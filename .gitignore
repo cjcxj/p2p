@@ -1,0 +1,24 @@
+# Go build cache (created by sandboxed builds)
+.gocache/
+.gopath/
+
+# Build artifacts
+bin/*.exe
+bin/*-linux
+bin/*.dll
+android/*.aar
+android/*.jar
+**/*.aar
+
+# Android / Gradle build output
+**/build/
+.gradle/
+android-demo/.gradle/
+android-demo/local.properties
+android-demo/.idea/
+*.iml
+*.apk
+
+# Logs / runtime state
+*.log
+*.pid
