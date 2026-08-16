@@ -85,6 +85,40 @@ func openData(key, payload []byte) ([]byte, error) {
 	return aead.Open(nil, nonce, payload[aead.NonceSize():], nil)
 }
 
+// e2eMagic marks application payloads encrypted end-to-end between the source
+// and final destination. Intermediate mesh nodes can route the frame but
+// cannot decrypt this payload.
+const e2eMagic byte = 0xE2
+
+// sealE2E encrypts an application payload for the final destination. The
+// returned payload is [e2eMagic][sealData output].
+func sealE2E(key, plaintext []byte) ([]byte, error) {
+	sealed, err := sealData(key, plaintext)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, 1+len(sealed))
+	out = append(out, e2eMagic)
+	out = append(out, sealed...)
+	return out, nil
+}
+
+// openE2E decrypts a payload produced by sealE2E. The bool result reports
+// whether the payload was marked as E2E-encrypted.
+func openE2E(key, payload []byte) ([]byte, bool, error) {
+	if len(payload) < 1 || payload[0] != e2eMagic {
+		return nil, false, nil
+	}
+	if len(key) == 0 {
+		return nil, true, errors.New("p2p: missing e2e key")
+	}
+	dec, err := openData(key, payload[1:])
+	if err != nil {
+		return nil, true, err
+	}
+	return dec, true, nil
+}
+
 // negotiateDataKey derives the per-pair data-plane key from the peer's
 // candidate public key. It returns nil when either side does not advertise
 // a key or the exchange fails, in which case the session uses plaintext

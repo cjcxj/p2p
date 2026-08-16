@@ -33,6 +33,38 @@ func TestSealOpenData(t *testing.T) {
 	}
 }
 
+func TestSealOpenE2E(t *testing.T) {
+	key := make([]byte, dataKeyLen)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	plain := []byte("end-to-end secret")
+
+	sealed, err := sealE2E(key, plain)
+	if err != nil {
+		t.Fatalf("sealE2E: %v", err)
+	}
+	dec, marked, err := openE2E(key, sealed)
+	if err != nil {
+		t.Fatalf("openE2E: %v", err)
+	}
+	if !marked {
+		t.Fatal("openE2E did not mark payload as encrypted")
+	}
+	if !bytes.Equal(dec, plain) {
+		t.Fatalf("e2e round trip mismatch: got %q want %q", dec, plain)
+	}
+
+	// Plain payloads are not marked.
+	_, marked, err = openE2E(key, plain)
+	if err != nil {
+		t.Fatalf("openE2E plain: %v", err)
+	}
+	if marked {
+		t.Fatal("plain payload was marked as e2e")
+	}
+}
+
 func TestDeriveDataKeySymmetric(t *testing.T) {
 	a, err := newDataKey()
 	if err != nil {

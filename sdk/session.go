@@ -157,7 +157,7 @@ func NewSession(cfg *Config, l Listener) (*Session, error) {
 	if l == nil {
 		l = nullListener{}
 	}
-	conn, err := net.ListenUDP("udp", nil)
+	conn, err := net.ListenUDP("udp4", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -272,13 +272,7 @@ func (s *Session) SendToIP(dstIP string, data []byte) error {
 	if ip == nil {
 		return errBadIP
 	}
-	s.mu.Lock()
-	m := s.mesh
-	s.mu.Unlock()
-	if m == nil {
-		return net.ErrClosed
-	}
-	return m.SendTo(ip, data)
+	return s.sendToMesh(ip, data)
 }
 
 // Broadcast sends a payload to every node in the room.
@@ -307,12 +301,15 @@ func (s *Session) Send(peerID string, data []byte) error {
 			}
 		}
 	}
-	m := s.mesh
+	var vip net.IP
+	if r != nil {
+		vip = r.vip
+	}
 	s.mu.Unlock()
-	if r == nil || r.vip == nil || m == nil {
+	if r == nil || vip == nil {
 		return errors.New("p2p: no route to peer")
 	}
-	return m.SendTo(r.vip, data)
+	return s.sendToMesh(vip, data)
 }
 
 // sendSecure sends a mesh payload to a peer, encrypting it with the per-pair
@@ -341,6 +338,61 @@ func (s *Session) sendSecure(id protocol.PeerID, payload []byte) error {
 		payload = sealed
 	}
 	return ph.Send(id, payload)
+}
+
+// sendToMesh sends an application payload to a virtual IP. When a per-pair
+// key with the final destination is available, the payload is encrypted
+// end-to-end before entering the mesh, so intermediate nodes cannot read it.
+func (s *Session) sendToMesh(dst net.IP, data []byte) error {
+	s.mu.Lock()
+	m := s.mesh
+	var key []byte
+	for _, r := range s.peers {
+		if r.vip != nil && r.vip.Equal(dst) && len(r.key) > 0 {
+			key = append([]byte(nil), r.key...)
+			break
+		}
+	}
+	s.mu.Unlock()
+	if m == nil {
+		return net.ErrClosed
+	}
+	if len(key) > 0 {
+		sealed, err := sealE2E(key, data)
+		if err != nil {
+			return err
+		}
+		data = sealed
+	}
+	return m.SendTo(dst, data)
+}
+
+// openInbound decrypts an end-to-end encrypted payload received from src.
+// Broadcast and legacy plaintext payloads are returned unchanged.
+func (s *Session) openInbound(src net.IP, payload []byte) []byte {
+	s.mu.Lock()
+	var key []byte
+	for _, r := range s.peers {
+		if r.vip != nil && r.vip.Equal(src) && len(r.key) > 0 {
+			key = append([]byte(nil), r.key...)
+			break
+		}
+	}
+	s.mu.Unlock()
+	if len(key) == 0 {
+		return payload
+	}
+	dec, marked, err := openE2E(key, payload)
+	if err != nil {
+		if s.cfg.Debug {
+			s.emit(EventDebug, "", []byte("p2p: dropped undecryptable e2e packet from "+src.String()))
+		}
+		return nil
+	}
+	if marked {
+		return dec
+	}
+	return payload
 }
 
 // Disconnect tears the session down. It is safe to call before Connect; in
@@ -419,6 +471,10 @@ func (s *Session) run(room string) {
 	// 3. Mesh node (virtual addressing + routing).
 	meshNode := mesh.NewNode(s.id, s.vip, s.ipnet)
 	meshNode.OnData = func(src net.IP, payload []byte) error {
+		payload = s.openInbound(src, payload)
+		if payload == nil {
+			return nil
+		}
 		s.mu.Lock()
 		ls := s.localStack
 		s.mu.Unlock()
