@@ -10,3 +10,14 @@ type batchPacket struct {
 	src  net.Addr
 	data []byte
 }
+
+// readBatchSingle is the portable fallback used by readBatch on platforms
+// without recvmmsg, and by the Linux implementation when the connection is
+// not a *net.UDPConn.
+func readBatchSingle(conn net.PacketConn, buf []byte) ([]batchPacket, error) {
+	n, src, err := conn.ReadFrom(buf)
+	if err != nil {
+		return nil, err
+	}
+	return []batchPacket{{src: src, data: buf[:n]}}, nil
+}
