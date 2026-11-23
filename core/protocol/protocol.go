@@ -25,6 +25,17 @@ func (id PeerID) String() string {
 	return hex.EncodeToString(id[:])
 }
 
+// Less orders identifiers so both peers can elect the same role from the pair
+// of IDs alone, without an extra round trip.
+func (id PeerID) Less(other PeerID) bool {
+	for i := range id {
+		if id[i] != other[i] {
+			return id[i] < other[i]
+		}
+	}
+	return false
+}
+
 // ParsePeerID parses a 32-char hex string into a PeerID.
 func ParsePeerID(s string) (PeerID, error) {
 	var id PeerID

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -19,12 +20,17 @@ import (
 
 var errBadIP = errors.New("p2p: invalid ip address")
 
+// udpSocketBufferSize is the target UDP socket buffer size used by Session.
+// 4 MiB is a reasonable high-BDP default; OS limits may cap the actual value.
+const udpSocketBufferSize = 4 << 20
+
 // Member describes a node in the virtual network.
 type Member struct {
 	PeerID        string
 	VirtualIP     string
 	NATType       string
 	Transport     string
+	Endpoint      string // actual remote UDP endpoint (IP:port) when connected
 	Connected     bool
 	BytesSent     uint64
 	BytesReceived uint64
@@ -51,6 +57,11 @@ type Session struct {
 	protector  SocketProtector
 	localStack *netstack.LocalStack
 
+	tunFile      *os.File
+	tunWriteMu   sync.Mutex
+	tunWriteCh   chan []byte
+	tunWriteStop chan struct{}
+
 	mu     sync.Mutex
 	peers  map[string]*remote
 	closed bool
@@ -63,6 +74,7 @@ type remote struct {
 	vip           net.IP
 	connected     bool
 	transport     string
+	endpoint      string // actual remote UDP endpoint (IP:port)
 	key           []byte // per-pair data-plane AEAD key; nil means plaintext fallback
 	bytesSent     uint64
 	bytesReceived uint64
@@ -98,6 +110,78 @@ func protectConn(conn net.PacketConn, p SocketProtector) {
 		return
 	}
 	raw.Control(func(fd uintptr) { p.Protect(int(fd)) })
+}
+
+// AttachTUN attaches a raw TUN file descriptor (e.g. Android VpnService) and
+// runs the packet bridge in Go. The session takes ownership of fd and closes
+// it on Disconnect. This avoids per-packet Java/JNI bridging and is much
+// faster on mobile.
+func (s *Session) AttachTUN(fd int, mtu int) error {
+	if fd < 0 {
+		return errors.New("p2p: invalid tun fd")
+	}
+	f := os.NewFile(uintptr(fd), "p2p-tun")
+	if f == nil {
+		return errors.New("p2p: invalid tun fd")
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		f.Close()
+		return net.ErrClosed
+	}
+	if s.tunFile != nil {
+		s.mu.Unlock()
+		f.Close()
+		return errors.New("p2p: tun already attached")
+	}
+	writeCh := make(chan []byte, 4096)
+	writeStop := make(chan struct{})
+	s.tunFile = f
+	s.tunWriteCh = writeCh
+	s.tunWriteStop = writeStop
+	s.mu.Unlock()
+	if mtu <= 0 {
+		mtu = 1280
+	}
+	go s.tunWriteWorker(f, writeCh, writeStop)
+	go s.tunReadLoop(f, mtu)
+	return nil
+}
+
+func (s *Session) tunWriteWorker(f *os.File, ch <-chan []byte, stop <-chan struct{}) {
+	for {
+		select {
+		case pkt := <-ch:
+			s.tunWriteMu.Lock()
+			_, _ = f.Write(pkt)
+			s.tunWriteMu.Unlock()
+		case <-stop:
+			return
+		}
+	}
+}
+
+func (s *Session) tunReadLoop(f *os.File, mtu int) {
+	buf := make([]byte, mtu+256)
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			pkt := buf[:n]
+			dst := ipv4Dst(pkt)
+			if dst == nil {
+				continue
+			}
+			if dst.IsMulticast() || dst.Equal(net.IPv4bcast) || dst.IsUnspecified() {
+				_ = s.Broadcast(pkt)
+			} else {
+				_ = s.SendToIP(dst.String(), pkt)
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 // EnableLocalStack creates a userspace IP endpoint for this node's virtual
@@ -161,6 +245,10 @@ func NewSession(cfg *Config, l Listener) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
+	// High-latency WAN paths need large UDP socket buffers; the OS defaults are
+	// often far too small for mesh throughput over mobile/home NAT links.
+	_ = conn.SetReadBuffer(udpSocketBufferSize)
+	_ = conn.SetWriteBuffer(udpSocketBufferSize)
 	key, err := newDataKey()
 	if err != nil {
 		conn.Close()
@@ -237,7 +325,7 @@ func (s *Session) MemberAt(i int) *Member {
 func (s *Session) memberList() []*Member {
 	out := make([]*Member, 0, len(s.peers))
 	for _, r := range s.peers {
-		m := &Member{PeerID: r.id.String(), Connected: r.connected, Transport: r.transport, BytesSent: r.bytesSent, BytesReceived: r.bytesReceived}
+		m := &Member{PeerID: r.id.String(), Connected: r.connected, Transport: r.transport, Endpoint: r.endpoint, BytesSent: r.bytesSent, BytesReceived: r.bytesReceived}
 		if r.vip != nil {
 			m.VirtualIP = r.vip.String()
 		}
@@ -330,7 +418,7 @@ func (s *Session) sendSecure(id protocol.PeerID, payload []byte) error {
 	if ph == nil {
 		return net.ErrClosed
 	}
-	if len(key) > 0 {
+	if len(key) > 0 && !s.cfg.Plaintext {
 		sealed, err := sealData(key, payload)
 		if err != nil {
 			return err
@@ -357,7 +445,7 @@ func (s *Session) sendToMesh(dst net.IP, data []byte) error {
 	if m == nil {
 		return net.ErrClosed
 	}
-	if len(key) > 0 {
+	if len(key) > 0 && !s.cfg.Plaintext {
 		sealed, err := sealE2E(key, data)
 		if err != nil {
 			return err
@@ -370,6 +458,9 @@ func (s *Session) sendToMesh(dst net.IP, data []byte) error {
 // openInbound decrypts an end-to-end encrypted payload received from src.
 // Broadcast and legacy plaintext payloads are returned unchanged.
 func (s *Session) openInbound(src net.IP, payload []byte) []byte {
+	if s.cfg.Plaintext {
+		return payload
+	}
 	s.mu.Lock()
 	var key []byte
 	for _, r := range s.peers {
@@ -407,6 +498,12 @@ func (s *Session) Disconnect() {
 		}
 		sig := s.sig
 		ph := s.ph
+		tf := s.tunFile
+		ch := s.tunWriteCh
+		stop := s.tunWriteStop
+		s.tunFile = nil
+		s.tunWriteCh = nil
+		s.tunWriteStop = nil
 		s.mu.Unlock()
 		if sig != nil {
 			sig.Close()
@@ -416,6 +513,13 @@ func (s *Session) Disconnect() {
 		if ph != nil {
 			ph.Stop()
 		}
+		if stop != nil {
+			close(stop)
+		}
+		if tf != nil {
+			_ = tf.Close()
+		}
+		_ = ch
 		s.emit(EventStateChanged, "", []byte(StateClosed))
 	})
 }
@@ -484,6 +588,25 @@ func (s *Session) run(room string) {
 			ls.HandleInbound(payload)
 			return nil
 		}
+		s.mu.Lock()
+		tf := s.tunFile
+		ch := s.tunWriteCh
+		s.mu.Unlock()
+		if tf != nil {
+			if ch != nil {
+				// Never block the punch read loop on a slow TUN write; drop
+				// only when the write queue is full.
+				select {
+				case ch <- payload:
+				default:
+				}
+			} else {
+				s.tunWriteMu.Lock()
+				_, _ = tf.Write(payload)
+				s.tunWriteMu.Unlock()
+			}
+			return nil
+		}
 		s.emit(EventData, src.String(), payload)
 		return nil
 	}
@@ -492,9 +615,15 @@ func (s *Session) run(room string) {
 	s.mu.Unlock()
 
 	// 4. Punch engine over the same UDP socket.
+	// det.LocalAddr already resolves the wildcard socket address to a concrete
+	// LAN IP when possible; fall back to the raw socket address only if needed.
+	privateAddr := det.LocalAddr
+	if privateAddr == nil {
+		privateAddr = localUDP(s.conn)
+	}
 	my := punch.NATInfo{
 		Type:        det.NATType,
-		PrivateAddr: localUDP(s.conn),
+		PrivateAddr: privateAddr,
 	}
 	if det.MappedAddr != nil {
 		my.PublicAddr = det.MappedAddr
@@ -522,7 +651,7 @@ func (s *Session) run(room string) {
 			key = append([]byte(nil), r.key...)
 		}
 		s.mu.Unlock()
-		if len(key) > 0 {
+		if len(key) > 0 && !s.cfg.Plaintext {
 			dec, err := openData(key, payload)
 			if err != nil {
 				// Drop undecryptable/tampered packets. They cannot be
@@ -541,8 +670,8 @@ func (s *Session) run(room string) {
 		s.mu.Unlock()
 		return meshNode.Handle(src, payload)
 	}
-	ph.OnState = func(id protocol.PeerID, t string) {
-		s.onPeerConnected(id, t)
+	ph.OnState = func(id protocol.PeerID, t string, endpoint string) {
+		s.onPeerConnected(id, t, endpoint)
 	}
 	ph.Start()
 	s.mu.Lock()
@@ -551,6 +680,15 @@ func (s *Session) run(room string) {
 
 	sig.OnMessage = func(m protocol.Message) error {
 		return s.onSignaling(m)
+	}
+	sig.OnClose = func(err error) {
+		s.mu.Lock()
+		closed := s.closed
+		s.mu.Unlock()
+		if closed {
+			return
+		}
+		s.emit(EventError, "", []byte("signaling: connection closed ("+err.Error()+"); existing p2p links remain active"))
 	}
 	go sig.Run()
 
@@ -618,7 +756,20 @@ func (s *Session) onSignaling(m protocol.Message) error {
 		}
 		s.onPeerCandidate(m)
 	case protocol.MsgRelayGrant:
-		addr, err := net.ResolveUDPAddr("udp", m.RelayAddr)
+		// Single-port server: TCP signaling, UDP STUN and UDP relay all share
+		// the same host:port. If the server omits --public it may advertise a
+		// loopback/unspecified relay address; in that case use the address the
+		// client actually used to reach the server.
+		relayAddrStr := s.cfg.ServerAddr
+		if m.RelayAddr != "" {
+			if host, _, err := net.SplitHostPort(m.RelayAddr); err == nil {
+				ip := net.ParseIP(host)
+				if ip == nil || (!ip.IsLoopback() && !ip.IsUnspecified()) {
+					relayAddrStr = m.RelayAddr
+				}
+			}
+		}
+		addr, err := net.ResolveUDPAddr("udp", relayAddrStr)
 		if err == nil {
 			tok := m.RelayToken
 			if tok == "" {
@@ -752,7 +903,7 @@ func (s *Session) onPeerCandidate(m protocol.Message) {
 	ph.AddPeer(senderID, info)
 }
 
-func (s *Session) onPeerConnected(id protocol.PeerID, transport string) {
+func (s *Session) onPeerConnected(id protocol.PeerID, transport, endpoint string) {
 	if id == s.id {
 		return
 	}
@@ -766,6 +917,7 @@ func (s *Session) onPeerConnected(id protocol.PeerID, transport string) {
 	oldTransport := r.transport
 	r.connected = true
 	r.transport = transport
+	r.endpoint = endpoint
 	vip := ""
 	var vipIP net.IP
 	if r.vip != nil {

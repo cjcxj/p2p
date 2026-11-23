@@ -28,8 +28,8 @@ func TestPathChangedEvent(t *testing.T) {
 	id := protocol.NewPeerID()
 	s.peers[id.String()] = &remote{id: id, vip: net.IPv4(10, 9, 0, 2)}
 
-	s.onPeerConnected(id, TransportRelay)
-	s.onPeerConnected(id, TransportPunched)
+	s.onPeerConnected(id, TransportRelay, "1.2.3.4:5000")
+	s.onPeerConnected(id, TransportPunched, "5.6.7.8:5001")
 
 	if len(l.events) != 2 {
 		t.Fatalf("expected 2 events, got %d: %v", len(l.events), l.events)

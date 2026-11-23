@@ -4,7 +4,7 @@
 带**虚拟 IP 子网**的私有网络，支持**多跳网状路由**、**广播/组播仿真**，并可创建 **TUN
 虚拟网卡**（Windows/Linux）让操作系统流量直接走组网。纯 Go 实现，同一核心同时产出：
 
-- Windows / Linux 的 CLI 客户端与三合一服务器
+- Windows / Linux 的统一 CLI（单个二进制同时包含客户端与三合一服务器，另保留 `p2p-server` / `p2p-client` 兼容入口）
 - Android 的 AAR（Java/Kotlin 可直接调用）
 
 ## 组网能力
@@ -34,8 +34,9 @@ core/
   tundev/            TUN 虚拟网卡（Windows/Linux）
   protocol/          共享 wire 协议
 cmd/
-  server/            三合一服务器（信令 + STUN + 中继 + 虚拟 IP 分配）
-  client/            CLI（nat-check / connect / mesh）
+  p2p/                统一 CLI（server / client / nat-check / connect / mesh）
+  server/             p2p-server 兼容入口（调用统一 CLI）
+  client/             p2p-client 兼容入口（调用统一 CLI）
 android/             gomobile 产出的 p2p.aar + Kotlin 示例
 scripts/build.ps1    一键构建三端 + AAR + wintun.dll
 ```
@@ -48,17 +49,21 @@ scripts/build.ps1    一键构建三端 + AAR + wintun.dll
 
 ```bash
 # 单公网 IP 部署（虚拟网络 10.9.0.0/24）
-p2p-server --public <公网IP> --port 8080
+p2p server --public <公网IP> --port 8080
 
 # 双 IP 部署（可精确区分 full cone；STUN 副 IP 走同端口）
-p2p-server --public <公网IP> --stun-ip2 <第二IP> --port 8080
+p2p server --public <公网IP> --stun-ip2 <第二IP> --port 8080
 
 # 开启双向鉴权（共享密钥，所有客户端必须携带 --secret）
-p2p-server --public <公网IP> --port 8080 --secret <共享密钥>
+p2p server --public <公网IP> --port 8080 --secret <共享密钥>
 
 # 开启按用户鉴权（客户端用 --user/--secret 登录）
-p2p-server --public <公网IP> --port 8080 --users alice:pass123,bob:pass456
+p2p server --public <公网IP> --port 8080 --users alice:pass123,bob:pass456
 ```
+
+说明：
+- 旧命令 `p2p-server ...` 仍然可用：构建脚本会把统一二进制复制为
+  `p2p-server` / `p2p-client`，两者行为与合并前一致。
 
 说明：
 - `--port` 同时绑定 TCP（信令）与 UDP（STUN+中继），**默认只占用这一个端口**。
@@ -70,13 +75,14 @@ p2p-server --public <公网IP> --port 8080 --users alice:pass123,bob:pass456
 ### 2. 组网（控制台模式）
 
 ```bash
+# 等价写法：p2p client mesh ...（旧命令 p2p-client mesh ... 也继续可用）
 # 每个节点运行（--stun 省略时自动与 --server 同端口）
-p2p-client mesh --server <服务器IP>:8080 --room demo --token secret
+p2p mesh --server <服务器IP>:8080 --room demo --token secret
 
 # 服务器开启鉴权时，客户端需携带凭证
-p2p-client mesh --server <服务器IP>:8080 --room demo --secret <共享密钥>
+p2p mesh --server <服务器IP>:8080 --room demo --secret <共享密钥>
 # 或按用户登录
-p2p-client mesh --server <服务器IP>:8080 --room demo --user alice --secret pass123
+p2p mesh --server <服务器IP>:8080 --room demo --user alice --secret pass123
 ```
 
 控制台命令：
@@ -88,19 +94,23 @@ p2p-client mesh --server <服务器IP>:8080 --room demo --user alice --secret pa
 
 ```bash
 # Windows：需 wintun.dll 与管理员权限
-p2p-client mesh --server <服务器IP>:8080 --room demo --tun
+p2p mesh --server <服务器IP>:8080 --room demo --tun
 
 # Linux：需 root 与 /dev/net/tun
-sudo p2p-client mesh --server <服务器IP>:8080 --room demo --tun
+sudo p2p mesh --server <服务器IP>:8080 --room demo --tun
+
+# 测试阶段可选的用户态协议栈（默认关闭；默认全部走内核 TUN）
+sudo p2p mesh --server <服务器IP>:8080 --room demo --tun --userspace-stack
 ```
 
 创建后本机获得虚拟 IP（如 10.9.0.2/24），同一房间内的节点可互相 ping、访问服务。
 Windows 的 `wintun.dll` 由构建脚本自动下载到 `bin/`。
+Linux 端会自动为虚拟网卡添加 iptables 放行规则（需 root），避免云主机默认防火墙丢弃入站 TCP/UDP。
 
 ### 4. 检测本机 NAT
 
 ```bash
-p2p-client nat-check --server <服务器IP>:8080
+p2p nat-check --server <服务器IP>:8080
 ```
 
 ## SDK 用法（Go）
@@ -198,10 +208,11 @@ session.connect("demo")
 
 ### 安卓 VPN 真接入（demo）
 
-`android-demo` 内置 `MeshVpnService`（VpnService）：勾选"详细打洞日志"旁，点"**VPN 组网**"，
-系统弹窗点允许后，手机会创建虚拟网卡并接入 mesh，获得虚拟 IP（10.9.0.x），
+`android-demo` 内置 `MeshVpnService`（VpnService）：默认走内核 TUN（与 Windows/Linux 一致），
+点"**VPN 组网**"，系统弹窗点允许后，手机会创建虚拟网卡并接入 mesh，获得虚拟 IP（10.9.0.x），
 **与 Windows/Linux 的 `--tun` 节点互相 ping / 访问服务**。mesh socket 已 `protect()` 防死循环；
 VPN 只路由虚拟子网（10.9.0.0/24），不影响手机正常上网。
+高级设置里的“用户态协议栈”默认关闭，仅供测试。
 
 ## NAT 组合与路由
 
@@ -216,8 +227,9 @@ Windows（PowerShell）：
 
 ```powershell
 scripts\build.ps1
-# 产出 bin\p2p-server.exe、bin\p2p-client.exe、bin\wintun.dll、
-#       bin\p2p-client-linux、bin\p2p-server-linux、android\p2p.aar
+# 产出 bin\p2p.exe、bin\p2p-server.exe、bin\p2p-client.exe、bin\wintun.dll、
+#       bin\p2p-linux、bin\p2p-server-linux、bin\p2p-client-linux、android\p2p.aar
+# p2p-server / p2p-client 为统一二进制的兼容副本
 ```
 
 Linux/macOS：

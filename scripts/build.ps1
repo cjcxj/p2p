@@ -1,4 +1,5 @@
-# Builds the P2P server/client for Windows and Linux, and the Android AAR.
+# Builds the unified P2P CLI (plus p2p-server/p2p-client compatibility
+# copies) for Windows and Linux, and the Android AAR.
 # Requires: Go, gomobile, Android SDK/NDK (for the AAR only).
 
 $ErrorActionPreference = "Stop"
@@ -21,10 +22,15 @@ function Build-Go([string]$Name, [string]$Pkg, [string]$GOOS, [string]$GOARCH, [
     Write-Host "    -> $out"
 }
 
-Build-Go "p2p-server" "server" "windows" "amd64" ".exe"
-Build-Go "p2p-client" "client" "windows" "amd64" ".exe"
-Build-Go "p2p-client" "client" "linux"   "amd64" "-linux"
-Build-Go "p2p-server" "server" "linux"   "amd64" "-linux"
+# One unified binary per platform; the legacy names are copies of the same
+# executable. cmd/p2p dispatches on argv[0], so p2p-server / p2p-client keep
+# their old behavior.
+Build-Go "p2p" "p2p" "windows" "amd64" ".exe"
+Copy-Item (Join-Path $OutDir "p2p.exe") (Join-Path $OutDir "p2p-server.exe") -Force
+Copy-Item (Join-Path $OutDir "p2p.exe") (Join-Path $OutDir "p2p-client.exe") -Force
+Build-Go "p2p" "p2p" "linux"   "amd64" "-linux"
+Copy-Item (Join-Path $OutDir "p2p-linux") (Join-Path $OutDir "p2p-server-linux") -Force
+Copy-Item (Join-Path $OutDir "p2p-linux") (Join-Path $OutDir "p2p-client-linux") -Force
 
 # Restore host env
 Remove-Item Env:GOOS -ErrorAction SilentlyContinue
@@ -39,6 +45,10 @@ if ($env:ANDROID_HOME -and $env:ANDROID_NDK_HOME) {
     & gomobile bind -target=android -androidapi 21 -o $aar ./sdk
     if ($LASTEXITCODE -ne 0) { throw "gomobile bind failed" }
     Write-Host "    -> $aar"
+    $demoLibs = Join-Path $Root "android-demo\app\libs"
+    New-Item -ItemType Directory -Force -Path $demoLibs | Out-Null
+    Copy-Item $aar (Join-Path $demoLibs "p2p.aar") -Force
+    Write-Host "    -> $demoLibs\p2p.aar"
 } else {
     Write-Host "==> SKIPPING Android AAR (set ANDROID_HOME and ANDROID_NDK_HOME)"
 }
@@ -46,7 +56,7 @@ if ($env:ANDROID_HOME -and $env:ANDROID_NDK_HOME) {
 # ---- wintun.dll (Windows TUN driver) ------------------------------------
 $wintun = Join-Path $OutDir "wintun.dll"
 if (-not (Test-Path $wintun)) {
-    Write-Host "==> downloading wintun.dll (needed by p2p-client mesh --tun)"
+    Write-Host "==> downloading wintun.dll (needed by p2p mesh --tun)"
     try {
         $zip = Join-Path $env:TEMP "wintun.zip"
         Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile $zip -UseBasicParsing

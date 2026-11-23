@@ -22,6 +22,8 @@ type Server struct {
 	relayGrant    func(roomID, peerID, token string)
 	network       *net.IPNet
 	auth          *authConfig
+	logger        *log.Logger
+	verbose       bool
 	mu            sync.Mutex
 	conns         map[net.Conn]struct{}
 	connIPs       map[string]int
@@ -46,6 +48,9 @@ type Options struct {
 	RelayGrant func(roomID, peerID, token string)
 	// Logger receives operational messages; nil disables logging.
 	Logger *log.Logger
+	// Verbose enables per-member join/leave and rejection logs in addition
+	// to the startup/shutdown messages.
+	Verbose bool
 	// Network is the virtual subnet for per-room address allocation.
 	// Empty defaults to DefaultNetwork. Set to "0.0.0.0/0" to disable
 	// virtual IP assignment.
@@ -91,6 +96,8 @@ func NewServer(addr string, opts Options) (*Server, error) {
 		relayAlloc:    opts.RelayAlloc,
 		relayGrant:    opts.RelayGrant,
 		network:       ipnet,
+		logger:        opts.Logger,
+		verbose:       opts.Verbose,
 		conns:         make(map[net.Conn]struct{}),
 		connIPs:       make(map[string]int),
 		lastSeen:      make(map[net.Conn]time.Time),
@@ -132,6 +139,21 @@ func (s *Server) reapLoop() {
 			s.mu.Unlock()
 		}
 	}
+}
+
+// logf emits a verbose operational log line when enabled.
+func (s *Server) logf(format string, args ...interface{}) {
+	if s.verbose && s.logger != nil {
+		s.logger.Printf(format, args...)
+	}
+}
+
+// tokenState renders a room token for logs without leaking secrets.
+func tokenState(token string) string {
+	if token == "" {
+		return "open"
+	}
+	return "protected"
 }
 
 // Network returns the configured virtual subnet.
@@ -227,11 +249,16 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 	}
 
-	vip, _, err := s.hub.join(roomID, token, mem, relayAddr, s.network)
+	vip, created, err := s.hub.join(roomID, token, mem, relayAddr, s.network)
 	if err != nil {
 		s.fail(conn, err.Error())
+		s.logf("member rejected room %q from %s: %v", roomID, conn.RemoteAddr(), err)
 		return
 	}
+	if created {
+		s.logf("room %q created (token %s)", roomID, tokenState(token))
+	}
+	s.logf("member joined room %q: peer=%s vip=%s remote=%s", roomID, id.String(), vip, conn.RemoteAddr())
 
 	// All writes to a member's conn go through member.mu to avoid concurrent
 	// frame interleaving with broadcast/forward goroutines.
@@ -272,6 +299,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 	}
 done:
+	s.logf("member left room %q: peer=%s vip=%s remote=%s", roomID, id.String(), mem.vip, conn.RemoteAddr())
 	s.hub.freeOnLeave(roomID, id)
 	s.hub.leave(roomID, id)
 	s.hub.broadcast(roomID, id, protocol.Message{Type: protocol.MsgMembers, Members: s.hub.membersInfo(roomID)})

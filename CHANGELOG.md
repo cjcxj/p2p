@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.23 (2026-08)
+- CLI 客户端与服务端合二为一：新增统一 `cmd/p2p`（`p2p server` / `p2p client ...`，并接受旧式 `p2p mesh/connect/nat-check` 子命令）。
+- 构建产物保留 `p2p-server` / `p2p-client` 兼容副本（同一二进制按 `argv[0]` 自动识别角色）。
+- 服务器新增 `--verbose`：输出房间创建、成员加入/离开、拒绝原因等详细日志。
+- Linux TUN 模式新增 iptables 放行规则：允许虚拟子网经 p2p0 入站/转发的 TCP/UDP/ICMP，修复 Linux 云主机默认防火墙导致 iperf3、TCP 服务无法访问的问题。
+- Android Demo 修复自 ping：发给本机虚拟 IP 的 ICMP echo reply 不再丢弃，而是注入 VPN 接口让内核 ping socket 收到。
+- netstack 增加 TCP 用户态转发能力（Android 用户态协议栈场景使用），可把入站 TCP 转发到本机 `127.0.0.1:同端口`。
+- 桌面 TUN 默认保持内核 TUN；新增 `--userspace-stack` 测试选项，显式开启时才使用用户态协议栈。
+- Android Demo 默认改为内核 TUN（“用户态协议栈”默认关闭），与 Windows/Linux 默认行为一致；仍保留开关供测试。
+- Android ICMP 改为“内核优先、应用层兜底”：先注入 TUN 等内核回包，超时未回才由应用层代答，并定期复探内核。
+- Android Demo 改为 Go 原生 TUN 桥接：TUN 读写直接由 Go SDK 完成，不再每包走 Java/JNI 拷贝，提升 iperf3 吞吐。
+- Android Demo 构建时自动把最新 `android/p2p.aar` 同步到 `android-demo/app/libs/p2p.aar`，避免测试用旧 AAR。
+- 信令服务器断开时客户端现在会收到 `EventError` 提示（已有 P2P 数据链路保持可用，便于诊断“服务器断开后客户端仍连着”的现象）。
+
 ## v0.22 (2026-08)
 - 实现单播端到端加密（E2E）：应用载荷在源节点用目的节点密钥加密，中间节点只能路由不能解密。
 - 新增 `cmd/gencert` 自签名证书生成工具，简化信令 TLS 启用。

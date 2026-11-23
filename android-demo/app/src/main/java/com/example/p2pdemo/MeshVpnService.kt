@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.VpnService
 import android.os.Build
@@ -18,519 +19,544 @@ import p2p.SocketProtector
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * 真组网：把手机的虚拟 IP 接入系统，创建 VPN 接口，
- * 让 OS 流量（ping / SSH / 网页）经 mesh 走虚拟局域网。
+ * 把手机接入 mesh 虚拟子网的 VpnService。
+ *
+ * 数据面：
+ * - tun -> mesh：只放行虚拟子网内的 IPv4 包，广播走 broadcast，单播走 sendToIP；
+ * - mesh -> tun：广播 / 发往其它虚拟 IP 的包注入 tun；
+ * - 发往本机虚拟 IP 的 ICMP echo：用户态协议栈开启时 SDK 已处理；
+ *   未开启时由应用层代答（Android 内核不会替 tun 回包）。
+ *
+ * 生命周期全部通过 running / stopVpn 收敛，关闭 tun fd 即可解除阻塞读。
  */
 class MeshVpnService : VpnService() {
 
-    companion object {
-        const val NOTIF_ID = 1001
-        const val ACTION_START = "com.example.p2pdemo.VPN_START"
-        const val ACTION_STOP = "com.example.p2pdemo.VPN_STOP"
-        private const val TAG = "MeshVpn"
-        private const val KERNEL_ICMP_FALLBACK_MS = 500L // 内核代答等待窗口，超时即兜底
-        private const val KERNEL_ICMP_REPROBE_EVERY = 10 // 兜底期间每 10 个 echo 请求复探一次内核
-
-        // 让 VPN 服务的诊断信息显示到 App 日志里（无需 adb）
-        @Volatile
-        var logHook: ((String) -> Unit)? = null
-    }
-
-    private fun log(msg: String) {
-        Log.w(TAG, msg)
-        logHook?.invoke(msg)
-    }
-
     @Volatile
     private var session: Session? = null
-    private var pfd: ParcelFileDescriptor? = null
-    private var output: FileOutputStream? = null
-    private var bridgeThread: Thread? = null
+
+    @Volatile
     private var running = false
-    @Volatile
-    private var lastReadMs = 0L
-    @Volatile
-    private var virtualNet: ByteArray? = null // 虚拟子网网络地址（4字节），buildVpn 时按 subnet 赋值
-    @Volatile
-    private var virtualPrefix = 24
-    @Volatile
-    private var kernelIcmpFailed = false // 探测到内核不回 ICMP 后，本会话走兜底（定期复探）
-    @Volatile
-    private var echoSinceFail = 0 // 兜底期间收到的 echo 请求计数，用于定期复探内核
-    private val pendingEcho = ConcurrentHashMap.newKeySet<String>() // 等待内核应答的 echo 请求键
-    private var scheduler: ScheduledExecutorService? = null // 兜底计时器
 
-    // mesh -> VPN 接口（ICMP echo 由应用层兜底应答；其余注入 VPN 接口）
-    private val listener = object : Listener {
-        override fun onEvent(event: Long, peerID: String, data: ByteArray) {
-            when (event) {
-                P2p.EventData -> {
-                    val dst = ipv4Dst(data)
-                    log("VPN 收到 mesh 数据 ${data.size} 字节，目标 ${dst?.let { ipv4Str(it) }}，校验和${if (ipHeaderChecksumValid(data)) "正常" else "异常!"}，IP头 ${hexHeader(data)}")
-                    // ICMP echo 应答策略（localStack 未接管时生效；接管则走不到这里）：
-                    // 内核优先——注入 tun 等内核代答，500ms 内没读到内核回包就兜底补位；
-                    // 兜底期间每 10 个 echo 请求复探一次内核，成功自动切回内核路径。
-                    val reply = icmpEchoReply(data)
-                    when {
-                        reply == null -> injectToTun(data)
-                        kernelIcmpFailed -> {
-                            echoSinceFail++
-                            if (echoSinceFail >= KERNEL_ICMP_REPROBE_EVERY) {
-                                echoSinceFail = 0
-                                if (injectToTun(data)) {
-                                    val key = icmpEchoKey(data, isReply = false)
-                                    if (key != null) {
-                                        pendingEcho.add(key)
-                                        log("兜底中复探内核：已注入 echo request（${KERNEL_ICMP_FALLBACK_MS}ms 窗口）")
-                                        scheduleKernelFallback(key, reply)
-                                    } else {
-                                        sendIcmpReply(reply)
-                                    }
-                                } else {
-                                    sendIcmpReply(reply)
-                                }
-                            } else {
-                                sendIcmpReply(reply)
-                            }
-                        }
-                        else -> {
-                            if (injectToTun(data)) {
-                                val key = icmpEchoKey(data, isReply = false)
-                                if (key != null) {
-                                    pendingEcho.add(key)
-                                    log("内核优先：已注入 echo request，${KERNEL_ICMP_FALLBACK_MS}ms 无内核应答则兜底")
-                                    scheduleKernelFallback(key, reply)
-                                } else {
-                                    sendIcmpReply(reply)
-                                }
-                            } else {
-                                sendIcmpReply(reply)
-                            }
-                        }
-                    }
-                }
-                P2p.EventError -> log("错误: ${String(data)}")
-                P2p.EventDebug -> log("[打洞] ${String(data)}")
-                P2p.EventPeerConnected -> log("节点已连通: $peerID via ${String(data)}")
-            }
-        }
-    }
+    private var tunFd: ParcelFileDescriptor? = null
+    private var tunOutput: FileOutputStream? = null
+    private val tunWriteLock = Any()
 
-    // 保护 mesh socket，防止其流量被本 VPN 再路由回去（死循环）
+    private var bridgeExecutor: ExecutorService? = null
+    private var senderExecutor: ExecutorService? = null
+    private var fallbackScheduler: ScheduledExecutorService? = null
+    private var echoServer: TcpEchoServer? = null
+
+    private val pendingEcho = ConcurrentHashMap.newKeySet<String>()
+
+    @Volatile
+    private var kernelIcmpFailed = false
+
+    private var echoSinceFail = 0
+
+    @Volatile
+    private var virtualNetwork: ByteArray? = null
+
+    @Volatile
+    private var virtualPrefix = DEFAULT_PREFIX
+
+    private val threadIds = AtomicInteger()
+
     private val protector = object : SocketProtector {
         override fun protect(fd: Long): Boolean =
             this@MeshVpnService.protect(fd.toInt())
     }
 
+    private val listener = object : Listener {
+        override fun onEvent(event: Long, peerID: String, data: ByteArray) {
+            when (event) {
+                P2p.EventData -> handleMeshPacket(data)
+                P2p.EventStateChanged -> {
+                    val state = data.toUtf8()
+                    log("会话状态: $state")
+                    if (state == P2p.StateFailed) {
+                        log("VPN 会话失败，停止服务")
+                        stopSelf()
+                    }
+                }
+                P2p.EventPeerJoined -> log("节点加入: $peerID")
+                P2p.EventPeerLeft -> log("节点离开: $peerID")
+                P2p.EventPeerConnected ->
+                    log("节点已连通: $peerID via ${data.toUtf8()}")
+                P2p.EventError -> log("错误: ${data.toUtf8()}")
+                P2p.EventDebug -> log("[打洞] ${data.toUtf8()}")
+            }
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null) return START_NOT_STICKY
-        when (intent.action) {
+        return when (intent.action) {
             ACTION_STOP -> {
+                log("收到停止请求")
                 stopVpn()
-                stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
-                return START_NOT_STICKY
+                START_NOT_STICKY
             }
-            ACTION_START -> {
-                val server = intent.getStringExtra("server") ?: return START_NOT_STICKY
-                val room = intent.getStringExtra("room") ?: return START_NOT_STICKY
-                val token = intent.getStringExtra("token") ?: ""
-                val user = intent.getStringExtra("user") ?: ""
-                val secret = intent.getStringExtra("secret") ?: ""
-                val useLocalStack = intent.getBooleanExtra("localStack", true)
-                kernelIcmpFailed = false // 每次启动 VPN 重新探测内核代答能力
-                startVpn(server, room, token, user, secret, useLocalStack)
-            }
+            ACTION_START -> startWith(intent)
+            else -> START_NOT_STICKY
         }
-        return START_STICKY
     }
 
-    private fun startVpn(server: String, room: String, token: String, user: String, secret: String, useLocalStack: Boolean) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIF_ID, buildNotification(),
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(NOTIF_ID, buildNotification())
+    private fun startWith(intent: Intent): Int {
+        if (running) {
+            log("VPN 已在运行，忽略重复启动")
+            return START_STICKY
         }
-        val cfg = p2p.Config()
-        cfg.serverAddr = server
-        cfg.stunAddr = server
-        cfg.token = token
-        cfg.authUser = user
-        cfg.authSecret = secret
-        cfg.relayEnabled = true
-        cfg.portPrediction = true
-        cfg.enableLAN = true
-        cfg.debug = true
+        val request = readRequest(intent)
+        if (request == null) {
+            log("启动参数不完整")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        try {
+            startForegroundWithType()
+        } catch (e: Exception) {
+            log("前台服务启动失败: ${e.message}")
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
-        if (scheduler == null || scheduler!!.isShutdown) {
-            scheduler = Executors.newSingleThreadScheduledExecutor()
-        }
-        val s = Session(cfg, listener)
-        // 先保护 socket，再建 VPN，再连接
-        s.setSocketProtector(protector)
-        session = s
         running = true
-
-        bridgeThread = Thread {
-            try {
-                s.connect(room)
-                // 等虚拟 IP
-                var ip = ""
-                var tries = 0
-                while (running && ip.isEmpty() && tries < 100) {
-                    ip = s.localIP() ?: ""
-                    if (ip.isEmpty()) {
-                        Thread.sleep(200)
-                        tries++
-                    }
-                }
-                if (ip.isEmpty()) {
-                    log("未获得虚拟 IP")
-                    stopSelf()
-                    return@Thread
-                }
-                // 启用用户态协议栈：发往本机虚拟 IP 的包（ping/TCP）在进程内处理，
-                // 不再依赖安卓内核回包。取消勾选时由应用层兜底应答 ICMP（见
-                // icmpEchoReply），因为安卓内核不会替 VpnService tun 回包。
-                if (useLocalStack) {
-                    try {
-                        s.enableLocalStack()
-                        s.exposeTCP(7000) // 转发到本机 7000 回显服务
-                        log("已启用用户态协议栈（本机 IP $ip 的入站流量进程内处理）")
-                    } catch (e: Exception) {
-                        log("启用用户态协议栈失败: ${e.message}")
-                    }
-                } else {
-                    log("未启用用户态协议栈：ICMP 回包由应用层兜底应答")
-                }
-                val subnet = s.subnet() ?: "10.9.0.0/24"
-                val pfd = buildVpn(ip, subnet)
-                if (pfd == null) {
-                    log("VPN 建立失败")
-                    stopSelf()
-                    return@Thread
-                }
-                this.pfd = pfd
-                output = FileOutputStream(pfd.fileDescriptor)
-                log("VPN 接口已建立: $ip/$subnet")
-                startReadWatchdog()
-                bridgeTunToMesh(s, FileInputStream(pfd.fileDescriptor))
-            } catch (e: Exception) {
-                log("vpn 异常: ${e.message}")
-                stopSelf()
-            }
+        bridgeExecutor = newSingleExecutor("vpn-bridge")
+        senderExecutor = newSingleExecutor("vpn-sender")
+        fallbackScheduler = Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "vpn-icmp-fallback").apply { isDaemon = true }
         }
-        bridgeThread?.start()
-    }
-
-    private fun buildVpn(ip: String, subnet: String): ParcelFileDescriptor? {
-        val (network, prefix) = parseCidr(subnet)
-        // 记录虚拟子网供 bridgeTunToMesh 过滤非虚拟网段流量（此前 virtualNet
-        // 从未赋值，过滤失效，可能把非虚拟网段流量打进 mesh）
-        virtualNet = parseIpv4(network)
-        virtualPrefix = prefix
-        val builder = Builder()
-            .setSession("p2p-mesh ($ip)")
-            .setMtu(1280)
-            .setBlocking(true) // 阻塞读：空闲时挂起不耗 CPU；退出靠 stopVpn() 关闭 fd 解除阻塞
-            .addAddress(ip, prefix)
-            .addRoute(network, prefix)
-        // mesh socket 已 protect() 且流量不在虚拟网段，无需禁用本 App 走 VPN，
-        // 这样 demo 自身的"自测 ping"和 7000 回显服务也能通过虚拟网互通
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            builder.setMetered(false)
-        }
-        // Android 12+：子网 VPN 必须声明底层网络，否则 VPN 路由可能不生效
-        try {
-            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            val nets = cm.allNetworks
-            if (nets.isNotEmpty()) {
-                builder.setUnderlyingNetworks(nets)
-                log("setUnderlyingNetworks 已设置 ${nets.size} 个底层网络")
-            } else {
-                log("警告: 未获取到任何底层网络（路由可能未安装）")
-            }
-        } catch (e: Exception) {
-            log("setUnderlyingNetworks 失败: ${e.message}")
-        }
-        return builder.establish()
-    }
-
-    // 读循环看门狗：确认读循环存活；多播/广播无回包属正常，只在持续空闲时提示一次
-    private fun startReadWatchdog() {
-        Thread {
-            var warned = false
-            while (running) {
-                Thread.sleep(5000)
-                val idle = (System.currentTimeMillis() - lastReadMs) / 1000
-                if (idle > 20) {
-                    if (!warned) {
-                        log("VPN 读循环空闲 ${idle}s（多播/广播无回包正常；若 ping 单播也无回包才是异常）")
-                        warned = true
-                    }
-                } else {
-                    warned = false
-                }
-            }
-        }.start()
-    }
-
-    // VPN 接口 -> mesh
-    private fun bridgeTunToMesh(s: Session, input: FileInputStream) {
-        log("VPN 读循环已启动")
-        val buf = ByteArray(65536)
-        while (running) {
-            val n = try {
-                input.read(buf)
-            } catch (e: Exception) {
-                log("读循环退出: ${e.message}")
-                break
-            }
-            if (n <= 0) break
-            lastReadMs = System.currentTimeMillis()
-            val pkt = buf.copyOf(n)
-            val dst = ipv4Dst(pkt) ?: continue
-            val dstIp = ipv4Str(dst)
-            val srcIp = ipv4Str(pkt.copyOfRange(12, 16))
-            val proto = pkt[9].toInt() and 0xFF
-            log("VPN 读取 ${pkt.size} 字节 src=$srcIp dst=$dstIp proto=$proto")
-            // 内核优先回 ICMP：读到本机发出的 echo reply 就取消对应请求的兜底计时；
-            // 若此前处于兜底状态（复探成功），则切回内核路径
-            if (proto == 1) {
-                val ihl = (pkt[0].toInt() and 0x0F) * 4
-                if (pkt.size >= ihl + 8 && (pkt[ihl].toInt() and 0xFF) == 0) {
-                    val key = icmpEchoKey(pkt, isReply = true)
-                    if (key != null && pendingEcho.remove(key)) {
-                        if (kernelIcmpFailed) {
-                            kernelIcmpFailed = false
-                            echoSinceFail = 0
-                            log("内核已应答 ICMP echo（复探成功，切回内核路径）")
-                        } else {
-                            log("内核已应答 ICMP echo（取消兜底计时）")
-                        }
-                    }
-                }
-            }
-            // 非虚拟子网流量丢弃（否则会打进 mesh 导致手机断网）
-            val vnet = virtualNet
-            if (vnet != null && !inVirtualNet(dst, vnet, virtualPrefix)) {
-                log("丢弃非虚拟网段流量: $dstIp")
-                continue
-            }
-            if ((dst[0].toInt() and 0xFF) == 255 || (dst[0].toInt() and 0xFF) >= 224) {
-                try { s.broadcast(pkt) } catch (e: Exception) { log("broadcast 失败: ${e.message}") }
-            } else {
-                try { s.sendToIP(dstIp, pkt) } catch (e: Exception) { log("sendToIP 失败: ${e.message}") }
-            }
-        }
-    }
-
-    private fun stopVpn() {
-        running = false
-        scheduler?.shutdownNow()
-        scheduler = null
-        pendingEcho.clear()
-        kernelIcmpFailed = false
-        echoSinceFail = 0
-        session?.disconnect()
-        session = null
-        try { output?.close() } catch (e: Exception) { }
-        try { pfd?.close() } catch (e: Exception) { }
-        output = null
-        pfd = null
-    }
-
-    // 为发往本机虚拟 IP 的 ICMP echo request 构造 echo reply（localStack 未接管
-    // 时的兜底）。返回 null 表示该包不是发给本机的 echo 请求，应走正常注入路径。
-    private fun icmpEchoReply(pkt: ByteArray): ByteArray? {
-        if (pkt.size < 28 || (pkt[0].toInt() shr 4) != 4) return null
-        val ihl = (pkt[0].toInt() and 0x0F) * 4
-        if (ihl < 20 || pkt.size < ihl + 8) return null
-        if ((pkt[9].toInt() and 0xFF) != 1) return null // 只处理 ICMP
-        if ((pkt[ihl].toInt() and 0xFF) != 8) return null // 只应答 echo request
-        val me = session?.localIP()
-        if (me.isNullOrEmpty()) return null
-        if (ipv4Str(pkt.copyOfRange(16, 20)) != me) return null // 只应答发给自己的请求
-        val reply = pkt.copyOf()
-        // 交换源/目的 IP
-        for (i in 0..3) {
-            reply[12 + i] = pkt[16 + i]
-            reply[16 + i] = pkt[12 + i]
-        }
-        // ICMP type: 8(echo request) -> 0(echo reply)，并重算 ICMP 校验和
-        reply[ihl] = 0
-        reply[ihl + 2] = 0
-        reply[ihl + 3] = 0
-        val icmpSum = ipChecksum(reply, ihl, reply.size - ihl)
-        reply[ihl + 2] = ((icmpSum shr 8) and 0xFF).toByte()
-        reply[ihl + 3] = (icmpSum and 0xFF).toByte()
-        // 重算 IP 头校验和
-        reply[10] = 0
-        reply[11] = 0
-        val ipSum = ipChecksum(reply, 0, ihl)
-        reply[10] = ((ipSum shr 8) and 0xFF).toByte()
-        reply[11] = (ipSum and 0xFF).toByte()
-        return reply
-    }
-
-    // 把原始 IP 包注入 VPN 接口；返回是否写入成功。
-    private fun injectToTun(data: ByteArray): Boolean {
-        val out = output ?: return false
-        return try {
-            out.write(data)
-            out.flush()
-            log("VPN 已注入接口 ${data.size} 字节")
-            true
-        } catch (e: Exception) {
-            log("VPN 写入失败: ${e.message}")
-            false
-        }
-    }
-
-    // 应用层兜底：把构造好的 echo reply 经 mesh 发回对端。
-    private fun sendIcmpReply(reply: ByteArray) {
-        val s = session
-        if (s == null) {
-            log("本地 ICMP 应答跳过：会话已关闭")
-            return
-        }
-        val back = ipv4Str(reply.copyOfRange(16, 20))
-        Thread {
-            try {
-                s.sendToIP(back, reply)
-                log("已本地应答 ICMP echo -> $back")
-            } catch (e: Exception) {
-                log("ICMP 回包发送失败: ${e.message}")
-            }
-        }.start()
-    }
-
-    // echo 请求/回包的匹配键："id:seq:对端IP"（请求取源 IP，回包取目的 IP，两者一致）。
-    private fun icmpEchoKey(pkt: ByteArray, isReply: Boolean): String? {
-        if (pkt.size < 28 || (pkt[0].toInt() shr 4) != 4) return null
-        val ihl = (pkt[0].toInt() and 0x0F) * 4
-        if (ihl < 20 || pkt.size < ihl + 8) return null
-        val id = ((pkt[ihl + 4].toInt() and 0xFF) shl 8) or (pkt[ihl + 5].toInt() and 0xFF)
-        val seq = ((pkt[ihl + 6].toInt() and 0xFF) shl 8) or (pkt[ihl + 7].toInt() and 0xFF)
-        val peer = if (isReply) ipv4Str(pkt.copyOfRange(16, 20)) else ipv4Str(pkt.copyOfRange(12, 16))
-        return "$id:$seq:$peer"
-    }
-
-    // 内核代答等待窗口：超时后若仍未读到内核回包，则兜底补位并置兜底状态
-    // （兜底期间每 KERNEL_ICMP_REPROBE_EVERY 个请求复探一次）。
-    private fun scheduleKernelFallback(key: String, reply: ByteArray) {
-        val sc = scheduler ?: return
-        try {
-            sc.schedule({
-                if (pendingEcho.remove(key)) {
-                    val wasFailed = kernelIcmpFailed
-                    kernelIcmpFailed = true
-                    log(if (wasFailed) {
-                        "内核复探仍无应答，继续兜底（${KERNEL_ICMP_REPROBE_EVERY} 个请求后再试）"
-                    } else {
-                        "内核未在 ${KERNEL_ICMP_FALLBACK_MS}ms 内应答，本会话改用应用层兜底"
-                    })
-                    sendIcmpReply(reply)
-                }
-            }, KERNEL_ICMP_FALLBACK_MS, TimeUnit.MILLISECONDS)
-        } catch (e: Exception) {
-            log("兜底计时器启动失败: ${e.message}")
-        }
-    }
-
-    private fun buildNotification(): Notification {
-        val chId = "p2p-vpn"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(chId, "P2P 组网 VPN", NotificationManager.IMPORTANCE_LOW)
-            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-                .createNotificationChannel(ch)
-        }
-        val pi = PendingIntent.getActivity(this, 0,
-            Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        return Notification.Builder(this, chId)
-            .setContentTitle("P2P 组网")
-            .setContentText("虚拟局域网运行中")
-            .setSmallIcon(android.R.drawable.ic_menu_compass)
-            .setContentIntent(pi)
-            .build()
+        bridgeExecutor?.execute { runVpn(request) }
+        return START_STICKY
     }
 
     override fun onDestroy() {
         stopVpn()
         super.onDestroy()
     }
-}
 
-private fun parseCidr(cidr: String): Pair<String, Int> {
-    val parts = cidr.split("/")
-    val prefix = if (parts.size > 1) parts[1].toIntOrNull() ?: 24 else 24
-    return parts[0] to prefix
-}
+    // ---------- 组网与 VPN 接口 ----------
 
-private fun parseIpv4(s: String): ByteArray? {
-    val parts = s.split(".")
-    if (parts.size != 4) return null
-    val out = ByteArray(4)
-    parts.forEachIndexed { i, p -> out[i] = (p.toIntOrNull() ?: return null).toByte() }
-    return out
-}
+    private fun runVpn(request: VpnRequest) {
+        val client = Session(request.toMeshConfig().toP2p(), listener)
+        // 必须先 protect mesh socket，再建立 VPN，否则会把自己的流量再路由回 tun。
+        client.setSocketProtector(protector)
+        session = client
 
-private fun ipv4Dst(pkt: ByteArray): ByteArray? {
-    if (pkt.size < 20 || (pkt[0].toInt() shr 4) != 4) return null
-    return byteArrayOf(pkt[16], pkt[17], pkt[18], pkt[19])
-}
+        try {
+            client.connect(request.room)
+        } catch (e: Exception) {
+            log("连接失败: ${e.message}")
+            stopSelf()
+            return
+        }
 
-private fun ipv4Str(ip: ByteArray): String =
-    ip.joinToString(".") { (it.toInt() and 0xFF).toString() }
+        val ip = awaitLocalIp(client)
+        if (ip == null) {
+            log("等待虚拟 IP 超时")
+            stopSelf()
+            return
+        }
+        val subnet = client.subnet()?.takeIf { it.isNotEmpty() } ?: DEFAULT_SUBNET
 
-// 判断 ip 是否属于网段（仅处理 IPv4 /24 及更小前缀的快速判断）
-private fun inVirtualNet(ip: ByteArray, net: ByteArray, prefix: Int): Boolean {
-    if (ip.size < 4 || net.size < 4) return false
-    val bytes = prefix / 8
-    for (i in 0 until bytes) {
-        if (ip[i] != net[i]) return false
+        if (request.localStack) {
+            try {
+                client.enableLocalStack()
+                client.exposeTCP(ECHO_TCP_PORT.toLong())
+                val echo = TcpEchoServer(ECHO_TCP_PORT) { message -> log(message) }
+                if (echo.start()) {
+                    echoServer = echo
+                } else {
+                    echo.stop()
+                }
+                log("用户态协议栈已启用，TCP $ECHO_TCP_PORT 已暴露给虚拟网")
+            } catch (e: Exception) {
+                log("用户态协议栈启用失败: ${e.message}（ICMP 走应用层代答，TCP 7000 不可用）")
+            }
+        } else {
+            log("未启用用户态协议栈：ICMP 内核优先，超时后应用层代答")
+        }
+
+        val pfd = buildTun(ip, subnet)
+        if (pfd == null) {
+            log("VPN 接口建立失败")
+            stopSelf()
+            return
+        }
+        tunFd = pfd
+        tunOutput = FileOutputStream(pfd.fileDescriptor)
+
+        log("VPN 接口已建立: $ip/$subnet")
+        AppBus.sendVpnState(this, true)
+        bridgeTunToMesh(client, FileInputStream(pfd.fileDescriptor))
+        log("VPN 读循环退出")
+        stopSelf()
     }
-    if (bytes < 4 && prefix % 8 != 0) {
-        val mask = (0xFF shl (8 - prefix % 8)) and 0xFF
-        if ((ip[bytes].toInt() and mask) != (net[bytes].toInt() and mask)) return false
-    }
-    return true
-}
 
-// 标准 IP 校验和（RFC 1071）
-private fun ipChecksum(data: ByteArray, offset: Int, length: Int): Int {
-    var sum = 0
-    var i = offset
-    val end = offset + length
-    while (i < end - 1) {
-        sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
-        i += 2
+    private fun awaitLocalIp(client: Session): String? {
+        repeat(LOCAL_IP_WAIT_ATTEMPTS) {
+            if (!running) return null
+            client.localIP()?.takeIf { it.isNotEmpty() }?.let { return it }
+            try {
+                Thread.sleep(LOCAL_IP_POLL_MS)
+            } catch (_: InterruptedException) {
+                return null
+            }
+        }
+        return null
     }
-    if (i < end) {
-        sum += (data[i].toInt() and 0xFF) shl 8
-    }
-    while (sum > 0xFFFF) {
-        sum = (sum and 0xFFFF) + (sum shr 16)
-    }
-    return (sum.inv()) and 0xFFFF
-}
 
-// 校验 IP 头校验和：合法包头（含校验和字段）的补码和为 0
-private fun ipHeaderChecksumValid(pkt: ByteArray): Boolean {
-    if (pkt.size < 20 || (pkt[0].toInt() shr 4) != 4) return false
-    val ihl = (pkt[0].toInt() and 0x0F) * 4
-    if (pkt.size < ihl) return false
-    return ipChecksum(pkt, 0, ihl) == 0
-}
+    private fun buildTun(ip: String, subnet: String): ParcelFileDescriptor? {
+        val network = subnet.substringBefore('/')
+        val prefix = subnet.substringAfter('/', DEFAULT_PREFIX.toString())
+            .toIntOrNull()
+            ?.coerceIn(0, 32)
+            ?: DEFAULT_PREFIX
+        val networkBytes = Ipv4.parseAddress(network)
+        if (networkBytes == null) {
+            log("子网地址无效: $subnet")
+            return null
+        }
+        virtualNetwork = networkBytes
+        virtualPrefix = prefix
 
-// IP 头前 20 字节的 hex，便于核对 45/协议/源目地址
-private fun hexHeader(pkt: ByteArray): String {
-    val n = minOf(20, pkt.size)
-    return (0 until n).joinToString("") { "%02x".format(pkt[it].toInt() and 0xFF) }
+        val builder = Builder()
+            .setSession("p2p-mesh")
+            .setMtu(MTU)
+            .setBlocking(true)
+            .addAddress(ip, prefix)
+            .addRoute(network, prefix)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                val networks = cm.allNetworks
+                if (networks.isNotEmpty()) {
+                    builder.setUnderlyingNetworks(networks)
+                    log("底层网络已绑定（${networks.size} 个）")
+                } else {
+                    log("警告：未获取到底层网络，VPN 路由可能不生效")
+                }
+            } catch (e: Exception) {
+                log("绑定底层网络失败: ${e.message}")
+            }
+        }
+
+        return try {
+            builder.establish()
+        } catch (e: Exception) {
+            log("建立 VPN 接口异常: ${e.message}")
+            null
+        }
+    }
+
+    // ---------- tun <-> mesh 桥接 ----------
+
+    private fun bridgeTunToMesh(client: Session, input: FileInputStream) {
+        log("VPN 读循环已启动")
+        val buffer = ByteArray(65536)
+        while (running) {
+            val read = try {
+                input.read(buffer)
+            } catch (e: Exception) {
+                log("读循环退出: ${e.message}")
+                break
+            }
+            if (read <= 0) break
+            handleTunPacket(client, buffer.copyOf(read))
+        }
+    }
+
+    /** tun -> mesh：只路由虚拟子网流量，避免把手机上网流量打进 mesh。 */
+    private fun handleTunPacket(client: Session, packet: ByteArray) {
+        val info = Ipv4.parse(packet) ?: run {
+            Log.d(TAG, "丢弃非 IPv4 包（${packet.size} 字节）")
+            return
+        }
+        // 内核产生的 ICMP echo reply：说明内核 TUN 能正常回包，取消待定的应用层兜底。
+        if (Ipv4.isIcmpEchoReply(packet)) {
+            val key = Ipv4.icmpEchoKey(packet)
+            if (key != null && pendingEcho.remove(key) && kernelIcmpFailed) {
+                kernelIcmpFailed = false
+                log("检测到内核 ICMP 回包，恢复内核优先")
+            }
+        }
+        val me = session?.localIP()
+        if (me != null && info.destination == me) {
+            Log.d(TAG, "丢弃发往本机虚拟 IP 的回环包")
+            return
+        }
+        val network = virtualNetwork ?: return
+        if (!Ipv4.inSubnet(info.destinationBytes, network, virtualPrefix)) {
+            Log.d(TAG, "丢弃非虚拟网段流量: ${info.destination} 协议 ${info.protocol}")
+            return
+        }
+
+        val broadcast = Ipv4.isMulticast(info.destinationBytes) ||
+            Ipv4.isSubnetBroadcast(info.destinationBytes, network, virtualPrefix) ||
+            Ipv4.isLimitedBroadcast(info.destinationBytes)
+
+        try {
+            if (broadcast) {
+                client.broadcast(packet)
+            } else {
+                client.sendToIP(info.destination, packet)
+            }
+        } catch (e: Exception) {
+            log("mesh 发送失败: ${e.message}")
+        }
+    }
+
+    /**
+     * mesh -> tun。SDK 回调线程内不能反调 Session，所以 ICMP 代答放到
+     * senderExecutor 里发送；写入 tun 是文件 IO，可以原地完成。
+     */
+    private fun handleMeshPacket(packet: ByteArray) {
+        if (!running) return
+        val info = Ipv4.parse(packet) ?: run {
+            log("收到无效 IPv4 包，丢弃")
+            return
+        }
+        val me = session?.localIP()
+        if (me != null && info.destination == me) {
+            // 用户态协议栈开启时，发给本机的包会在 SDK 内被拦截，一般走不到这里。
+            val reply = Ipv4.icmpEchoReply(packet, me)
+            if (reply != null) {
+                val key = Ipv4.icmpEchoKey(packet)
+                if (key == null) {
+                    sendAppEchoReply(packet, reply, me)
+                } else if (kernelIcmpFailed) {
+                    // 之前内核不回包，暂时应用层代答；每 N 次复探一次内核。
+                    echoSinceFail++
+                    if (echoSinceFail >= KERNEL_ICMP_REPROBE_EVERY) {
+                        echoSinceFail = 0
+                        tryKernelThenFallback(packet, reply, key, me)
+                    } else {
+                        sendAppEchoReply(packet, reply, me)
+                    }
+                } else {
+                    // 默认内核优先：先注入 TUN，等内核回包；超时未回再兜底。
+                    tryKernelThenFallback(packet, reply, key, me)
+                }
+            } else {
+                // 用户态协议栈只接管发给本机的 ICMP echo request（以及 TCP）。
+                // 其它发给本机的包（例如 ping 对端后返回的 ICMP echo reply）
+                // 必须注入 tun 让内核 ping socket 收到，否则手机自己 ping 不通。
+                if (!injectToTun(packet)) {
+                    log("注入本机回包失败（协议 ${info.protocol}）")
+                }
+            }
+            return
+        }
+        injectToTun(packet)
+    }
+
+    /** 应用层 ICMP echo reply 兜底。必须在后台线程发送，不能在 SDK 回调线程里反调 Session。 */
+    private fun sendAppEchoReply(request: ByteArray, reply: ByteArray, me: String) {
+        val back = Ipv4.parse(reply)?.destination ?: return
+        val client = session
+        senderExecutor?.execute {
+            try {
+                client?.sendToIP(back, reply)
+                log("已代答 ICMP echo -> $back")
+            } catch (e: Exception) {
+                log("ICMP 代答发送失败: ${e.message}")
+            }
+        }
+    }
+
+    /** 内核优先：注入 TUN，并在超时后发送应用层兜底 reply（若内核已回则自动取消）。 */
+    private fun tryKernelThenFallback(
+        request: ByteArray,
+        reply: ByteArray,
+        key: String,
+        me: String,
+    ) {
+        pendingEcho.add(key)
+        if (!injectToTun(request)) {
+            pendingEcho.remove(key)
+            sendAppEchoReply(request, reply, me)
+            return
+        }
+        val scheduled = fallbackScheduler?.schedule({
+            if (pendingEcho.remove(key)) {
+                sendAppEchoReply(request, reply, me)
+                kernelIcmpFailed = true
+                log("内核未在 ${KERNEL_ICMP_FALLBACK_MS}ms 内回 ICMP，应用层代答")
+            }
+        }, KERNEL_ICMP_FALLBACK_MS, TimeUnit.MILLISECONDS)
+        if (scheduled == null) {
+            pendingEcho.remove(key)
+            sendAppEchoReply(request, reply, me)
+        }
+    }
+
+    private fun injectToTun(packet: ByteArray): Boolean {
+        val output = tunOutput ?: return false
+        return try {
+            synchronized(tunWriteLock) {
+                output.write(packet)
+                output.flush()
+            }
+            true
+        } catch (e: Exception) {
+            log("写入 VPN 接口失败: ${e.message}")
+            false
+        }
+    }
+
+    // ---------- 生命周期 ----------
+
+    private fun stopVpn() {
+        val active = running || session != null || tunFd != null || echoServer != null
+        if (!active) return
+
+        running = false
+
+        echoServer?.stop()
+        echoServer = null
+
+        try {
+            tunOutput?.close()
+        } catch (_: Exception) {
+        }
+        tunOutput = null
+
+        try {
+            tunFd?.close()
+        } catch (_: Exception) {
+        }
+        tunFd = null
+
+        session?.disconnect()
+        session = null
+
+        fallbackScheduler?.shutdownNow()
+        fallbackScheduler = null
+        pendingEcho.clear()
+        kernelIcmpFailed = false
+        echoSinceFail = 0
+
+        bridgeExecutor?.shutdownNow()
+        senderExecutor?.shutdownNow()
+        bridgeExecutor = null
+        senderExecutor = null
+
+        log("VPN 已停止")
+        AppBus.sendVpnState(this, false)
+    }
+
+    // ---------- 辅助 ----------
+
+    private fun readRequest(intent: Intent): VpnRequest? {
+        val server = intent.getStringExtra(EXTRA_SERVER)?.trim().orEmpty()
+        val room = intent.getStringExtra(EXTRA_ROOM)?.trim().orEmpty()
+        if (server.isEmpty() || room.isEmpty()) return null
+        return VpnRequest(
+            server = server,
+            room = room,
+            token = intent.getStringExtra(EXTRA_TOKEN).orEmpty(),
+            authUser = intent.getStringExtra(EXTRA_AUTH_USER).orEmpty(),
+            authSecret = intent.getStringExtra(EXTRA_AUTH_SECRET).orEmpty(),
+            localStack = intent.getBooleanExtra(EXTRA_LOCAL_STACK, false),
+            relayEnabled = intent.getBooleanExtra(EXTRA_RELAY, true),
+            debug = intent.getBooleanExtra(EXTRA_DEBUG, true),
+            plaintext = intent.getBooleanExtra(EXTRA_PLAINTEXT, false),
+        )
+    }
+
+    private fun startForegroundWithType() {
+        val notification = buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun buildNotification(): Notification {
+        val channelId = "p2p-vpn"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(
+                NotificationChannel(channelId, "P2P 组网 VPN", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+
+        val contentIntent = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+        )
+        val stopIntent = PendingIntent.getService(
+            this,
+            1,
+            Intent(this, MeshVpnService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, channelId)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+        return builder
+            .setContentTitle("P2P 组网")
+            .setContentText("虚拟局域网运行中")
+            .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .setOngoing(true)
+            .setContentIntent(contentIntent)
+            .addAction(0, "断开", stopIntent)
+            .build()
+    }
+
+    private fun newSingleExecutor(name: String): ExecutorService =
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "$name-${threadIds.incrementAndGet()}").apply { isDaemon = true }
+        }
+
+    private fun log(message: String) {
+        Log.i(TAG, message)
+        AppBus.sendLog(this, "[vpn] $message")
+    }
+
+    private fun ByteArray.toUtf8(): String = String(this, Charsets.UTF_8)
+
+    companion object {
+        const val ACTION_START = "com.example.p2pdemo.VPN_START"
+        const val ACTION_STOP = "com.example.p2pdemo.VPN_STOP"
+
+        const val EXTRA_SERVER = "extra.server"
+        const val EXTRA_ROOM = "extra.room"
+        const val EXTRA_TOKEN = "extra.token"
+        const val EXTRA_AUTH_USER = "extra.auth_user"
+        const val EXTRA_AUTH_SECRET = "extra.auth_secret"
+        const val EXTRA_LOCAL_STACK = "extra.local_stack"
+        const val EXTRA_RELAY = "extra.relay"
+        const val EXTRA_DEBUG = "extra.debug"
+        const val EXTRA_PLAINTEXT = "extra.plaintext"
+
+        const val ECHO_TCP_PORT = 7000
+
+        private const val TAG = "MeshVpn"
+        private const val NOTIFICATION_ID = 1001
+        private const val MTU = 1280
+        private const val DEFAULT_PREFIX = 24
+        private const val DEFAULT_SUBNET = "10.9.0.0/24"
+        private const val LOCAL_IP_WAIT_ATTEMPTS = 100
+        private const val LOCAL_IP_POLL_MS = 200L
+        private const val KERNEL_ICMP_FALLBACK_MS = 500L
+        private const val KERNEL_ICMP_REPROBE_EVERY = 10
+    }
 }

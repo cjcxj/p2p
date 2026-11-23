@@ -6,7 +6,10 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/ipv4"
 
 	"p2p/core/protocol"
 	"p2p/core/stun"
@@ -18,6 +21,20 @@ const (
 	StatePunched  = "punched"
 	StateRelay    = "relay"
 )
+
+// WireGuardSink consumes a WireGuard datagram received on the punch socket. It
+// is called from the read goroutine and must not block.
+type WireGuardSink func(data []byte, src *net.UDPAddr)
+
+// SetWireGuardSink attaches a tunnel to this socket, or detaches it when sink
+// is nil. Packets are dropped rather than queued until a sink is attached.
+func (p *Punch) SetWireGuardSink(sink WireGuardSink) {
+	if sink == nil {
+		p.wgHook.Store(nil)
+		return
+	}
+	p.wgHook.Store(&sink)
+}
 
 // keepaliveInterval keeps established NAT mappings alive. It is shorter than
 // common NAT mapping timeouts (30s–120s) while staying low-overhead.
@@ -38,13 +55,25 @@ type Punch struct {
 	// OnData is called for inbound data packets (from the read goroutine).
 	OnData func(src protocol.PeerID, pkt *Packet) error
 	// OnState reports per-peer punching progress (from the read goroutine).
-	OnState func(peerID protocol.PeerID, state string)
+	// The third argument is the actual remote UDP endpoint (IP:port) used for
+	// the connection, or an empty string when not available.
+	OnState func(peerID protocol.PeerID, state string, endpoint string)
+	// wgHook routes datagrams that are not punch frames to a WireGuard tunnel
+	// sharing this socket -- and therefore this NAT mapping. Swapped atomically
+	// because the tunnel may attach while the read loop is already running.
+	wgHook atomic.Pointer[WireGuardSink]
 
-	mu    sync.Mutex
-	peers map[protocol.PeerID]*peer
-	done  chan struct{}
-	once  sync.Once
-	wg    sync.WaitGroup
+	mu     sync.Mutex
+	peers  map[protocol.PeerID]*peer
+	done   chan struct{}
+	once   sync.Once
+	wg     sync.WaitGroup
+	sendCh chan sendItem
+}
+
+type sendItem struct {
+	endpoint *net.UDPAddr
+	buf      []byte
 }
 
 type peer struct {
@@ -66,6 +95,7 @@ func New(conn net.PacketConn, myID protocol.PeerID, my NATInfo, cfg Config) *Pun
 		MyID:   myID,
 		My:     my,
 		Config: cfg,
+		sendCh: make(chan sendItem, 4096),
 		peers:  make(map[protocol.PeerID]*peer),
 		done:   make(chan struct{}),
 	}
@@ -123,10 +153,12 @@ func (p *Punch) RemovePeer(id protocol.PeerID) {
 	p.mu.Unlock()
 }
 
-// Start begins the shared read loop.
+// Start begins the shared read and batch-send loops.
 func (p *Punch) Start() {
 	p.wg.Add(1)
 	go p.readLoop()
+	p.wg.Add(1)
+	go p.sendLoop()
 }
 
 // RegisterRelay sends a relay registration packet so the relay learns our
@@ -181,9 +213,91 @@ func (p *Punch) Send(id protocol.PeerID, data []byte) error {
 	ps.seq++
 	pkt := &Packet{Type: PktData, Seq: ps.seq, Src: p.MyID, Dst: id, Payload: data}
 	buf := encodePooled(pkt)
-	_, err := p.Conn.WriteTo(buf, ps.endpoint)
-	putEncode(buf)
-	return err
+	select {
+	case p.sendCh <- sendItem{endpoint: ps.endpoint, buf: buf}:
+		return nil
+	default:
+		// Queue is full: fall back to an immediate write to avoid blocking the
+		// caller. This should be rare; the batch writer drains continuously.
+		_, err := p.Conn.WriteTo(buf, ps.endpoint)
+		putEncode(buf)
+		return err
+	}
+}
+
+const (
+	sendBatchSize     = 64
+	sendBatchInterval = time.Millisecond
+)
+
+// sendLoop batches outbound UDP datagrams and flushes them with sendmmsg
+// (WriteBatch) where supported. This reduces syscall overhead dramatically on
+// high-packet-rate paths such as Android TUN bridging.
+func (p *Punch) sendLoop() {
+	defer p.wg.Done()
+	var batchWriter *ipv4.PacketConn
+	if uc, ok := p.Conn.(*net.UDPConn); ok {
+		batchWriter = ipv4.NewPacketConn(uc)
+	}
+	msgs := make([]ipv4.Message, 0, sendBatchSize)
+	ticker := time.NewTicker(sendBatchInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.done:
+			p.flushBatch(msgs, batchWriter)
+			return
+		case item := <-p.sendCh:
+			msgs = append(msgs, ipv4.Message{Addr: item.endpoint, Buffers: [][]byte{item.buf}})
+			// Coalesce everything already queued, then send at once. Blocking on
+			// the ticker instead would add its full interval to every isolated
+			// packet's latency.
+		drain:
+			for len(msgs) < sendBatchSize {
+				select {
+				case more := <-p.sendCh:
+					msgs = append(msgs, ipv4.Message{Addr: more.endpoint, Buffers: [][]byte{more.buf}})
+				default:
+					break drain
+				}
+			}
+			p.flushBatch(msgs, batchWriter)
+			msgs = msgs[:0]
+		case <-ticker.C:
+			if len(msgs) > 0 {
+				p.flushBatch(msgs, batchWriter)
+				msgs = msgs[:0]
+			}
+		}
+	}
+}
+
+func (p *Punch) flushBatch(msgs []ipv4.Message, batchWriter *ipv4.PacketConn) {
+	if len(msgs) == 0 {
+		return
+	}
+	if batchWriter != nil {
+		if _, err := batchWriter.WriteBatch(msgs, 0); err == nil {
+			for _, m := range msgs {
+				if len(m.Buffers) > 0 {
+					putEncode(m.Buffers[0])
+				}
+			}
+			return
+		}
+		// WriteBatch is not supported on this platform/conn; fall back to
+		// individual writes so packets are not silently dropped.
+	}
+	for _, m := range msgs {
+		if m.Addr != nil && len(m.Buffers) > 0 {
+			_, _ = p.Conn.WriteTo(m.Buffers[0], m.Addr)
+		}
+	}
+	for _, m := range msgs {
+		if len(m.Buffers) > 0 {
+			putEncode(m.Buffers[0])
+		}
+	}
 }
 
 // Connected reports whether the peer has a confirmed endpoint.
@@ -245,6 +359,7 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 	interval := time.Duration(p.intervalMs()) * time.Millisecond
 
 	// Verbose flow log: the punching plan for this peer.
+	p.logf("peer %s (nat=%s): my private=%s peer private=%s", id.String()[:8], info.Type, p.My.PrivateAddr, info.PrivateAddr)
 	p.logf("peer %s (nat=%s): punching plan", id.String()[:8], info.Type)
 	for _, ep := range punchEps {
 		p.logf("  target kind=%s %s", ep.Kind, ep.Addr)
@@ -400,6 +515,14 @@ func (p *Punch) readLoop() {
 			return
 		}
 		for _, bp := range batches {
+			if IsWireGuard(bp.data) {
+				if sink := p.wgHook.Load(); sink != nil {
+					if ua, ok := bp.src.(*net.UDPAddr); ok {
+						(*sink)(bp.data, ua)
+					}
+				}
+				continue
+			}
 			pkt, err := Decode(bp.data)
 			if err != nil {
 				continue
@@ -505,8 +628,12 @@ func (p *Punch) report(ps *peer, id protocol.PeerID) {
 	}
 	ps.mu.Lock()
 	t := ps.transport
+	endpoint := ""
+	if ps.endpoint != nil {
+		endpoint = ps.endpoint.String()
+	}
 	ps.mu.Unlock()
-	p.OnState(id, t)
+	p.OnState(id, t, endpoint)
 }
 
 func (p *Punch) stopped() bool {

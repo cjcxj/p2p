@@ -1,4 +1,42 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">P2P 组网 Demo</string>
+
+    <string name="server_label">服务器地址（host:port）</string>
+    <string name="server_hint">例如 192.168.1.100:8080</string>
+    <string name="room_label">房间</string>
+    <string name="room_hint">同一房间才能互通</string>
+
+    <string name="advanced_collapse">高级设置 ▸</string>
+    <string name="advanced_expand">高级设置 ▾</string>
+    <string name="auth_label">房间密钥 / 用户名 / 密钥（可选）</string>
+    <string name="token_hint">房间密钥</string>
+    <string name="user_hint">用户名（服务器按用户鉴权时）</string>
+    <string name="secret_hint">密钥 / 密码</string>
+    <string name="relay_enabled">中继回退</string>
+    <string name="debug_log">详细打洞日志</string>
+    <string name="plaintext_log">关闭数据面加密（测试，两端需同时开）</string>
+    <string name="local_stack">用户态协议栈（默认关闭，测试用）</string>
+
+    <string name="connect">连接</string>
+    <string name="disconnect">断开</string>
+    <string name="vpn_on">VPN 组网</string>
+    <string name="vpn_off">关闭 VPN</string>
+    <string name="vpn_starting">启动中…</string>
+
+    <string name="status_disconnected">未连接</string>
+    <string name="status_connecting">连接中…</string>
+    <string name="status_connect_failed">连接失败</string>
+    <string name="status_fill_server_room">请填写服务器和房间</string>
+    <string name="members_empty">（暂无其他节点）</string>
+
+    <string name="message_label">点对点消息</string>
+    <string name="peer_ip_hint">目标虚拟 IP</string>
+    <string name="message_hint">消息内容</string>
+    <string name="send">发送</string>
+    <string name="broadcast">广播</string>
+    <string name="self_ping">自测 ping</string>
+
+    <string name="log_title">日志</string>
+    <string name="clear_log">清空</string>
 </resources>

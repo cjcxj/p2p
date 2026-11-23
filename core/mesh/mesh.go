@@ -10,7 +10,6 @@ package mesh
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"net"
 	"sync"
 
@@ -109,9 +108,16 @@ type Node struct {
 	byIP      map[string]protocol.PeerID
 	routes    map[string]protocol.PeerID // learned next hop for a virtual IP
 	known     map[string]struct{}
-	seen      map[string]struct{}
-	seenOrder []string
+	seen      map[seenKey]struct{}
+	seenOrder []seenKey
 	lastID    uint32
+}
+
+// seenKey identifies a frame for deduplication. Using a fixed-size struct
+// avoids per-packet fmt/string allocation on the hot path.
+type seenKey struct {
+	src [4]byte
+	id  uint32
 }
 
 // maxSeen bounds the mesh deduplication table. Older entries are evicted in
@@ -128,7 +134,7 @@ func NewNode(id protocol.PeerID, vip net.IP, network *net.IPNet) *Node {
 		byIP:   make(map[string]protocol.PeerID),
 		routes: make(map[string]protocol.PeerID),
 		known:  make(map[string]struct{}),
-		seen:   make(map[string]struct{}),
+		seen:   make(map[seenKey]struct{}),
 	}
 }
 
@@ -372,8 +378,13 @@ func (n *Node) markSeen(f *Frame) {
 	}
 }
 
-func (n *Node) seenKey(f *Frame) string {
-	return fmt.Sprintf("%s:%d", f.Src.String(), f.PktID)
+func (n *Node) seenKey(f *Frame) seenKey {
+	var k seenKey
+	if v4 := f.Src.To4(); v4 != nil {
+		copy(k.src[:], v4)
+	}
+	k.id = f.PktID
+	return k
 }
 
 func (n *Node) nextID() uint32 {

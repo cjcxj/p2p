@@ -94,6 +94,6 @@ func main() {
 	}
 
 	fmt.Printf("wrote %s and %s\n", certPath, keyPath)
-	fmt.Printf("server: p2p-server --tls-cert %s --tls-key %s\n", certPath, keyPath)
-	fmt.Printf("client: p2p-client ... --tls --tls-insecure\n")
+	fmt.Printf("server: p2p server --tls-cert %s --tls-key %s\n", certPath, keyPath)
+	fmt.Printf("client: p2p client ... --tls --tls-insecure\n")
 }

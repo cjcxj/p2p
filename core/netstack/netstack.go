@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -21,9 +22,13 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 const mtu = 1280
+
+// tcpForwarderMaxInFlight bounds simultaneous userspace TCP handshakes.
+const tcpForwarderMaxInFlight = 1024
 
 // LocalStack owns one virtual address in a userspace IP stack.
 type LocalStack struct {
@@ -78,8 +83,58 @@ func NewLocalStack(vip net.IP, subnet *net.IPNet, send func(ipPkt []byte)) (*Loc
 		send:  send,
 		close: make(chan struct{}),
 	}
+
+	// Forward unhandled inbound TCP to 127.0.0.1:<same port>. This makes
+	// services that listen on 0.0.0.0 reachable through the virtual IP even
+	// when the host firewall drops new connections on the TUN interface.
+	tcpFwd := tcp.NewForwarder(s, 0, tcpForwarderMaxInFlight, func(req *tcp.ForwarderRequest) {
+		go ls.handleTCPForwarder(req)
+	})
+	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
+
 	go ls.drain()
 	return ls, nil
+}
+
+// handleTCPForwarder accepts an inbound TCP connection in the userspace stack
+// and proxies it to a local service listening on 127.0.0.1:same-port.
+func (l *LocalStack) handleTCPForwarder(req *tcp.ForwarderRequest) {
+	port := req.ID().LocalPort
+	if port == 0 {
+		req.Complete(true)
+		return
+	}
+	var wq waiter.Queue
+	ep, err := req.CreateEndpoint(&wq)
+	if err != nil {
+		req.Complete(true)
+		return
+	}
+	req.Complete(false)
+
+	client := gonet.NewTCPConn(&wq, ep)
+	upstream, derr := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port))))
+	if derr != nil {
+		client.Close()
+		return
+	}
+
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(upstream, client)
+		if tc, ok := upstream.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(client, upstream)
+		_ = client.CloseWrite()
+		done <- struct{}{}
+	}()
+	<-done
+	_ = client.Close()
+	_ = upstream.Close()
 }
 
 // HandleInbound feeds a raw IPv4 packet into the userspace stack. Only

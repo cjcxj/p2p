@@ -39,6 +39,10 @@ type Config struct {
 	// self-signed certificates in trusted/internal deployments only.
 	TLSInsecureSkipVerify bool
 
+	// Plaintext disables data-plane encryption for performance testing. Both
+	// ends must set it; traffic will not be encrypted end-to-end.
+	Plaintext bool
+
 	// TimeoutSec bounds the whole connection attempt (default 15).
 	TimeoutSec int
 	// ProbeIntervalMs is the delay between probe bursts (default 200).

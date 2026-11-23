@@ -3,177 +3,216 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:padding="16dp">
+    android:padding="12dp">
 
-    <!-- 固定输入区：始终可见 -->
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="服务器地址 (host:port)"
-        android:textSize="14sp" />
-
-    <EditText
-        android:id="@+id/serverInput"
+    <!-- 上半部分：配置、状态、消息输入，小屏可滚动 -->
+    <ScrollView
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:hint="例如 192.168.1.100:8080（STUN 自动取相同地址）" />
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="false">
 
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="房间"
-        android:textSize="14sp" />
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
 
-    <EditText
-        android:id="@+id/roomInput"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:hint="房间名（同一房间才能互通）" />
+            <TextView
+                style="@style/FieldLabel"
+                android:text="@string/server_label" />
 
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="Token / 用户名 / 密钥（可选）"
-        android:textSize="13sp" />
+            <EditText
+                android:id="@+id/serverInput"
+                style="@style/FieldInput"
+                android:hint="@string/server_hint" />
 
+            <TextView
+                style="@style/FieldLabel"
+                android:text="@string/room_label" />
+
+            <EditText
+                android:id="@+id/roomInput"
+                style="@style/FieldInput"
+                android:hint="@string/room_hint" />
+
+            <Button
+                android:id="@+id/advToggle"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="@string/advanced_collapse"
+                android:textSize="13sp" />
+
+            <LinearLayout
+                android:id="@+id/advPanel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:visibility="gone">
+
+                <TextView
+                    style="@style/FieldLabel"
+                    android:layout_marginTop="0dp"
+                    android:text="@string/auth_label" />
+
+                <EditText
+                    android:id="@+id/tokenInput"
+                    style="@style/FieldInput"
+                    android:hint="@string/token_hint" />
+
+                <EditText
+                    android:id="@+id/userInput"
+                    style="@style/FieldInput"
+                    android:hint="@string/user_hint" />
+
+                <EditText
+                    android:id="@+id/secretInput"
+                    style="@style/FieldInput"
+                    android:hint="@string/secret_hint"
+                    android:inputType="textPassword" />
+
+                <CheckBox
+                    android:id="@+id/relayCheck"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checked="true"
+                    android:text="@string/relay_enabled" />
+
+                <CheckBox
+                    android:id="@+id/debugCheck"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/debug_log" />
+
+                <CheckBox
+                    android:id="@+id/plaintextCheck"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/plaintext_log" />
+
+                <CheckBox
+                    android:id="@+id/localStackCheck"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checked="true"
+                    android:text="@string/local_stack" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/connectBtn"
+                    style="@style/WeightButton"
+                    android:text="@string/connect" />
+
+                <Button
+                    android:id="@+id/disconnectBtn"
+                    style="@style/WeightButton"
+                    android:enabled="false"
+                    android:text="@string/disconnect" />
+
+                <Button
+                    android:id="@+id/vpnBtn"
+                    style="@style/WeightButton"
+                    android:text="@string/vpn_on" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/statusText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="@string/status_disconnected"
+                android:textSize="14sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/memberText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textSize="13sp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="@string/message_label" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:orientation="horizontal">
+
+                <EditText
+                    android:id="@+id/peerInput"
+                    style="@style/WeightInput"
+                    android:hint="@string/peer_ip_hint" />
+
+                <Button
+                    android:id="@+id/pingBtn"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:enabled="false"
+                    android:text="@string/self_ping" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:orientation="horizontal">
+
+                <EditText
+                    android:id="@+id/msgInput"
+                    style="@style/WeightInput"
+                    android:hint="@string/message_hint" />
+
+                <Button
+                    android:id="@+id/sendBtn"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:enabled="false"
+                    android:text="@string/send" />
+
+                <Button
+                    android:id="@+id/broadcastBtn"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:enabled="false"
+                    android:text="@string/broadcast" />
+            </LinearLayout>
+        </LinearLayout>
+    </ScrollView>
+
+    <!-- 下半部分：固定高度的日志区，独立滚动 -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="horizontal">
-
-        <EditText
-            android:id="@+id/tokenInput"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:hint="房间密钥" />
-
-        <EditText
-            android:id="@+id/userInput"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:hint="用户名" />
-
-        <EditText
-            android:id="@+id/secretInput"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:hint="密钥/密码" />
-    </LinearLayout>
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:orientation="horizontal">
-
-        <CheckBox
-            android:id="@+id/debugCheck"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="详细打洞日志" />
-
-        <CheckBox
-            android:id="@+id/localStackCheck"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:checked="true"
-            android:text="用户态协议栈" />
-
-        <Button
-            android:id="@+id/connectBtn"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="连接" />
-
-        <Button
-            android:id="@+id/disconnectBtn"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="断开" />
-
-        <Button
-            android:id="@+id/vpnBtn"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="VPN 组网" />
-    </LinearLayout>
-
-    <TextView
-        android:id="@+id/statusText"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
-        android:text="未连接"
-        android:textSize="14sp"
-        android:textStyle="bold" />
-
-    <TextView
-        android:id="@+id/memberText"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:textSize="13sp" />
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
+        android:gravity="center_vertical"
         android:orientation="horizontal">
 
-        <EditText
-            android:id="@+id/peerInput"
+        <TextView
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:hint="目标虚拟 IP" />
+            android:text="@string/log_title"
+            android:textSize="14sp"
+            android:textStyle="bold" />
 
         <Button
-            android:id="@+id/sendBtn"
+            android:id="@+id/clearLogBtn"
+            style="?android:attr/borderlessButtonStyle"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="发送" />
+            android:text="@string/clear_log"
+            android:textSize="13sp" />
     </LinearLayout>
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:orientation="horizontal">
-
-        <EditText
-            android:id="@+id/msgInput"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:hint="消息内容" />
-
-        <Button
-            android:id="@+id/broadcastBtn"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="广播" />
-
-        <Button
-            android:id="@+id/pingBtn"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="自测ping" />
-    </LinearLayout>
-
-    <!-- 日志区：独立滚动 -->
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="日志"
-        android:textSize="14sp" />
 
     <ScrollView
         android:id="@+id/logScroll"
@@ -185,6 +224,8 @@
             android:id="@+id/logText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:textSize="13sp" />
+            android:fontFamily="monospace"
+            android:textIsSelectable="true"
+            android:textSize="12sp" />
     </ScrollView>
 </LinearLayout>

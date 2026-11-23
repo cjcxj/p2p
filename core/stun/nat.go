@@ -53,6 +53,22 @@ func (c *Client) Secondary() *net.UDPAddr {
 	return &net.UDPAddr{IP: ip, Port: c.Server.Port + 1}
 }
 
+// localIPFor returns the local IPv4 address the OS would use to reach server.
+func localIPFor(server *net.UDPAddr) net.IP {
+	if server == nil {
+		return nil
+	}
+	c, err := net.DialUDP("udp", nil, server)
+	if err != nil {
+		return nil
+	}
+	defer c.Close()
+	if a, ok := c.LocalAddr().(*net.UDPAddr); ok {
+		return a.IP
+	}
+	return nil
+}
+
 // Detect runs the RFC 3489 style test sequence and classifies the NAT.
 //
 // With a single-IP STUN server the change-IP test is never answered, so
@@ -71,6 +87,14 @@ func (c *Client) Detect() (*Detection, error) {
 	}
 	local := c.Conn.LocalAddr()
 	localUDP, _ := local.(*net.UDPAddr)
+	// A socket bound to 0.0.0.0 reports a wildcard local IP. Resolve the
+	// concrete source IP used to reach the STUN server so same-LAN peers can
+	// find each other via the private-network shortcut.
+	if localUDP != nil && (localUDP.IP == nil || localUDP.IP.IsUnspecified()) {
+		if ip := localIPFor(c.Server); ip != nil {
+			localUDP = &net.UDPAddr{IP: ip, Port: localUDP.Port}
+		}
+	}
 	d := &Detection{
 		NATType:    NatUnknown,
 		MappedAddr: mapped1,

@@ -94,3 +94,11 @@ func Decode(b []byte) (*Packet, error) {
 	p.Payload = append([]byte(nil), b[41:41+plen]...)
 	return p, nil
 }
+
+// IsWireGuard reports whether a datagram on the shared socket carries a
+// WireGuard message. Their type is a little-endian u32 in 1..4, so the leading
+// byte separates them from PNCH (0x50..), MSHM (0x4D..) and STUN (0x00/0x01
+// class byte followed by a non-zero second byte) without parsing any of them.
+func IsWireGuard(b []byte) bool {
+	return len(b) >= 4 && b[0] >= 1 && b[0] <= 4 && b[1] == 0 && b[2] == 0 && b[3] == 0
+}
