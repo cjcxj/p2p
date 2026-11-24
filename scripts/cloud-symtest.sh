@@ -12,6 +12,13 @@
 # match on the veth subnet only) and ALWAYS undone via `trap` + explicit cleanup.
 # DO NOT RUN without reading it and agreeing; it is provided for review.
 #
+# PREREQUISITE -- the box that builds the namespace must NOT also host the
+# signaling/STUN server. A client inside the namespace sending to the host's own
+# public IP is delivered locally instead of out `eth0`, so `MASQUERADE -o eth0`
+# never fires and there is no per-destination port rotation: you would be
+# measuring a loopback path, not a symmetric NAT (Docker has the same problem).
+# Either point SERVER at a different host, or use a real device for that side.
+#
 #   Desktop (NAT3):  ./bin/p2p.exe connect -server <SERVER> -room symtest -verbose
 #   This script (cloud, NAT4):  ./scripts/cloud-symtest.sh <SERVER_SSH_HOST> <PORT>
 set -u
