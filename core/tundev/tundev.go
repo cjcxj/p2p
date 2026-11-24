@@ -48,6 +48,12 @@ func Create(ip net.IP, mask net.IPMask, mtu int) (*Device, error) {
 // Name returns the OS interface name.
 func (d *Device) Name() string { return d.name }
 
+// TUN returns the underlying device so it can be handed to a WireGuard
+// interface, which reads and writes raw IP packets itself. The caller must not
+// close both this wrapper and the returned device: closing the wrapper closes
+// the device.
+func (d *Device) TUN() tun.Device { return d.dev }
+
 // Read reads a raw IP packet from the TUN device.
 func (d *Device) Read(p []byte) (int, error) {
 	sizes := make([]int, 1)

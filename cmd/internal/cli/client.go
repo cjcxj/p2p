@@ -68,7 +68,8 @@ options:
   --tls-insecure   skip TLS certificate verification (self-signed only)
   --tun            (mesh) create a TUN device and route OS traffic
   --mtu <n>        (mesh) TUN MTU, default 1280
-  --userspace-stack (mesh) experimental: handle inbound TCP in userspace and forward to 127.0.0.1:same-port`)
+  --userspace-stack (mesh) experimental: handle inbound TCP in userspace and forward to 127.0.0.1:same-port
+  --legacy-mesh    (mesh) experimental: route --tun traffic through the retired mesh bridge instead of the WireGuard tunnel`)
 }
 
 func runNatCheck(args []string) int {
@@ -87,7 +88,7 @@ func runNatCheck(args []string) int {
 		fmt.Println("error:", err)
 		return 1
 	}
-	c := &stun.Client{Conn: conn, Server: addr}
+	c := &stun.Client{Conn: conn, Server: addr, SecondaryTimeout: 800 * time.Millisecond, StepSamples: stun.DefaultStepSamples}
 	det, err := c.Detect()
 	if err != nil {
 		fmt.Println("error:", err)
@@ -96,8 +97,11 @@ func runNatCheck(args []string) int {
 	fmt.Printf("NAT type : %s\n", det.NATType)
 	fmt.Printf("local    : %s\n", conn.LocalAddr())
 	fmt.Printf("public   : %s\n", det.PublicAddr())
-	if det.PortDelta != 0 {
-		fmt.Printf("port delta: %d\n", det.PortDelta)
+	if det.PortStep > 0 {
+		fmt.Printf("port step: %d\n", det.PortStep)
+	}
+	if m := det.Method(); m != "" {
+		fmt.Printf("evidence : %s\n", m)
 	}
 	return 0
 }
@@ -106,6 +110,7 @@ func runConnect(args []string) int {
 	fs := flag.NewFlagSet("connect", flag.ExitOnError)
 	server := fs.String("server", "127.0.0.1:8080", "signaling server address")
 	stunAddr := fs.String("stun", "", "STUN server address (default: same host:port as --server)")
+	stunList := fs.String("stun-list", "", "comma-separated extra STUN observation points for CGNAT candidate discovery (default: built-in list)")
 	room := fs.String("room", "", "room id")
 	token := fs.String("token", "", "room token")
 	user := fs.String("user", "", "username for server authentication")
@@ -113,6 +118,9 @@ func runConnect(args []string) int {
 	noPredict := fs.Bool("no-predict", false, "disable symmetric-NAT port prediction")
 	noRelay := fs.Bool("no-relay", false, "disable relay fallback")
 	noLAN := fs.Bool("no-lan", false, "disable same-LAN shortcut")
+	punchSockets := fs.Int("punch-sockets", 25, "socket pool size for symmetric plant/block legs (0=off)")
+	peerPortOffset := fs.Int("peer-port-offset", 20, "block spray aims at peer public port + this offset (must be < --punch-sockets)")
+	symSpray := fs.Int("sym-spray", 1024, "random ports the cone side sprays per round at a symmetric peer (birthday attack; 0=default)")
 	noEncrypt := fs.Bool("no-encrypt", false, "experimental: disable data-plane encryption (both ends must set it)")
 	timeout := fs.Int("timeout", 15, "connect timeout in seconds")
 	verbose := fs.Bool("verbose", false, "show detailed hole-punching flow logs")
@@ -152,6 +160,10 @@ func runConnect(args []string) int {
 	if *noLAN {
 		cfg.EnableLAN = false
 	}
+	cfg.PredictionSockets = *punchSockets
+	cfg.PeerPortOffset = *peerPortOffset
+	cfg.SymmetricSpray = *symSpray
+	cfg.STUNSecondaries = *stunList
 
 	cli := &cliListener{}
 	sess, err := p2p.NewSession(cfg, cli)
@@ -196,6 +208,7 @@ func runMesh(args []string) int {
 	fs := flag.NewFlagSet("mesh", flag.ExitOnError)
 	server := fs.String("server", "127.0.0.1:8080", "signaling server address")
 	stunAddr := fs.String("stun", "", "STUN server address (default: same host:port as --server)")
+	stunList := fs.String("stun-list", "", "comma-separated extra STUN observation points for CGNAT candidate discovery (default: built-in list)")
 	room := fs.String("room", "", "room id")
 	token := fs.String("token", "", "room token")
 	user := fs.String("user", "", "username for server authentication")
@@ -203,11 +216,15 @@ func runMesh(args []string) int {
 	noPredict := fs.Bool("no-predict", false, "disable symmetric-NAT port prediction")
 	noRelay := fs.Bool("no-relay", false, "disable relay fallback")
 	noLAN := fs.Bool("no-lan", false, "disable same-LAN shortcut")
+	punchSockets := fs.Int("punch-sockets", 25, "socket pool size for symmetric plant/block legs (0=off)")
+	peerPortOffset := fs.Int("peer-port-offset", 20, "block spray aims at peer public port + this offset (must be < --punch-sockets)")
+	symSpray := fs.Int("sym-spray", 1024, "random ports the cone side sprays per round at a symmetric peer (birthday attack; 0=default)")
 	noEncrypt := fs.Bool("no-encrypt", false, "experimental: disable data-plane encryption (both ends must set it)")
 	timeout := fs.Int("timeout", 15, "connect timeout in seconds")
 	useTun := fs.Bool("tun", false, "create a TUN device and route OS traffic")
 	mtu := fs.Int("mtu", 1280, "TUN MTU (1280 default: safe across most networks, avoids IP fragmentation)")
-	userspaceStack := fs.Bool("userspace-stack", false, "experimental: handle inbound TCP in userspace and forward to 127.0.0.1:same-port")
+	userspaceStack := fs.Bool("userspace-stack", false, "experimental (legacy mesh only): handle inbound TCP in userspace and forward to 127.0.0.1:same-port")
+	legacyMesh := fs.Bool("legacy-mesh", false, "experimental: route --tun traffic through the retired mesh bridge instead of the WireGuard tunnel")
 	verbose := fs.Bool("verbose", false, "show detailed hole-punching flow logs")
 	tlsEnable := fs.Bool("tls", false, "enable TLS for the signaling connection")
 	tlsServerName := fs.String("tls-server-name", "", "TLS ServerName override")
@@ -244,6 +261,11 @@ func runMesh(args []string) int {
 	if *noLAN {
 		cfg.EnableLAN = false
 	}
+	cfg.PredictionSockets = *punchSockets
+	cfg.PeerPortOffset = *peerPortOffset
+	cfg.SymmetricSpray = *symSpray
+	cfg.STUNSecondaries = *stunList
+	cfg.LegacyMesh = *legacyMesh
 
 	ml := &meshListener{}
 	ml.initData()
@@ -260,15 +282,17 @@ func runMesh(args []string) int {
 	fmt.Printf("[mesh] joining room %q\n", *room)
 
 	if *useTun {
-		runTun(sess, ml, *mtu, *userspaceStack)
+		runTun(sess, ml, *mtu, *userspaceStack, *legacyMesh)
 	} else {
 		runMeshConsole(sess, ml)
 	}
 	return 0
 }
 
-// runTun bridges the virtual network with a TUN device.
-func runTun(sess *p2p.Session, ml *meshListener, mtu int, userspaceStack bool) {
+// runTun bridges the virtual network with a TUN device. The default data plane
+// is a WireGuard tunnel on the hole-punched UDP socket; --legacy-mesh puts the
+// retired per-packet bridge back so the two can be compared on one machine.
+func runTun(sess *p2p.Session, ml *meshListener, mtu int, userspaceStack, legacyMesh bool) {
 	ml.mu.Lock()
 	ml.tunMode = true
 	ml.mu.Unlock()
@@ -281,6 +305,10 @@ func runTun(sess *p2p.Session, ml *meshListener, mtu int, userspaceStack bool) {
 	_, ipnet, err := net.ParseCIDR(sess.Subnet())
 	if err != nil {
 		ipnet = &net.IPNet{IP: net.ParseIP(ip).To4(), Mask: net.CIDRMask(24, 32)}
+	}
+	if !legacyMesh {
+		runWGTunnel(sess, ml, ip, ipnet, mtu)
+		return
 	}
 	if userspaceStack {
 		if err := sess.EnableLocalStack(); err != nil {
@@ -297,35 +325,9 @@ func runTun(sess *p2p.Session, ml *meshListener, mtu int, userspaceStack bool) {
 	}
 	defer dev.Close()
 	fmt.Printf("[mesh] 虚拟网卡已创建: %s\n", dev.Name())
-	// Windows：为虚拟网卡添加防火墙放行规则（ICMP/TCP/UDP/ALL），按虚拟子网
-	// 限定 remoteip；否则默认策略会丢弃入站 ICMP（ping 不通的常见原因）
-	if err := tundev.AddInterfaceFirewallRules(dev.Name(), ipnet.String()); err != nil {
-		fmt.Printf("[mesh] 警告: 添加防火墙放行规则失败: %v\n", err)
-		if runtime.GOOS == "windows" {
-			fmt.Printf("[mesh] 提示: 需要管理员权限；ping 不通时请以管理员运行或手动放行\n")
-		} else {
-			fmt.Printf("[mesh] 提示: Linux 请以 root 运行并确保 iptables 可用；若使用 nftables，请手动放行 %s 的虚拟子网入站流量\n", dev.Name())
-		}
-	} else if runtime.GOOS == "windows" {
-		fmt.Printf("[mesh] 已为 %s 添加防火墙放行规则（ICMP/TCP/UDP）\n", dev.Name())
-	} else {
-		fmt.Printf("[mesh] 已为 %s 添加 iptables 放行规则（虚拟子网 TCP/UDP/ICMP）\n", dev.Name())
-	}
-	devName := dev.Name()
-	defer tundev.RemoveInterfaceFirewallRules(devName)
-	// 校验虚拟 IP 是否真的落到了网卡上（排查残留网卡/进程导致的地址混乱）
-	realIP := findInterfaceIP(ipnet)
-	if realIP == ip {
-		fmt.Printf("[mesh] 本机虚拟 IP: %s/%d（%s）\n", ip, maskOnes(ipnet.Mask), sess.Subnet())
-	} else if realIP != "" {
-		fmt.Printf("[mesh] 注意: 网卡上检测到的 IP 是 %s（不是 %s），可能存在多个旧网卡/进程\n", realIP, ip)
-		fmt.Printf("[mesh] 提示: 结束所有 p2p / p2p-client 进程后重试；如仍有多个 p2p 网卡请手动删除\n")
-	} else {
-		fmt.Printf("[mesh] 警告: 未在网卡上检测到 %s，请用 ipconfig 确认虚拟网卡 IP 已配置\n", ip)
-	}
-	if stale := countInterfacesIn(ipnet); stale > 1 {
-		fmt.Printf("[mesh] 警告: 本机有 %d 个网卡使用虚拟子网 %s，建议清理旧的 p2p 网卡\n", stale, ipnet.String())
-	}
+	addTunFirewallRules(dev.Name(), ipnet)
+	defer tundev.RemoveInterfaceFirewallRules(dev.Name())
+	reportTunAddress(ip, ipnet, sess)
 	fmt.Printf("[mesh] 组网验证: 在另一台已组网的设备上执行 ping %s\n", ip)
 	ml.tun = dev
 
@@ -363,6 +365,67 @@ func runTun(sess *p2p.Session, ml *meshListener, mtu int, userspaceStack bool) {
 
 	// mesh -> TUN (ml.data carries IP packets) handled by the listener
 	for range ml.data {
+	}
+}
+
+// runWGTunnel starts the SDK's WireGuard tunnel and stays alive until Ctrl+C.
+// The interface, its address and every packet on it belong to the session;
+// this only reports on the result and opens the firewall for the new NIC.
+func runWGTunnel(sess *p2p.Session, ml *meshListener, ip string, ipnet *net.IPNet, mtu int) {
+	if err := sess.OpenTUN(mtu); err != nil {
+		fmt.Println("[mesh] WireGuard 隧道启动失败:", err)
+		fmt.Println("[mesh] 提示: 需要管理员/root 权限；Windows 还需 wintun.dll 放在 exe 同目录")
+		fmt.Println("[mesh] 提示: 可临时加 --legacy-mesh 走旧网桥对比")
+		return
+	}
+	name := sess.TUNName()
+	fmt.Printf("[mesh] WireGuard 隧道已启动（虚拟网卡 %s）\n", name)
+	addTunFirewallRules(name, ipnet)
+	defer tundev.RemoveInterfaceFirewallRules(name)
+	reportTunAddress(ip, ipnet, sess)
+	fmt.Printf("[mesh] 组网验证: 在另一台已组网的设备上执行 ping %s\n", ip)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		sess.Disconnect()
+	}()
+	for range ml.data {
+	}
+}
+
+// addTunFirewallRules 为虚拟网卡添加防火墙放行规则（ICMP/TCP/UDP/ALL），按
+// 虚拟子网限定 remoteip；否则默认策略会丢弃入站 ICMP（ping 不通的常见原因）。
+func addTunFirewallRules(name string, ipnet *net.IPNet) {
+	if err := tundev.AddInterfaceFirewallRules(name, ipnet.String()); err != nil {
+		fmt.Printf("[mesh] 警告: 添加防火墙放行规则失败: %v\n", err)
+		if runtime.GOOS == "windows" {
+			fmt.Printf("[mesh] 提示: 需要管理员权限；ping 不通时请以管理员运行或手动放行\n")
+		} else {
+			fmt.Printf("[mesh] 提示: Linux 请以 root 运行并确保 iptables 可用；若使用 nftables，请手动放行 %s 的虚拟子网入站流量\n", name)
+		}
+	} else if runtime.GOOS == "windows" {
+		fmt.Printf("[mesh] 已为 %s 添加防火墙放行规则（ICMP/TCP/UDP）\n", name)
+	} else {
+		fmt.Printf("[mesh] 已为 %s 添加 iptables 放行规则（虚拟子网 TCP/UDP/ICMP）\n", name)
+	}
+}
+
+// reportTunAddress 校验虚拟 IP 是否真的落到了网卡上（排查残留网卡/进程导致的
+// 地址混乱）。
+func reportTunAddress(ip string, ipnet *net.IPNet, sess *p2p.Session) {
+	realIP := findInterfaceIP(ipnet)
+	if realIP == ip {
+		fmt.Printf("[mesh] 本机虚拟 IP: %s/%d（%s）\n", ip, maskOnes(ipnet.Mask), sess.Subnet())
+	} else if realIP != "" {
+		fmt.Printf("[mesh] 注意: 网卡上检测到的 IP 是 %s（不是 %s），可能存在多个旧网卡/进程\n", realIP, ip)
+		fmt.Printf("[mesh] 提示: 结束所有 p2p / p2p-client 进程后重试；如仍有多个 p2p 网卡请手动删除\n")
+	} else {
+		fmt.Printf("[mesh] 警告: 未在网卡上检测到 %s，请用 ipconfig 确认虚拟网卡 IP 已配置\n", ip)
+	}
+	if stale := countInterfacesIn(ipnet); stale > 1 {
+		fmt.Printf("[mesh] 警告: 本机有 %d 个网卡使用虚拟子网 %s，建议清理旧的 p2p 网卡\n", stale, ipnet.String())
 	}
 }
 

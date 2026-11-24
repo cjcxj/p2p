@@ -60,6 +60,14 @@ func (e *endpoint) DstToBytes() []byte {
 type Bind struct {
 	pc net.PacketConn
 
+	// sender, when set, overrides how an outbound datagram reaches its
+	// destination. The session installs one that writes through the punch
+	// engine's *winning* socket for that peer, because a hole-punched NAT
+	// mapping only exists on the socket that actually punched -- sending a
+	// reply out a different socket would use an unmapped source the peer drops.
+	// Nil means send straight through pc.
+	sender func([]byte, *net.UDPAddr) error
+
 	pool sync.Pool
 
 	mu        sync.Mutex
@@ -86,6 +94,14 @@ func NewBind(pc net.PacketConn) *Bind {
 		b.localPort = uint16(ua.Port)
 	}
 	return b
+}
+
+// SetSender installs the outbound router described on the Bind.sender field. A
+// nil sender restores writing through pc directly.
+func (b *Bind) SetSender(fn func([]byte, *net.UDPAddr) error) {
+	b.mu.Lock()
+	b.sender = fn
+	b.mu.Unlock()
 }
 
 // Ingest hands a received WireGuard datagram to the device. It never blocks:
@@ -155,7 +171,16 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		return conn.ErrWrongEndpointType
 	}
 	addr := net.UDPAddrFromAddrPort(target.AddrPort)
+	b.mu.Lock()
+	sender := b.sender
+	b.mu.Unlock()
 	for _, buf := range bufs {
+		if sender != nil {
+			if err := sender(buf, addr); err != nil {
+				return err
+			}
+			continue
+		}
 		if _, err := b.pc.WriteTo(buf, addr); err != nil {
 			return err
 		}

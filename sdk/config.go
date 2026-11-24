@@ -43,6 +43,11 @@ type Config struct {
 	// ends must set it; traffic will not be encrypted end-to-end.
 	Plaintext bool
 
+	// LegacyMesh keeps the retired mesh data plane for TUN traffic instead of
+	// the WireGuard tunnel. It exists only to A/B the two paths on real
+	// hardware and mobile; leave it false unless comparing.
+	LegacyMesh bool
+
 	// TimeoutSec bounds the whole connection attempt (default 15).
 	TimeoutSec int
 	// ProbeIntervalMs is the delay between probe bursts (default 200).
@@ -50,17 +55,44 @@ type Config struct {
 	// PunchTimeoutMs is how long to punch before falling back to relay
 	// (default 4000).
 	PunchTimeoutMs int
+	// PredictionSockets is the number of UDP source sockets used for the
+	// symmetric-NAT block spray (n4-style). 0 disables the socket pool;
+	// 1 = primary socket only. Values > 1 bind a contiguous local port block
+	// and, against a hard (symmetric/unmeasurable) peer, aim every socket at
+	// the peer's public port + PeerPortOffset, betting the NAT preserves the
+	// local port. This needs no peer PortStep, so it reaches a cellular
+	// CGNAT the step path cannot. Default (via Defaults): 25.
+	PredictionSockets int
+	// PeerPortOffset shifts the block spray off the peer's reported public
+	// port (n4 "-o", default 20). Must be < PredictionSockets so the aim
+	// lands inside the local block.
+	PeerPortOffset int
+	// SymmetricSpray is how many random ports the cone side fires per round at
+	// a hard peer's public IP (paired with the hard side's plant leg -- the
+	// birthday attack that connects a cellular CGNAT). 0 = SDK default (1024).
+	SymmetricSpray int
+	// STUNSecondaries is a comma-separated list of extra observation addresses
+	// ("host:port,host:port") used to discover the destination-rotating CGNAT
+	// candidate public IPs. Empty uses the built-in DefaultSecondaries. Set this
+	// per deployment to STUN servers that are actually reachable from your
+	// network/region -- the hole-punch generalization depends on the candidate
+	// set covering the egress IP the peer direction uses, so region-appropriate
+	// observation points matter.
+	STUNSecondaries string
 }
 
 // Defaults returns a Config with the recommended values filled in.
 func Defaults() *Config {
 	return &Config{
-		RelayEnabled:    true,
-		PortPrediction:  true,
-		EnableLAN:       true,
-		TimeoutSec:      15,
-		ProbeIntervalMs: 200,
-		PunchTimeoutMs:  4000,
+		RelayEnabled:      true,
+		PortPrediction:    true,
+		EnableLAN:         true,
+		TimeoutSec:        15,
+		ProbeIntervalMs:   200,
+		PunchTimeoutMs:    4000,
+		PredictionSockets: 25,
+		PeerPortOffset:    20,
+		SymmetricSpray:    1024,
 	}
 }
 

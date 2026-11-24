@@ -3,6 +3,7 @@ package stun
 import (
 	"fmt"
 	"net"
+	"time"
 )
 
 // NATType classifies the behaviour of the network address translation in
@@ -16,8 +17,19 @@ const (
 	NatRestrictedCone     NATType = "restricted_cone"
 	NatPortRestrictedCone NATType = "port_restricted_cone"
 	NatSymmetric          NATType = "symmetric"
-	NatUnknown            NATType = "unknown"
-	NatBlocked            NATType = "blocked"
+	// NatCone means the NAT repeats one mapping for every destination (so it is
+	// cone, which is all hole punching needs to know) but the inbound filter
+	// level was never measured: grading full vs address vs port restricted
+	// requires the server to answer from a second port and a second IP, and a
+	// combined server normally has neither. Reporting a guessed subtype is what
+	// made a single-port deployment claim "port restricted" everywhere.
+	NatCone NATType = "cone"
+	// NatUnmeasurable means filtering was at least port-dependent, but no
+	// alternate destination answered, so cone and symmetric were never told
+	// apart. Treat it as "may well be symmetric", not as cone.
+	NatUnmeasurable NATType = "unmeasurable"
+	NatUnknown      NATType = "unknown"
+	NatBlocked      NATType = "blocked"
 )
 
 // Detection holds the result of a NAT classification.
@@ -30,6 +42,27 @@ type Detection struct {
 	// PortDelta is the per-mapping port increment observed for a symmetric
 	// NAT (0 when not symmetric or not measurable).
 	PortDelta int
+	// Secondary records which alternate destination produced the comparison
+	// that decided a symmetric/port-restricted classification. Empty means no
+	// alternate destination was usable.
+	Secondary string
+	// PortStep is how far this NAT's public port moves per new binding
+	// (0 = not measured or not predictable). It is the number symmetric NAT
+	// port prediction needs: the increment is per binding, not per destination,
+	// so it can only be learned by creating several sockets.
+	PortStep int
+	// ObservedIPs is the set of distinct public IPv4 addresses this host was
+	// seen at across the primary and every alternate destination that answered
+	// (index 0 is the primary mapping). A CGNAT that rotates its egress address
+	// per destination yields several; the easy peer sprays at all of them so a
+	// destination-dependent mapping can still be collided with.
+	ObservedIPs []net.IP
+	// FilterMeasured reports whether the cone subtype (full / address / port
+	// restricted) was actually observed rather than assumed.
+	FilterMeasured bool
+	// Note carries the caveat for what could not be tested, so a reader of the
+	// log knows how far to trust NATType.
+	Note string
 }
 
 // PublicAddr returns the mapped public address as a host:port string.
@@ -40,17 +73,32 @@ func (d *Detection) PublicAddr() string {
 	return d.MappedAddr.String()
 }
 
-// Secondary is an alternate STUN endpoint (second destination) used to
-// detect symmetric NATs. It is optional.
-func (c *Client) Secondary() *net.UDPAddr {
-	if c.Server == nil {
-		return nil
+// Method explains what the classification actually rested on, which is the
+// first thing to look at when a peer's punching plan seems wrong: a symmetric
+// NAT only ever shows up if an alternate destination answered.
+func (d *Detection) Method() string {
+	var s string
+	switch {
+	case d.NATType == NatSymmetric:
+		s = fmt.Sprintf("second destination %s gave a different mapping (delta %+d)", d.Secondary, d.PortDelta)
+	case d.NATType == NatPortRestrictedCone:
+		s = fmt.Sprintf("second destination %s repeated the mapping, change-port answer dropped", d.Secondary)
+	case d.NATType == NatFullCone:
+		s = "change-IP answer arrived: no address filtering"
+	case d.NATType == NatRestrictedCone:
+		s = "change-IP answer dropped: address-filtered but not port-filtered"
+	case d.NATType == NatCone:
+		s = fmt.Sprintf("second destination %s repeated the mapping", d.Secondary)
+	case d.NATType == NatUnmeasurable:
+		s = "no alternate destination answered"
 	}
-	ip := c.Server.IP
-	if ip == nil {
-		return nil
+	if d.PortStep != 0 {
+		s += fmt.Sprintf("; port step %+d per new binding", d.PortStep)
 	}
-	return &net.UDPAddr{IP: ip, Port: c.Server.Port + 1}
+	if d.Note != "" {
+		s += "; " + d.Note
+	}
+	return s
 }
 
 // localIPFor returns the local IPv4 address the OS would use to reach server.
@@ -72,9 +120,11 @@ func localIPFor(server *net.UDPAddr) net.IP {
 // Detect runs the RFC 3489 style test sequence and classifies the NAT.
 //
 // With a single-IP STUN server the change-IP test is never answered, so
-// full-cone is conservatively reported as restricted-cone (the two behave
-// identically for hole punching). A second IP on the server restores the
-// distinction.
+// full-cone is conservatively reported as port-restricted cone (the two behave
+// the same for hole punching). The cone/symmetric distinction does not depend
+// on the server having a second port: an alternate destination from
+// DefaultSecondaries is enough, and if none of them answers the result is
+// NatUnmeasurable rather than a guess.
 func (c *Client) Detect() (*Detection, error) {
 	// Test I: plain binding to primary.
 	t1, _, err := c.BindRequest(false, false)
@@ -107,35 +157,124 @@ func (c *Client) Detect() (*Detection, error) {
 		return d, nil
 	}
 
-	// Test III: change port only -> filters by source port?
+	// Test III: ask the server to answer from its port+1. A reply proves the
+	// NAT does not filter by source port. Silence proves nothing on its own:
+	// a combined signaling+STUN+relay server usually listens on one UDP port
+	// only, so there may be nobody to answer from port+1 even on a full-cone
+	// network. The alternate loop below records whether server:port+1 ever
+	// answered and grades the cone subtype from that instead of guessing.
 	t3, _, _ := c.BindRequest(false, true)
 	if t3 != nil {
-		// Not port-restricted in filtering: either full cone or
-		// address-restricted cone.
+		// Not port-filtered. Telling full cone from address-restricted cone
+		// needs a reply from a *second server address*, which a single-address
+		// deployment cannot produce.
 		t2, _, _ := c.BindRequest(true, false)
 		if t2 != nil {
 			d.NATType = NatFullCone
+			d.FilterMeasured = true
 		} else {
-			d.NATType = NatRestrictedCone
+			d.NATType = NatCone
+			d.Note = "not port-filtered; full vs address-restricted needs a second server address"
 		}
 		return d, nil
 	}
 
 	// Filtering is port-dependent: either port-restricted cone or symmetric.
-	// Probe a second destination to observe mapping behaviour.
-	if sec := c.Secondary(); sec != nil {
-		client2 := *c
-		client2.Server = sec
-		if t4, _, err4 := client2.BindOnce(); err4 == nil {
-			if m4, errM := t4.MappedAddress(); errM == nil {
-				if m4.Port != mapped1.Port {
-					d.NATType = NatSymmetric
-					d.PortDelta = m4.Port - mapped1.Port
-					return d, nil
-				}
+	// Ask the alternate destinations what they see. A cone NAT repeats the
+	// mapping it already made, a symmetric / CGNAT allocates a new one per
+	// destination. That per-destination address is exactly what the easy peer
+	// must aim at, so keep probing every alternate (within a budget) to publish
+	// the whole candidate set, not only the first one that answers. Any answer
+	// that differs from the primary mapping proves the NAT is destination-
+	// dependent, which is the correct trigger for the plant/spray strategy.
+	until := time.Now().Add(6 * time.Second)
+	altAnswered := false
+	answered := false
+	differs := false
+	delta := 0
+	firstSec := ""
+	observed := []net.IP{}
+	seen := map[string]bool{}
+	if mapped1.IP != nil {
+		seen[mapped1.IP.String()] = true
+		observed = append(observed, mapped1.IP)
+	}
+	// Enumerate the whole configured STUN list in parallel (from ephemeral
+	// sockets) while the shared-socket classification runs below. This is what
+	// makes "configure many STUN servers" actually sample them all instead of
+	// the first few the sequential budget reaches.
+	altAddrs := c.secondaryAddrs()
+	obsDone := make(chan []net.IP, 1)
+	go func() { obsDone <- c.observeEgressIPs(altAddrs, 1200*time.Millisecond, 4*time.Second) }()
+	for _, sec := range altAddrs {
+		if time.Now().After(until) {
+			break
+		}
+		fromServerAltPort := c.Server != nil && sec.IP != nil &&
+			sec.IP.Equal(c.Server.IP) && sec.Port == c.Server.Port+1
+		t4, err4 := c.secondaryProbe(sec, until)
+		if err4 != nil {
+			continue
+		}
+		m4, errM := t4.MappedAddress()
+		if errM != nil {
+			continue
+		}
+		answered = true
+		if fromServerAltPort {
+			altAnswered = true
+		}
+		if firstSec == "" {
+			firstSec = sec.String()
+		}
+		if m4.IP != nil && !seen[m4.IP.String()] {
+			seen[m4.IP.String()] = true
+			observed = append(observed, m4.IP)
+		}
+		if m4.Port != mapped1.Port || !m4.IP.Equal(mapped1.IP) {
+			if !differs {
+				delta = m4.Port - mapped1.Port
 			}
+			differs = true
 		}
 	}
-	d.NATType = NatPortRestrictedCone
+	// Fold in every egress IP the parallel multi-STUN sweep found, so the
+	// published candidate set covers the full configured observation list.
+	for _, ip := range <-obsDone {
+		if ip != nil && !seen[ip.String()] {
+			seen[ip.String()] = true
+			observed = append(observed, ip)
+		}
+	}
+	d.ObservedIPs = observed
+	if differs {
+		d.NATType = NatSymmetric
+		d.Secondary = firstSec
+		d.PortDelta = delta
+		d.PortStep = c.measureStep()
+		return d, nil
+	}
+	if answered {
+		d.Secondary = firstSec
+		// Cone: every alternate that answered repeated the primary mapping.
+		// Grading the inbound filter needs the change-port test to have been
+		// possible, and the only evidence that it was is the server's second
+		// port answering.
+		if altAnswered {
+			d.NATType = NatPortRestrictedCone
+			d.FilterMeasured = true
+		} else {
+			d.NATType = NatCone
+			d.Note = "inbound filter level untested: nothing answered from the server's second port"
+		}
+		return d, nil
+	}
+
+	// No alternate destination answered, so the mapping was never observed
+	// against a second destination. Guessing "port restricted" here is what
+	// makes a symmetric NAT get the wrong punching plan: report the ambiguity
+	// and let the strategy probe for both.
+	d.NATType = NatUnmeasurable
+	d.PortStep = c.measureStep()
 	return d, nil
 }

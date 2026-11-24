@@ -78,6 +78,7 @@ type Candidate struct {
 	PrivateAddr string `json:"private_addr"`
 	RelayAddr   string `json:"relay_addr"`
 	PortDelta   int    `json:"port_delta"`
+	PortStep    int    `json:"port_step,omitempty"`
 	// X25519Pub is the sender's X25519 public key (hex, 32 bytes) used to
 	// derive a per-pair data-plane AEAD key. Older peers omit it and the
 	// session falls back to plaintext data.

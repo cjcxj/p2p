@@ -1,16 +1,28 @@
 package punch
 
 import (
+	"math/rand"
 	"net"
 
 	"p2p/core/stun"
 )
 
+// defaultPeerPortOffset mirrors n4's "-o 20": every pool socket aims at
+// peer_port+offset, betting the NAT preserves the local port into the public
+// one, so the peer's own block spray lands inside this socket's public port.
+const defaultPeerPortOffset = 20
+
+// defaultSymmetricSpray is how many random ports the easy side fires at a hard
+// peer's public IP each round -- the EasyTier "hard-sym" birthday leg that
+// works when the peer's NAT randomizes the per-socket public port.
+const defaultSymmetricSpray = 1024
+
 // Endpoint is one address the punch engine will probe.
 type Endpoint struct {
-	Addr  *net.UDPAddr
-	Kind  string // "lan","public","predicted","relay"
-	Order int
+	Addr   *net.UDPAddr
+	Kind   string // "lan","public","predicted","block","plant","spray","relay"
+	Order  int
+	Socket int // index into Punch.Conns; 0 = primary
 }
 
 // NATInfo describes one side's reachability from the other side's
@@ -20,7 +32,42 @@ type NATInfo struct {
 	PublicAddr  *net.UDPAddr
 	PrivateAddr *net.UDPAddr
 	PortDelta   int
+	PortStep    int
 	RelayAddr   *net.UDPAddr
+	// PublicIPs are additional distinct public addresses this peer was seen at
+	// across multiple STUN observation points (a destination-rotating CGNAT).
+	// Empty for ordinary NATs; the spray leg aims at all of them plus
+	// PublicAddr.IP.
+	PublicIPs []net.IP
+}
+
+// CandidateIPs returns every public IPv4 address the peer might be reached at:
+// its advertised PublicAddr.IP first, then any observation-point addresses, with
+// duplicates removed. A CGNAT that rotates egress IP per destination is only
+// punchable if the spray covers the address it happens to use toward us.
+func (n NATInfo) CandidateIPs() []net.IP {
+	var out []net.IP
+	seen := map[string]bool{}
+	add := func(ip net.IP) {
+		if ip == nil {
+			return
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			ip = ip4
+		}
+		if seen[ip.String()] {
+			return
+		}
+		seen[ip.String()] = true
+		out = append(out, ip)
+	}
+	if n.PublicAddr != nil {
+		add(n.PublicAddr.IP)
+	}
+	for _, ip := range n.PublicIPs {
+		add(ip)
+	}
+	return out
 }
 
 // Config tunes the punch engine.
@@ -38,6 +85,25 @@ type Config struct {
 	ProbeIntervalMs int
 	// PunchTimeout is how long to punch before trying the relay.
 	PunchTimeoutMs int
+	// PredictionSockets is the number of source sockets in the spray pool
+	// (default 0 = no pool; 1 = primary only). Values > 1 bind a contiguous
+	// local port block and drive both the step-aligned prediction leg and the
+	// hard-symmetric plant/block legs. It needs no peer PortStep for the
+	// plant/block/spray legs, so it reaches a cellular CGNAT the step path
+	// cannot.
+	PredictionSockets int
+	// PeerPortOffset shifts the deterministic block spray off the peer's
+	// reported public port. It assumes the NAT roughly preserves the local
+	// source port (n4's "-o"), so it needs no per-binding step measurement
+	// and is the fallback when PortStep is unknown. 0 = defaultPeerPortOffset.
+	PeerPortOffset int
+	// SymmetricSpray is how many random ports the EASY side (cone NAT) fires
+	// at the hard peer's public IP each round when the peer reports no usable
+	// PortStep. Paired with the hard side's PLANT leg (all pool sockets aimed
+	// at this side's advertised address) it forms EasyTier's hard-sym
+	// birthday attack, the path that works against cellular CGNAT. 0 = use
+	// defaultSymmetricSpray (1024).
+	SymmetricSpray int
 	// OnLog, when set, receives verbose hole-punching flow messages.
 	OnLog func(format string, args ...interface{})
 }
@@ -67,38 +133,120 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 		order++
 	}
 
-	// Predicted symmetric mapping ports. A symmetric NAT increments the
-	// mapped port by a constant delta per new destination mapping. The peer's
-	// mapping for us is unknown, so we sweep a window around the port that
-	// its mapping would use if it had already mapped us, plus a few mappings
-	// ahead. Both sides sweep simultaneously, so one of the combined
-	// (probe port, mapped port) pairs lines up.
-	if cfg.PortPrediction && peer.PublicAddr != nil {
-		span := cfg.PredictionRange
-		if span <= 0 {
-			span = 4
-		}
-		base := peer.PublicAddr.Port
-		ports := make([]int, 0, span*4)
-		if peer.PortDelta != 0 {
-			// measured per-mapping delta: sweep around the predicted window
-			for k := -span; k <= span*2; k++ {
-				ports = append(ports, base+k*peer.PortDelta)
+	// Predicted symmetric mapping ports.
+	//
+	// Two independent dimensions are measured by STUN:
+	//   PortStep  -- how much the NAT increments the external port per new
+	//                local binding (measured by MeasurePortStep). This is the
+	//                dimension exploited by the socket-pool spray.
+	//   PortDelta -- how much the external port changes per destination.
+	//                This only varies across destinations for symmetric NATs
+	//                that are NOT increment-type; the old single-socket sweep
+	//                around PortDelta is the fallback for that case.
+	//
+	// When both sides can spray (PortStep > 0 and PredictionSockets > 1) the
+	// spray is aligned: socket k targets port_0 + k*peer_step.
+	if peer.PublicAddr != nil {
+		hardPeer := peer.Type == stun.NatSymmetric || peer.Type == stun.NatUnmeasurable
+		hardMy := my.Type == stun.NatSymmetric || my.Type == stun.NatUnmeasurable
+		if cfg.PredictionSockets > 1 && peer.PortStep > 0 {
+			// Step-aligned spray: one target per pool socket.
+			base := peer.PublicAddr.Port
+			for k := 0; k < cfg.PredictionSockets; k++ {
+				port := base + k*peer.PortStep
+				if port < 1 || port > 65535 {
+					continue
+				}
+				addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: port}
+				eps = append(eps, Endpoint{Addr: addr, Kind: "predicted", Order: order, Socket: k})
+				order++
 			}
-		} else {
-			// delta unknown (no STUN secondary): assume the common delta of
-			// 1 and sweep a short forward window as a best effort
-			for k := 1; k <= span; k++ {
-				ports = append(ports, base+k)
+		} else if cfg.PredictionSockets > 1 && (hardPeer || hardMy) {
+			// Hard-symmetric handling. A cellular CGNAT neither preserves the
+			// local source port nor reports a PortStep, so the n4 block bet
+			// alone misses every peer mapping. The two complementary roles are
+			// what actually connect it (EasyTier's "hard-sym" birthday attack):
+			//
+			//   hard side (this host, when hardMy): PLANT. Aim every pool
+			//     socket at the peer's advertised public address so the NAT
+			//     opens one mapping per socket -- each on a different random
+			//     public port -- all pointed at the peer. The peer's blind
+			//     spray then has something to hit.
+			//
+			//   easy side (peer is the hard one, we are cone): SPRAY. Fire a
+			//     wide, freshly randomized port set at the peer's public IP
+			//     from the primary socket, whose public port is the one the
+			//     hard side planted toward, so the spray collides with one of
+			//     the peer's random mapping ports.
+			//
+			//   the block offset (n4) is kept as a cheap first bet for NATs
+			//     that do roughly preserve ports; harmless alongside the spray.
+			if hardMy {
+				for k := 1; k < cfg.PredictionSockets; k++ {
+					eps = append(eps, Endpoint{Addr: peer.PublicAddr, Kind: "plant", Order: order, Socket: k})
+					order++
+				}
 			}
-		}
-		for _, port := range ports {
-			if port < 1 || port > 65535 {
-				continue
+			offset := cfg.PeerPortOffset
+			if offset == 0 {
+				offset = defaultPeerPortOffset
 			}
-			addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: port}
-			eps = append(eps, Endpoint{Addr: addr, Kind: "predicted", Order: order})
-			order++
+			port := peer.PublicAddr.Port + offset
+			if port >= 1 && port <= 65535 {
+				addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: port}
+				for k := 0; k < cfg.PredictionSockets; k++ {
+					eps = append(eps, Endpoint{Addr: addr, Kind: "block", Order: order, Socket: k})
+					order++
+				}
+			}
+			if hardPeer {
+				n := cfg.SymmetricSpray
+				if n <= 0 {
+					n = defaultSymmetricSpray
+				}
+				// Spray the full window at EVERY candidate IP: the primary the
+				// server knows plus any observation-point addresses, because a
+				// destination-rotating CGNAT may answer on any of them.
+				ports := distinctPorts(n)
+				for _, ip := range peer.CandidateIPs() {
+					for _, sp := range ports {
+						addr := &net.UDPAddr{IP: ip, Port: sp}
+						eps = append(eps, Endpoint{Addr: addr, Kind: "spray", Order: order, Socket: 0})
+						order++
+					}
+				}
+			}
+		} else if cfg.PortPrediction && peer.Type == stun.NatSymmetric {
+			// Legacy single-socket sweep using per-destination PortDelta.
+			span := cfg.PredictionRange
+			if span <= 0 {
+				span = 4
+			}
+			if peer.PortDelta == 0 {
+				span *= 3
+			}
+			base := peer.PublicAddr.Port
+			if peer.PortDelta != 0 {
+				for k := -span; k <= span*2; k++ {
+					port := base + k*peer.PortDelta
+					if port < 1 || port > 65535 {
+						continue
+					}
+					addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: port}
+					eps = append(eps, Endpoint{Addr: addr, Kind: "predicted", Order: order})
+					order++
+				}
+			} else {
+				for k := 1; k <= span; k++ {
+					port := base + k
+					if port < 1 || port > 65535 {
+						continue
+					}
+					addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: port}
+					eps = append(eps, Endpoint{Addr: addr, Kind: "predicted", Order: order})
+					order++
+				}
+			}
 		}
 	}
 
@@ -112,4 +260,29 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 
 func sameLAN(a, b net.IP) bool {
 	return len(a) == 4 && len(b) == 4 && a[0] == b[0] && a[1] == b[1] && a[2] == b[2]
+}
+
+// distinctPorts returns n unique ports in the unprivileged UDP range, used for
+// the easy-side spray at a hard peer. The global math/rand source is locked, so
+// concurrent probe loops may call this. n is capped at the range size.
+func distinctPorts(n int) []int {
+	const low, high = 1024, 65535
+	span := high - low + 1
+	if n <= 0 {
+		return nil
+	}
+	if n > span {
+		n = span
+	}
+	seen := make(map[int]struct{}, n)
+	out := make([]int, 0, n)
+	for len(out) < n {
+		p := low + rand.Intn(span)
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return out
 }

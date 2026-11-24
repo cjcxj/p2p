@@ -51,6 +51,15 @@ func New(tunDev tun.Device, pc net.PacketConn, verbose bool) *Tunnel {
 // Bind exposes the ingress hook the punch read loop feeds WireGuard packets to.
 func (t *Tunnel) Bind() *Bind { return t.bind }
 
+// SetOutboundRouter makes the tunnel write each datagram through a caller
+// supplied function instead of its fixed socket. The session installs one that
+// selects the punch engine's winning socket per peer, so the WireGuard data
+// plane shares the exact NAT mapping hole punching opened rather than a
+// different socket's unmapped source.
+func (t *Tunnel) SetOutboundRouter(fn func([]byte, *net.UDPAddr) error) {
+	t.bind.SetSender(fn)
+}
+
 // Start installs the local private key and brings the interface up. The listen
 // port is deliberately not set: the socket is already bound by the punch
 // engine, and re-binding would lose the NAT mapping hole punching created.
@@ -151,4 +160,31 @@ func (t *Tunnel) Stop() {
 	if t.tunDev != nil {
 		t.tunDev.Close()
 	}
+}
+
+// Dump returns the configuration view WireGuard keeps for this interface. It is
+// a debugging aid: handshake state is the first thing to look at when a tunnel
+// carries nothing. Secret material is redacted -- on a phone this text lands in
+// the app's own log page, where the user can copy it out.
+func (t *Tunnel) Dump() string {
+	var buf bytes.Buffer
+	if err := t.dev.IpcGetOperation(&buf); err != nil {
+		return "dump: " + err.Error()
+	}
+	return redactSecrets(buf.String())
+}
+
+var secretKeys = []string{"private_key=", "preshared_key="}
+
+func redactSecrets(dump string) string {
+	lines := strings.Split(dump, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimLeft(line, " \t")
+		for _, key := range secretKeys {
+			if rest := strings.TrimPrefix(trimmed, key); rest != trimmed {
+				lines[i] = line[:len(line)-len(trimmed)] + key + "(redacted)"
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
 }

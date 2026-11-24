@@ -1,6 +1,7 @@
 package wgengine
 
 import (
+	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -8,26 +9,22 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/crypto/curve25519"
 	"p2p/core/protocol"
 	"p2p/core/punch"
 	"p2p/core/stun"
 )
 
+// keypair returns a WireGuard key pair in the shape the SDK already exchanges:
+// a crypto/ecdh X25519 key whose public half is hex advertised in signaling and
+// whose private half is handed to WireGuard unclamped. The tunnel working with
+// these keys is what proves Candidate.X25519Pub needs no wire format change.
 func keypair(t testing.TB) (privHex, pubHex string) {
 	t.Helper()
-	sk := make([]byte, 32)
-	if _, err := rand.Read(sk); err != nil {
-		t.Fatalf("rand: %v", err)
-	}
-	sk[0] &= 248
-	sk[31] &= 127
-	sk[31] |= 64
-	pk, err := curve25519.X25519(sk, curve25519.Basepoint)
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatalf("curve25519: %v", err)
+		t.Fatalf("ecdh: %v", err)
 	}
-	return hex.EncodeToString(sk), hex.EncodeToString(pk)
+	return hex.EncodeToString(priv.Bytes()), hex.EncodeToString(priv.PublicKey().Bytes())
 }
 
 func csum(b []byte) uint16 {
@@ -121,6 +118,14 @@ func dial(t testing.TB) *pair {
 
 	pa := puncher(t, sockA, idA)
 	pb := puncher(t, sockB, idB)
+	// Punch.Stop waits for its read loop, which only unblocks once the socket it
+	// is parked on is closed -- so close first, in this one cleanup.
+	t.Cleanup(func() {
+		_ = sockA.Close()
+		_ = sockB.Close()
+		pa.Stop()
+		pb.Stop()
+	})
 	pa.AddPeer(idB, punch.NATInfo{Type: stun.NatOpen, PublicAddr: addrB, PrivateAddr: addrB})
 	pb.AddPeer(idA, punch.NATInfo{Type: stun.NatOpen, PublicAddr: addrA, PrivateAddr: addrA})
 	pa.Start()

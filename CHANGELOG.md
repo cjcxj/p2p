@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.26 (2026-11-23)
+- **修复 NAT 类型误判**：对称判定要往「第二个目的地」发一次 STUN，代码写的是 `server 端口+1`；而实际部署的信令+STUN+中继只监听一个 UDP 端口（腾讯云安全组也只放行了 8080），那次探测必然无应答，于是**任何 NAT 都被记成 `port_restricted_cone`**——对称 NAT 拿不到 `PortDelta`、也永远不会触发对称策略。现在备选目的地列表为「服务端 port+1 + 公网 STUN（`stun.miwifi.com:3478`、`stun1.l.google.com:19302`）」逐个实测：同一个 socket 在两个目的地拿到不同映射即判 `symmetric` 并测出 delta，拿到同一映射才判 `port_restricted_cone`，全都无应答则新增 `unmeasurable`（不再当作 cone 蒙）。`Detection.Method()` 把判据本身暴露出来，`nat-check` 与 SDK debug 日志都会打印「第二个目的地 X 给出的映射不同/相同」。
+- **中继接通后不再终止直连探测**：`probeLoop` 原来只要链路 connected（哪怕是中继）就转 keepalive，直连目标只发一轮（一次突发）就永久停止；而对称 NAT 的映射是按秒轮换的，一轮根本撞不上。现在中继状态下每 1 秒继续扫描直连目标（同时保留中继 keepalive），直连一旦命中就升级为直连；3 分钟仍无直连才认中继。
+- **链路只升不降**：`peer.note()` 取代 `classifyTransport()`——已确认的直连端点不会被中继上的 keepalive 覆盖，否则隧道会在直连与中继之间来回摆。
+- 疑似对称（`symmetric`/`unmeasurable` 且没有实测 delta）时，端口预测窗口从 4 扩到 12，覆盖 CGNAT 的端口漂移。
+- `wgengine.Tunnel.Dump()` 对 `private_key` / `preshared_key` 脱敏：调试日志在手机上会显示在应用自己的日志页里，之前实测泄漏过 WG 私钥。
+
+## v0.25 (2026-11-23)
+- **Android Demo 重写（逻辑 + 界面）**：界面换成 Compose + Material 3，分「总览 / 节点 / 工具 / 日志」四页，参数集中在设置面板（含 `legacyMesh` A/B 开关）。
+- **一台设备只有一个会话**：会话、节点表、隧道开关统一由进程级 `MeshController` 持有（StateFlow + 事件通道 + 2 秒心跳快照），`MeshVpnService` 不再自建 Session。旧版 Activity 与服务各建一个会话，同一台手机上有两个虚拟 IP 互相打洞，界面显示的链路也不是真正在跑的那条。
+- **虚拟网卡与房间解耦**：界面开关只调 `closeTUN()`（会话保持），离开房间才 `disconnect()`；`MeshVpnService` 退化为能力提供者，只注册 `protect(fd)` 与 `Builder().establish()` 两件事到 `VpnBridge`。
+- **修正描述符交接 API**：`ParcelFileDescriptor.detachFileDescriptor()` 不是公开 API（编译不过），改用公开的 `detachFd()`；交出后由 Go 关闭，Kotlin 侧不再关。
+- **重新 protect 的时机写进流程**：`setSocketProtector` 在虚拟网卡建立之后再调一次——接口一出现默认路由就归 VPN，mesh 的 UDP socket 若不当场摘出隧道，打洞包会绕回自己。
+- **连通性自测改为真走隧道**：删掉 `InetAddress.isReachable`（Android 上不保证发 ICMP，且应用 socket 未走隧道会假阴性），改成系统 `/system/bin/ping` 解析 RTT/丢包 + TCP 7000 往返计时；旧的 Kotlin 逐包桥接文件（`MeshClient.kt`、`AppBus.kt`、`MeshConfig.kt`、`activity_main.xml`、`styles.xml`）随之下线。
+- 构建：工程离线可编译（`--offline` 用缓存里的 Gradle 9.1.0 与本地已缓存的 Compose 组件；Compose 编译器插件用 `resolutionStrategy.eachPlugin` 直接指到 `compose-compiler-gradle-plugin`，因为插件 marker 不在缓存里）。`:app:assembleDebug` 通过。
+
+## v0.24 (2026-11)
+- 数据面换成 WireGuard 隧道：打洞完成后在同一个 UDP socket 上跑 WG，发现帧与隧道帧按首字节分流，IP 流量不再逐包 AEAD + mesh 转发。回环实测每包分配从 6.8 KB/34 次降到 0.3 KB/6 次，1420 字节包吞吐 14–18 万 pkt/s（≈1.6–2.0 Gbit/s），丢包 ≤0.07%。
+- 建连不再等 5 秒：WG 的 initiator 由两端 PeerID 排序唯一决定，只有一端发握手；另一端配晚了的坏顺序由 600ms 看门狗重开握手，首包实测从 5.2s 降到 ~1ms（坏顺序 ~0.6s）。
+- SDK 新增 `OpenTUN(mtu)` / `TUNName()`（桌面自己创建并配置虚拟网卡）；`AttachTUN(fd, mtu)` 改为把描述符直接交给 WG 接口读写（Android 走 `CreateUnmonitoredTUNFromFD`），不再有逐包桥接。Android 侧的 fd 归 SDK 所有：调用返回后（无论成败）描述符已由 Go 关闭，调用方再关一次会误伤已复用的 fd。
+- Android Demo 的 `MeshVpnService` 只剩一次 `attachTUN(pfd.detachFileDescriptor(), mtu)`：删掉 tun 读循环、逐包 IPv4 解析、`sendToIP`/`broadcast` 转发和 ICMP 内核兜底/复探那一整套 Kotlin 桥接（约 200 行），`Ipv4.kt` 随之下线；本机 ICMP 由内核应答，TCP 7000 直接监听即可从虚拟网访问，「用户态协议栈」开关对隧道无效（仅记一条日志）。Android WG 接口的 MTU 由请求值上报（`tundev.fixedMTU`），避免依赖应用可能无权的 `SIOCGIFMTU`。
+- CLI `p2p client mesh --tun` 默认走 WG 隧道；新增 `--legacy-mesh`（SDK 为 `Config.LegacyMesh`）退回旧 mesh 网桥，便于真机 A/B 对比与回滚。
+- 中继链路暂不进隧道：WG 直接向端点写原始帧，中继只认自己的分帧，因此 relay 节点仍走旧路径；对称 NAT 打不通直连的场景留待后续。
+
 ## v0.23 (2026-08)
 - CLI 客户端与服务端合二为一：新增统一 `cmd/p2p`（`p2p server` / `p2p client ...`，并接受旧式 `p2p mesh/connect/nat-check` 子命令）。
 - 构建产物保留 `p2p-server` / `p2p-client` 兼容副本（同一二进制按 `argv[0]` 自动识别角色）。

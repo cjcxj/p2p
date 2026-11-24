@@ -3,12 +3,15 @@
 .gopath/
 
 # Build artifacts
-bin/*.exe
-bin/*-linux
-bin/*.dll
+/bin/
+/*.exe
 android/*.aar
 android/*.jar
 **/*.aar
+
+# Scratch output from local test runs
+*.tmp
+*.out
 
 # Android / Gradle build output
 **/build/

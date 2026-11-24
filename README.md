@@ -183,9 +183,9 @@ SDK 关键 API：
 
 ```kotlin
 val cfg = Config()
-cfg.serverAddr = "server.example.com:8080"
-cfg.stunAddr = "server.example.com:8080" // 单端口服务器：STUN 与信令同端口
-cfg.token = "secret"
+cfg.setServerAddr("server.example.com:8080")
+cfg.setSTUNAddr("server.example.com:8080") // 单端口服务器：STUN 与信令同端口
+cfg.setToken("secret")
 
 val session = Session(cfg, object : Listener {
     override fun onEvent(event: Long, peerID: String, data: ByteArray) {
@@ -194,9 +194,9 @@ val session = Session(cfg, object : Listener {
         }
     }
 })
-session.connect("demo")
-// session.sendToIP("10.9.0.1", byteArrayOf(...))
-// session.broadcast(byteArrayOf(...))
+session.connect("demo")          // 异步：虚拟 IP 由 localIP() 轮询或等 connected 事件
+// session.attachTUN(fd, 1280)   // 把 VpnService 的网卡描述符交给 SDK 跑隧道
+// session.closeTUN()            // 只收网卡，房间保持
 // session.memberCount(); session.memberAt(i)
 // session.disconnect()
 ```
@@ -206,13 +206,26 @@ session.connect("demo")
 2. app 的 `build.gradle` 添加依赖 `implementation project(':p2p')`。
 3. `AndroidManifest.xml` 添加 `<uses-permission android:name="android.permission.INTERNET"/>`。
 
+字段 getter 里带连续大写的（`getSTUNAddr`、`getNATType`）请用显式调用而不是 Kotlin 属性语法；
+Go 的 `int` 在绑定里是 `long`。
+
 ### 安卓 VPN 真接入（demo）
 
-`android-demo` 内置 `MeshVpnService`（VpnService）：默认走内核 TUN（与 Windows/Linux 一致），
-点"**VPN 组网**"，系统弹窗点允许后，手机会创建虚拟网卡并接入 mesh，获得虚拟 IP（10.9.0.x），
-**与 Windows/Linux 的 `--tun` 节点互相 ping / 访问服务**。mesh socket 已 `protect()` 防死循环；
-VPN 只路由虚拟子网（10.9.0.0/24），不影响手机正常上网。
-高级设置里的“用户态协议栈”默认关闭，仅供测试。
+`android-demo` 是 Compose + Material 3 的重写版：**一台设备只有一个会话**。旧版 Activity 和
+`MeshVpnService` 各建一个 `Session`，两个虚拟 IP 在同一台手机上互相打洞，界面显示的链路也不是
+真正在跑的那条。现在会话、节点表、隧道开关都由进程级 `MeshController` 持有，服务只提供
+`protect(fd)` 和虚拟网卡描述符两样 Android 才有的能力。
+
+用法：设置里填服务器与房间 →「接入房间」→ 打开「接入组网虚拟网卡」→ 系统授权后手机拿到
+10.9.0.x，**与 Windows/Linux 的 `--tun` 节点互相 ping / 访问服务**：IP 包以 WireGuard 帧在已打洞
+的 UDP socket 上收发（`attachTUN(fd, mtu)`，无 Kotlin 逐包桥接），ICMP 由内核应答，本机监听的
+TCP 端口（demo 里是 7000）直接从虚拟网可达。VPN 只路由虚拟子网，不影响正常上网；mesh socket 在
+网卡建立后会立刻重新 `protect()`，否则打洞包会绕回隧道。
+
+界面分四页：**总览**（本机与参数）、**节点**（VIP + 直连/中继 + UDP 端点 + NAT，点一个设为测试目标）、
+**工具**（对目标做 `ping` 与 TCP 7000 往返，走真实隧道）、**日志**（按信息/打洞/隧道/错误过滤）。
+虚拟网卡开关只调 `closeTUN()`，房间会话不动；「旧版 mesh 数据面」开关是 A/B 对照，用它比较隧道
+与逐包转发的差别。
 
 ## NAT 组合与路由
 

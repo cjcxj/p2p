@@ -44,10 +44,21 @@ const keepaliveInterval = 15 * time.Second
 // link is considered stale and hole punching is restarted.
 const peerIdleTimeout = 45 * time.Second
 
-// Punch drives hole punching for a set of remote peers over one shared UDP
-// socket.
+// relaySweepInterval is how often a peer that is only reachable over the relay
+// is probed again for a direct path. A NAT that maps each destination
+// separately rotates that mapping on the order of seconds, so a sweep that
+// stops the moment the relay answers never lines up.
+const relaySweepInterval = time.Second
+
+// directSweepDeadline bounds the background sweep: past it the relay is
+// accepted as the link and only keepalives continue.
+const directSweepDeadline = 3 * time.Minute
+
+// Punch drives hole punching for a set of remote peers over one or more shared
+// UDP sockets.
 type Punch struct {
 	Conn   net.PacketConn
+	Conns  []net.PacketConn // socket pool; Conns[0] == Conn after Start
 	MyID   protocol.PeerID
 	My     NATInfo
 	Config Config
@@ -72,6 +83,7 @@ type Punch struct {
 }
 
 type sendItem struct {
+	sockIdx  int
 	endpoint *net.UDPAddr
 	buf      []byte
 }
@@ -80,6 +92,7 @@ type peer struct {
 	info      NATInfo
 	mu        sync.Mutex
 	endpoint  *net.UDPAddr
+	sockIdx   int // which Conns entry carries this peer's data path
 	transport string
 	connected bool
 	seq       uint16
@@ -155,8 +168,13 @@ func (p *Punch) RemovePeer(id protocol.PeerID) {
 
 // Start begins the shared read and batch-send loops.
 func (p *Punch) Start() {
-	p.wg.Add(1)
-	go p.readLoop()
+	if len(p.Conns) == 0 {
+		p.Conns = []net.PacketConn{p.Conn}
+	}
+	for i, conn := range p.Conns {
+		p.wg.Add(1)
+		go p.readLoop(conn, i)
+	}
 	p.wg.Add(1)
 	go p.sendLoop()
 }
@@ -214,12 +232,10 @@ func (p *Punch) Send(id protocol.PeerID, data []byte) error {
 	pkt := &Packet{Type: PktData, Seq: ps.seq, Src: p.MyID, Dst: id, Payload: data}
 	buf := encodePooled(pkt)
 	select {
-	case p.sendCh <- sendItem{endpoint: ps.endpoint, buf: buf}:
+	case p.sendCh <- sendItem{sockIdx: ps.sockIdx, endpoint: ps.endpoint, buf: buf}:
 		return nil
 	default:
-		// Queue is full: fall back to an immediate write to avoid blocking the
-		// caller. This should be rare; the batch writer drains continuously.
-		_, err := p.Conn.WriteTo(buf, ps.endpoint)
+		_, err := p.Conns[ps.sockIdx].WriteTo(buf, ps.endpoint)
 		putEncode(buf)
 		return err
 	}
@@ -248,14 +264,21 @@ func (p *Punch) sendLoop() {
 			p.flushBatch(msgs, batchWriter)
 			return
 		case item := <-p.sendCh:
+			if item.sockIdx != 0 {
+				_, _ = p.Conns[item.sockIdx].WriteTo(item.buf, item.endpoint)
+				putEncode(item.buf)
+				continue
+			}
 			msgs = append(msgs, ipv4.Message{Addr: item.endpoint, Buffers: [][]byte{item.buf}})
-			// Coalesce everything already queued, then send at once. Blocking on
-			// the ticker instead would add its full interval to every isolated
-			// packet's latency.
 		drain:
 			for len(msgs) < sendBatchSize {
 				select {
 				case more := <-p.sendCh:
+					if more.sockIdx != 0 {
+						_, _ = p.Conns[more.sockIdx].WriteTo(more.buf, more.endpoint)
+						putEncode(more.buf)
+						continue
+					}
 					msgs = append(msgs, ipv4.Message{Addr: more.endpoint, Buffers: [][]byte{more.buf}})
 				default:
 					break drain
@@ -311,6 +334,34 @@ func (p *Punch) Connected(id protocol.PeerID) (bool, string) {
 	return ps.connected, ps.transport
 }
 
+// SendWireGuard writes an outbound WireGuard datagram to dst through the socket
+// that actually punched the peer owning that endpoint, so the frame shares the
+// peer's live NAT mapping instead of a different pool socket's unmapped source.
+// It falls back to the primary socket when the endpoint matches no punched peer
+// (a relay link, or a peer mid-roaming before its endpoint is confirmed).
+func (p *Punch) SendWireGuard(buf []byte, dst *net.UDPAddr) error {
+	if dst == nil {
+		return errors.New("punch: nil wireguard destination")
+	}
+	idx := 0
+	target := dst.String()
+	p.mu.Lock()
+	for _, ps := range p.peers {
+		ps.mu.Lock()
+		if ps.connected && ps.transport == StatePunched && ps.endpoint != nil &&
+			ps.endpoint.String() == target && ps.sockIdx < len(p.Conns) {
+			idx = ps.sockIdx
+		}
+		ps.mu.Unlock()
+	}
+	p.mu.Unlock()
+	if idx >= len(p.Conns) {
+		idx = 0
+	}
+	_, err := p.Conns[idx].WriteTo(buf, dst)
+	return err
+}
+
 func (p *Punch) peer(id protocol.PeerID) *peer {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -331,38 +382,60 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 
 	cfg := p.Config
 
-	// Symmetric-to-symmetric punching is unreliable even with port
-	// prediction: the guessed mapping may create a link that immediately
-	// goes stale. Such pairs go straight to the relay when available,
-	// otherwise they are left to the mesh's multi-hop routing.
+	// canSpray is true when the pool is active. An active pool is enough to
+	// replace the old symmetric-to-symmetric give-up path: planTargets picks
+	// the step-aligned spray when the peer reports a PortStep, and otherwise
+	// falls back to the deterministic n4-style block spray, which needs no
+	// step measurement at all (so it works against a cellular CGNAT).
+	canSpray := cfg.PredictionSockets > 1
 	bothSymmetric := p.My.Type == stun.NatSymmetric && info.Type == stun.NatSymmetric
-	if bothSymmetric && !cfg.RelayFallback {
-		return // no direct link; the mesh reaches this peer via hops
+	if bothSymmetric && !canSpray && !cfg.RelayFallback {
+		return
 	}
 
 	targets := planTargets(p.My, info, cfg)
 	var punchEps []Endpoint
 	var relayEp *Endpoint
+	spraying := false
 	for i := range targets {
-		if targets[i].Kind == "relay" {
-			relayEp = &targets[i]
-		} else {
+		switch targets[i].Kind {
+		case "relay":
+			ep := targets[i]
+			relayEp = &ep
+		case "spray":
+			spraying = true
+			punchEps = append(punchEps, targets[i])
+		default:
 			punchEps = append(punchEps, targets[i])
 		}
 	}
 
-	relayOnly := bothSymmetric
+	relayOnly := bothSymmetric && !canSpray
 	if relayOnly {
 		punchEps = nil
+		spraying = false
 	}
 
 	interval := time.Duration(p.intervalMs()) * time.Millisecond
 
-	// Verbose flow log: the punching plan for this peer.
+	// Verbose flow log: the punching plan for this peer. The spray window is
+	// thousands of endpoints; collapse it to one line so the plan is readable.
 	p.logf("peer %s (nat=%s): my private=%s peer private=%s", id.String()[:8], info.Type, p.My.PrivateAddr, info.PrivateAddr)
 	p.logf("peer %s (nat=%s): punching plan", id.String()[:8], info.Type)
+	sprayPorts := 0
+	var sprayIP net.IP
 	for _, ep := range punchEps {
+		if ep.Kind == "spray" {
+			sprayPorts++
+			if sprayIP == nil {
+				sprayIP = ep.Addr.IP
+			}
+			continue
+		}
 		p.logf("  target kind=%s %s", ep.Kind, ep.Addr)
+	}
+	if sprayPorts > 0 {
+		p.logf("  target kind=spray %d random ports at %s (re-rolled each round)", sprayPorts, sprayIP)
 	}
 	if relayEp != nil {
 		if relayOnly {
@@ -374,6 +447,7 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 
 	start := time.Now()
 	lastAnnounce := time.Time{}
+	round := 0
 	for {
 		if p.stopped() {
 			return
@@ -383,20 +457,51 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 			return
 		default:
 		}
-		if ok, _ := p.Connected(id); ok {
+		connected, transport := p.Connected(id)
+		if connected && transport != StateRelay {
+			if relayEp != nil {
+				p.logf("peer %s: direct path confirmed, upgrading from relay", id.String()[:8])
+			}
 			p.keepaliveLoop(id, stop)
 			return
 		}
+		wait := interval
+		if spraying && round > 0 {
+			// Re-roll the spray window each round. A fixed random subset can
+			// miss the peer's planted mapping ports forever; new ports every
+			// round grow coverage until a collision lands.
+			nt := planTargets(p.My, info, cfg)
+			replanned := punchEps[:0]
+			for i := range nt {
+				if nt[i].Kind != "relay" {
+					replanned = append(replanned, nt[i])
+				}
+			}
+			punchEps = replanned
+		}
 		eps := punchEps
-		useRelay := relayEp != nil
-		if useRelay {
+		if relayEp != nil {
 			if !ps.relayOn {
 				p.logf("peer %s: probing direct + relay in parallel", id.String()[:8])
 			}
 			ps.mu.Lock()
 			ps.relayOn = true
 			ps.mu.Unlock()
-			eps = append(append([]Endpoint(nil), eps...), *relayEp)
+			if connected {
+				// A working relay is not a result. A NAT that maps each
+				// destination separately usually only lines up after several
+				// rounds, and one burst is not a round: keep the relay mapping
+				// warm and keep sweeping for a direct path, more slowly.
+				p.keepAliveOnce(id)
+				if time.Since(start) > directSweepDeadline {
+					p.logf("peer %s: no direct path after %s, staying on relay", id.String()[:8], directSweepDeadline)
+					p.keepaliveLoop(id, stop)
+					return
+				}
+				wait = relaySweepInterval
+			} else {
+				eps = append(append([]Endpoint(nil), eps...), *relayEp)
+			}
 		}
 		for _, ep := range eps {
 			if p.stopped() {
@@ -409,17 +514,18 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 			}
 			p.sendProbe(ps, ep)
 		}
+		round++
 		// periodic activity heartbeat
 		if time.Since(lastAnnounce) > 2*time.Second {
 			lastAnnounce = time.Now()
-			p.logf("peer %s: still probing %d target(s) (round %d)", id.String()[:8], len(eps), int(time.Since(start)/interval))
+			p.logf("peer %s: still probing %d target(s) (round %d)", id.String()[:8], len(eps), round)
 		}
 		select {
 		case <-p.done:
 			return
 		case <-stop:
 			return
-		case <-time.After(interval):
+		case <-time.After(wait):
 		}
 	}
 }
@@ -444,7 +550,7 @@ func (p *Punch) keepaliveLoop(id protocol.PeerID, stop <-chan struct{}) {
 			return
 		}
 		ps.mu.Lock()
-		if !ps.connected || ps.endpoint == nil {
+		if !ps.connected {
 			ps.mu.Unlock()
 			return
 		}
@@ -456,15 +562,37 @@ func (p *Punch) keepaliveLoop(id protocol.PeerID, stop <-chan struct{}) {
 			p.restartPeer(id)
 			return
 		}
-		endpoint := ps.endpoint
-		ps.seq++
-		seq := ps.seq
 		ps.mu.Unlock()
-		pkt := &Packet{Type: PktAck, Seq: seq, Src: p.MyID, Dst: id}
-		buf := encodePooled(pkt)
-		p.Conn.WriteTo(buf, endpoint)
-		putEncode(buf)
+		if !p.keepAliveOnce(id) {
+			return
+		}
 	}
+}
+
+// keepAliveOnce sends the one lightweight ack that maintains a connected
+// peer's NAT mapping on its confirmed endpoint. Using PktAck with a non-zero
+// dst keeps relay broadcasts from being accepted by other room members. It
+// returns false when the peer is gone or is no longer connected.
+func (p *Punch) keepAliveOnce(id protocol.PeerID) bool {
+	ps := p.peer(id)
+	if ps == nil {
+		return false
+	}
+	ps.mu.Lock()
+	if !ps.connected || ps.endpoint == nil {
+		ps.mu.Unlock()
+		return false
+	}
+	endpoint := ps.endpoint
+	sockIdx := ps.sockIdx
+	ps.seq++
+	seq := ps.seq
+	ps.mu.Unlock()
+	pkt := &Packet{Type: PktAck, Seq: seq, Src: p.MyID, Dst: id}
+	buf := encodePooled(pkt)
+	p.Conns[sockIdx].WriteTo(buf, endpoint)
+	putEncode(buf)
+	return true
 }
 
 // restartPeer stops the current probe/keepalive generation for a peer and
@@ -495,22 +623,19 @@ func (p *Punch) sendProbe(ps *peer, ep Endpoint) {
 	seq := ps.seq
 	ps.mu.Unlock()
 	pkt := &Packet{Type: PktProbe, Seq: seq, Src: p.MyID, Dst: protocol.PeerID{}, Payload: nil}
-	// dst unknown until we learn the peer's id; carry it in payload? No -
-	// peers are identified by Src, so dst is only meaningful for data.
-	// Use dst = zero; routing is by Src on receipt.
 	buf := encodePooled(pkt)
-	p.Conn.WriteTo(buf, ep.Addr)
+	p.Conns[ep.Socket].WriteTo(buf, ep.Addr)
 	putEncode(buf)
 }
 
-func (p *Punch) readLoop() {
+func (p *Punch) readLoop(conn net.PacketConn, sockIdx int) {
 	defer p.wg.Done()
 	bufs := make([][]byte, readBatchSize)
 	for i := range bufs {
 		bufs[i] = make([]byte, 65536)
 	}
 	for {
-		batches, err := readBatch(p.Conn, bufs)
+		batches, err := readBatch(conn, bufs)
 		if err != nil {
 			return
 		}
@@ -529,36 +654,31 @@ func (p *Punch) readLoop() {
 			}
 			switch pkt.Type {
 			case PktProbe, PktProbe2, PktAck, PktData:
-				// probes carry an empty dst; acks/data are addressed to us
 				if pkt.Dst != p.MyID && pkt.Dst != (protocol.PeerID{}) {
 					continue
 				}
 			case PktRegister:
-				// only the relay server consumes registers
 				continue
 			case PktRegAck:
 				if pkt.Dst != p.MyID {
 					continue
 				}
 			}
-			p.handle(pkt, bp.src)
+			p.handle(pkt, bp.src, sockIdx)
 		}
 	}
 }
 
-func (p *Punch) handle(pkt *Packet, src net.Addr) {
+func (p *Punch) handle(pkt *Packet, src net.Addr, sockIdx int) {
 	ua, _ := src.(*net.UDPAddr)
 
 	switch pkt.Type {
 	case PktRegAck:
-		// relay registration confirmed; nothing else to do here
 		return
 	case PktRegister:
-		// handled by the relay server, not the client engine
 		return
 	}
 
-	// Only accept traffic from peers we are punching.
 	ps := p.peer(pkt.Src)
 	if ps == nil {
 		return
@@ -567,41 +687,31 @@ func (p *Punch) handle(pkt *Packet, src net.Addr) {
 	ps.lastSeen = time.Now()
 	switch pkt.Type {
 	case PktProbe, PktProbe2:
-		first := !ps.connected
-		ps.endpoint = ua
-		ps.transport = p.classifyTransport(ps, ua)
-		ps.connected = true
+		first, upgraded := ps.note(p, ua, sockIdx)
+		transport := ps.transport
 		ps.mu.Unlock()
-		if first {
-			p.logf("peer %s: <- probe from %s -> connected via %s", pkt.Src.String()[:8], ua, ps.transport)
+		if first || upgraded {
+			p.logf("peer %s: <- probe from %s -> connected via %s (socket %d)", pkt.Src.String()[:8], ua, transport, sockIdx)
 		}
-		// answer with an ack to open the return path
 		ack := &Packet{Type: PktAck, Seq: pkt.Seq, Src: p.MyID, Dst: pkt.Src}
 		buf := encodePooled(ack)
-		p.Conn.WriteTo(buf, ua)
+		p.Conns[sockIdx].WriteTo(buf, ua)
 		putEncode(buf)
 		p.report(ps, pkt.Src)
 		return
 	case PktAck:
-		first := !ps.connected
-		ps.endpoint = ua
-		ps.transport = p.classifyTransport(ps, ua)
-		ps.connected = true
+		first, upgraded := ps.note(p, ua, sockIdx)
+		transport := ps.transport
 		ps.mu.Unlock()
-		if first {
-			p.logf("peer %s: <- ack from %s -> connected via %s", pkt.Src.String()[:8], ua, ps.transport)
+		if first || upgraded {
+			p.logf("peer %s: <- ack from %s -> connected via %s (socket %d)", pkt.Src.String()[:8], ua, transport, sockIdx)
 		}
 		p.report(ps, pkt.Src)
 		return
 	case PktData:
-		first := !ps.connected
-		if !ps.connected {
-			ps.endpoint = ua
-			ps.transport = p.classifyTransport(ps, ua)
-			ps.connected = true
-		}
+		first, upgraded := ps.note(p, ua, sockIdx)
 		ps.mu.Unlock()
-		if first {
+		if first || upgraded {
 			p.report(ps, pkt.Src)
 		}
 		if p.OnData != nil {
@@ -610,16 +720,34 @@ func (p *Punch) handle(pkt *Packet, src net.Addr) {
 	}
 }
 
-// classifyTransport labels an endpoint as relay or punched. Caller must hold
-// ps.mu.
-func (p *Punch) classifyTransport(ps *peer, ua *net.UDPAddr) string {
+// note records the endpoint and socket a peer's packet arrived from and labels
+// the link.
+//
+// A direct path, once confirmed, is never replaced by the relay: the relay
+// keeps forwarding this peer's keepalives to the same socket, and letting
+// those overwrite the endpoint would pull a punched link back onto the slow
+// path every few seconds. Caller must hold ps.mu.
+func (ps *peer) note(p *Punch, ua *net.UDPAddr, sockIdx int) (first, upgraded bool) {
+	first = !ps.connected
 	if ua == nil {
-		return ""
+		return first, false
 	}
-	if ps.info.RelayAddr != nil && ua.IP.Equal(ps.info.RelayAddr.IP) && ua.Port == ps.info.RelayAddr.Port {
-		return StateRelay
+	viaRelay := ps.info.RelayAddr != nil &&
+		ua.IP.Equal(ps.info.RelayAddr.IP) && ua.Port == ps.info.RelayAddr.Port
+	if viaRelay && ps.transport == StatePunched {
+		return first, false
 	}
-	return StatePunched
+	was := ps.transport
+	ps.endpoint = ua
+	if !viaRelay {
+		ps.sockIdx = sockIdx
+	}
+	ps.transport = StatePunched
+	if viaRelay {
+		ps.transport = StateRelay
+	}
+	ps.connected = true
+	return first, was == StateRelay && ps.transport == StatePunched
 }
 
 func (p *Punch) report(ps *peer, id protocol.PeerID) {

@@ -32,6 +32,13 @@ class MainActivity : AppCompatActivity() {
         cfg.relayEnabled = true
         cfg.portPrediction = true
         cfg.enableLan = true
+        // Hard-symmetric birthday attack: as the CGNAT (hard) side the phone
+        // PLANTS one mapping per pool socket at the peer's advertised port so
+        // the cone peer's wide random SPRAY can collide with one; PeerPortOffset
+        // keeps n4's cheap bet for port-preserving NATs.
+        cfg.predictionSockets = 25L
+        cfg.peerPortOffset = 20L
+        cfg.symmetricSpray = 1024L
 
         session = Session(cfg, object : Listener {
             override fun onEvent(event: Long, peerID: String, data: ByteArray) {
