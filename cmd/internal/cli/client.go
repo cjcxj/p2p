@@ -75,6 +75,7 @@ options:
 func runNatCheck(args []string) int {
 	fs := flag.NewFlagSet("nat-check", flag.ExitOnError)
 	server := fs.String("server", "127.0.0.1:3478", "STUN server address")
+	stunList := fs.String("stun-list", "", "comma-separated extra STUN observation points")
 	fs.Parse(args)
 
 	conn, err := net.ListenUDP("udp", nil)
@@ -89,6 +90,13 @@ func runNatCheck(args []string) int {
 		return 1
 	}
 	c := &stun.Client{Conn: conn, Server: addr, SecondaryTimeout: 800 * time.Millisecond, StepSamples: stun.DefaultStepSamples}
+	if *stunList != "" {
+		var list []string
+		for _, p := range splitTrim(*stunList) {
+			list = append(list, p)
+		}
+		c.Secondaries = list
+	}
 	det, err := c.Detect()
 	if err != nil {
 		fmt.Println("error:", err)
@@ -97,6 +105,13 @@ func runNatCheck(args []string) int {
 	fmt.Printf("NAT type : %s\n", det.NATType)
 	fmt.Printf("local    : %s\n", conn.LocalAddr())
 	fmt.Printf("public   : %s\n", det.PublicAddr())
+	if len(det.ObservedIPs) > 0 {
+		ips := make([]string, 0, len(det.ObservedIPs))
+		for _, ip := range det.ObservedIPs {
+			ips = append(ips, ip.String())
+		}
+		fmt.Printf("candidates: %v\n", ips)
+	}
 	if det.PortStep > 0 {
 		fmt.Printf("port step: %d\n", det.PortStep)
 	}
@@ -104,6 +119,17 @@ func runNatCheck(args []string) int {
 		fmt.Printf("evidence : %s\n", m)
 	}
 	return 0
+}
+
+// splitTrim splits a comma-separated list into trimmed non-empty tokens.
+func splitTrim(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func runConnect(args []string) int {

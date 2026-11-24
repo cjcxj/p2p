@@ -44,16 +44,16 @@ type Session struct {
 	cfg Config
 	l   Listener
 
-	conn      net.PacketConn
+	conn       net.PacketConn
 	extraConns []*net.UDPConn // spray pool; closed in Close
-	det   *stun.Detection
-	id    protocol.PeerID
-	vip   net.IP
-	ipnet *net.IPNet
-	sig   *signaling.Client
-	ph    *punch.Punch
-	mesh  *mesh.Node
-	room  string
+	det        *stun.Detection
+	id         protocol.PeerID
+	vip        net.IP
+	ipnet      *net.IPNet
+	sig        *signaling.Client
+	ph         *punch.Punch
+	mesh       *mesh.Node
+	room       string
 
 	relayAddr *net.UDPAddr
 
@@ -1035,6 +1035,15 @@ func (s *Session) onPeerCandidate(m protocol.Message) {
 	}
 	if ph == nil {
 		return
+	}
+	// Actionable diagnostic for the one case that can still defeat a symmetric
+	// peer: its candidate set enumerates only one public IP. If that IP is not
+	// the address it uses toward us (a destination-rotating CGNAT), the spray
+	// has nothing correct to aim at. Rather than fail silently onto the relay,
+	// surface the fix: configure more STUN observation points.
+	if s.cfg.Debug && info.Type == stun.NatSymmetric && len(info.CandidateIPs()) <= 1 {
+		s.debugf("p2p: peer " + sender + " is symmetric but exposes a single candidate IP; " +
+			"if punching falls back to relay, add more --stun-list observation points so its egress pool is enumerated")
 	}
 	ph.AddPeer(senderID, info)
 	if needTunnel {

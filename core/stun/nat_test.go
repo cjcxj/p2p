@@ -250,6 +250,18 @@ func TestConeSubtypeNeedsSecondServerPort(t *testing.T) {
 // IP by each, and Detect must collect the whole candidate set (not just the
 // primary). The easy peer sprays at every one of them, which is what turns a
 // "we happened to sample the right IP" case into a configurable mechanism.
+// ResolveAllUDPAddr must be safe with no DNS: an IPv4 literal resolves to
+// itself (so adb-shell and offline paths are unaffected), and empty is nil.
+func TestResolveAllUDPAddrLiteralSafe(t *testing.T) {
+	got := ResolveAllUDPAddr("203.0.113.7:3478")
+	if len(got) != 1 || got[0].IP.String() != "203.0.113.7" || got[0].Port != 3478 {
+		t.Fatalf("literal IPv4 must resolve to itself, got %v", got)
+	}
+	if len(ResolveAllUDPAddr("")) != 0 {
+		t.Fatal("empty must yield no addresses")
+	}
+}
+
 func TestDetectCollectsMultiSTUNCandidateIPs(t *testing.T) {
 	primary := newFakeResponderMapped(t, "203.0.113.212", 43000)
 	s1 := newFakeResponderMapped(t, "203.0.113.216", 43000)

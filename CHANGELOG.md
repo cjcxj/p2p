@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.27 (2026-11-24)
+- **多候选 IP 宽喷不再被 socket 池开关顺带关掉**：`planTargets()` 的「硬对称」分支整体挂在 `PredictionSockets > 1` 上，而 `--punch-sockets 0`（关池）会把这个分支一起跳过——可宽喷那条腿**只用主 socket**，恰恰是打穿「按目的地轮换出口 IP」的 CGNAT 的唯一手段。现在 plant / block / step 对角线这三条池相关的腿各自按池大小门控，宽喷无条件规划。回归用例 `TestPlanTargetsSprayWithoutPool`。
+- **对端报了 PortStep 也照样宽喷**：step 对齐的前提是出口 IP 稳定，轮换型 CGNAT 不满足，所以对称对端即使测出 step，step 对角线也只能当**额外一份赌注**，不再作为独占分支把宽喷顶掉（原逻辑 `else if` 就是这个互斥）。反向保护 `TestPlanTargetsConeStepDiagonal`：双方都是 cone 且测出 step 时仍走廉价对角线，不做宽喷。
+- **认不出来的 NAT 一律按硬对称处理**：新增 `isHardNAT()`，把 `unknown` / `blocked` 与 `symmetric` / `unmeasurable` 同等对待。之前分类含糊会掉进 cone 快路径，等于**悄悄丢掉了对称 NAT 本来需要的遍历**，最后无声退回中继；现在是失败安全地走激进路径（plant+spray 是 cone 的超集， cone 对端仍会被普通公网目标打通，不亏）。同时删掉 `PortPrediction` 那条单 socket 的 PortDelta 老式扫描分支，池化的 plant+spray 已覆盖。
+- **一个 `--stun-list` 条目可以贡献多个观测点**：新增 `stun.ResolveAllUDPAddr()`，把主机名的每条 IPv4 A 记录都当成独立目的地去探测（多宿主 / 负载均衡的公共 STUN 一个条目就能多枚举几个出口），`secondaryAddrs()` 随之去重。IPv4 字面量原样返回、不依赖 DNS（`adb shell` 那类无解析器环境不受影响），解析失败回退单地址解析，只会更好不会更坏。运维含义：与其逼用户抄一堆 IP，不如给一个多 A 记录的域名。
+- **`nat-check` 补上同一套能力**：以前只有 `connect` / `mesh` 认 `-stun-list`，现在 `nat-check` 也认，并新增一行 `candidates: [...]` 打印本机在该组观测点下暴露的全部公网出口 IP。调网络时先看这个数字：**candidates 只有 1 个**要么是真 cone（没事），要么是轮换 CGNAT 没被现有 STUN 列表枚举到（需要加观测点）。
+- **对称对端只有一个候选 IP 时给可执行提示**：SDK debug 日志会明确说「该对端是 symmetric 但只暴露一个候选出口，若退回中继请为它所在网络加 `--stun-list` 观测点」，把「打不通是玄学」变成有指向性的下一步。
+- **真机验证工具**：新增 `scripts/nat34-check.sh`（两台机器各自跑同一个 `--server`/`--room`，逐轮报本机 NAT 类型、是否 `connected via punched`、建连耗时、命中并取胜的对端端点、候选 IP 数；把「某一次侥幸成功」变成 N/N 的成功率账）与 `scripts/cloud-symtest.sh`（在云服务器上用一个临时 netns + `MASQUERADE --random-fully` 造出**真·按目的地轮换端口**的对称 NAT，和家里/公司的 cone 网络跨真实公网做 NAT3↔NAT4，不需要手机）。后者会动共享主机的 netfilter：作用域限定在专用链和 veth 子网，并由 `trap cleanup EXIT` 必回滚，脚本头部写明「先读再跑」。**两个脚本都不落任何管理端点**——SSH 主机与端口只能从参数或 `P2P_SSH` / `P2P_SSH_PORT` 环境变量传入。
+- 测试：新增 `core/punch/nat34_test.go`（纯内存 NAT3↔NAT4 模型驱动**真实** Punch 引擎，带负向对照——对端出口 IP 不在候选集内时必须打不通，证明宽喷是真命中了轮换地址，而不是严格过滤被绕过）以及 `ResolveAllUDPAddr` / 候选枚举 / 上述三条策略门控的用例。
+
 ## v0.26 (2026-11-23)
 - **修复 NAT 类型误判**：对称判定要往「第二个目的地」发一次 STUN，代码写的是 `server 端口+1`；而实际部署的信令+STUN+中继只监听一个 UDP 端口（腾讯云安全组也只放行了 8080），那次探测必然无应答，于是**任何 NAT 都被记成 `port_restricted_cone`**——对称 NAT 拿不到 `PortDelta`、也永远不会触发对称策略。现在备选目的地列表为「服务端 port+1 + 公网 STUN（`stun.miwifi.com:3478`、`stun1.l.google.com:19302`）」逐个实测：同一个 socket 在两个目的地拿到不同映射即判 `symmetric` 并测出 delta，拿到同一映射才判 `port_restricted_cone`，全都无应答则新增 `unmeasurable`（不再当作 cone 蒙）。`Detection.Method()` 把判据本身暴露出来，`nat-check` 与 SDK debug 日志都会打印「第二个目的地 X 给出的映射不同/相同」。
 - **中继接通后不再终止直连探测**：`probeLoop` 原来只要链路 connected（哪怕是中继）就转 keepalive，直连目标只发一轮（一次突发）就永久停止；而对称 NAT 的映射是按秒轮换的，一轮根本撞不上。现在中继状态下每 1 秒继续扫描直连目标（同时保留中继 keepalive），直连一旦命中就升级为直连；3 分钟仍无直连才认中继。

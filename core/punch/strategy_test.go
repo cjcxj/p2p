@@ -46,24 +46,57 @@ func TestPlanTargetsBlockSprayNoStep(t *testing.T) {
 	}
 }
 
-// A measured PortStep takes precedence and yields the step-aligned diagonal
-// instead of the fixed-offset block.
+// A hard (symmetric) peer that ALSO reports a PortStep must still get the
+// plant+block+spray handling -- the step diagonal is an extra bet, not a
+// replacement, because the diagonal assumes a stable base IP that a
+// destination-rotating CGNAT does not provide. Regression guard for the gap
+// where step-alignment used to be an exclusive branch and skipped the spray.
 func TestPlanTargetsStepAlignedPreferred(t *testing.T) {
-	cfg := Config{PredictionSockets: 4}
+	cfg := Config{PredictionSockets: 4, SymmetricSpray: 12}
 	peer := peerInfo(stun.NatSymmetric, addr("1.2.3.4", 40000), 118)
 	eps := planTargets(NATInfo{}, peer, cfg)
 
-	var predicted, block int
+	var predicted, block, spray int
 	for _, e := range eps {
 		switch e.Kind {
 		case "predicted":
 			predicted++
 		case "block":
 			block++
+		case "spray":
+			spray++
 		}
 	}
-	if predicted != 4 || block != 0 {
-		t.Fatalf("with PortStep want 4 predicted + 0 block, got %d/%d", predicted, block)
+	if predicted != 4 {
+		t.Fatalf("step diagonal want 4, got %d", predicted)
+	}
+	if block == 0 || spray == 0 {
+		t.Fatalf("hard peer with a step must STILL spray (block=%d spray=%d)", block, spray)
+	}
+}
+
+// A cone-class peer with a measured step uses the step-aligned diagonal and
+// does NOT trigger the hard-symmetric spray.
+func TestPlanTargetsConeStepDiagonal(t *testing.T) {
+	cfg := Config{PredictionSockets: 5, SymmetricSpray: 10}
+	peer := peerInfo(stun.NatPortRestrictedCone, addr("1.2.3.4", 40000), 7)
+	eps := planTargets(NATInfo{Type: stun.NatFullCone}, peer, cfg)
+	var predicted, spray, block int
+	for _, e := range eps {
+		switch e.Kind {
+		case "predicted":
+			predicted++
+		case "spray":
+			spray++
+		case "block":
+			block++
+		}
+	}
+	if predicted != 5 {
+		t.Fatalf("cone+step want 5 diagonal, got %d", predicted)
+	}
+	if spray != 0 || block != 0 {
+		t.Fatalf("cone peer must not trigger hard spray/block (spray=%d block=%d)", spray, block)
 	}
 }
 
@@ -217,6 +250,38 @@ func TestPlanTargetsSprayCoversCandidateIPs(t *testing.T) {
 	}
 	if perIP["223.104.77.212"] != 50 || perIP["223.104.77.220"] != 50 {
 		t.Fatalf("expected spray at both advertised + observed IPs, got %v", perIP)
+	}
+}
+
+// The multi-IP spray (the leg that cracks a destination-rotating CGNAT) must
+// fire even with the socket pool disabled -- it only uses the primary socket.
+// Regression guard: previously the whole hard branch was gated on
+// PredictionSockets > 1, so a single-socket config silently lost the spray.
+func TestPlanTargetsSprayWithoutPool(t *testing.T) {
+	cfg := Config{PredictionSockets: 1, SymmetricSpray: 30}
+	peer := peerInfo(stun.NatSymmetric, addr("1.2.3.4", 40000), 0)
+	eps := planTargets(NATInfo{Type: stun.NatPortRestrictedCone}, peer, cfg)
+	spray := countKind(eps, "spray")
+	if len(spray) != 30 {
+		t.Fatalf("spray must run without a pool: got %d, want 30", len(spray))
+	}
+	if len(countKind(eps, "block")) != 0 || len(countKind(eps, "plant")) != 0 {
+		t.Fatal("pool legs (block/plant) must be empty when PredictionSockets <= 1")
+	}
+}
+
+// A peer we could not classify must fail safe into the aggressive hard path --
+// an unknown/blocked peer gets the multi-IP spray, not the cone fast path that
+// silently drops the traversal a symmetric NAT would need. Regression guard for
+// "any network" where STUN classification can be ambiguous.
+func TestPlanTargetsUnknownFailsafeHard(t *testing.T) {
+	cfg := Config{PredictionSockets: 5, SymmetricSpray: 40}
+	for _, ty := range []stun.NATType{stun.NatUnknown, stun.NatBlocked, stun.NatUnmeasurable} {
+		peer := peerInfo(ty, addr("1.2.3.4", 40000), 0)
+		eps := planTargets(NATInfo{Type: stun.NatPortRestrictedCone}, peer, cfg)
+		if len(countKind(eps, "spray")) == 0 {
+			t.Fatalf("peer %s must trigger spray (fail-safe hard), got none", ty)
+		}
 	}
 }
 

@@ -147,10 +147,20 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 	// When both sides can spray (PortStep > 0 and PredictionSockets > 1) the
 	// spray is aligned: socket k targets port_0 + k*peer_step.
 	if peer.PublicAddr != nil {
-		hardPeer := peer.Type == stun.NatSymmetric || peer.Type == stun.NatUnmeasurable
-		hardMy := my.Type == stun.NatSymmetric || my.Type == stun.NatUnmeasurable
-		if cfg.PredictionSockets > 1 && peer.PortStep > 0 {
-			// Step-aligned spray: one target per pool socket.
+		// "hard" = must use plant+spray. Symmetric and unmeasurable are obvious;
+		// unknown/blocked are included deliberately: when we could not classify
+		// the peer (STUN partly failed, or a network we have not seen), fail
+		// safe into the aggressive traversal -- plant+spray is a superset that
+		// still connects a cone-class peer via the plain public target, so an
+		// ambiguous result must not silently skip the spray that NAT4 needs.
+		hardPeer := isHardNAT(peer.Type)
+		hardMy := isHardNAT(my.Type)
+		if cfg.PredictionSockets > 1 && peer.PortStep > 0 && !hardPeer && !hardMy {
+			// Both sides cone-class but the peer reports a per-binding step:
+			// the step-aligned diagonal is the cheap aligned spray. A hard
+			// (symmetric/unmeasurable) peer does NOT take this branch -- it
+			// falls through to the plant+spray handling below, which also adds
+			// the diagonal as an extra bet when a step is known.
 			base := peer.PublicAddr.Port
 			for k := 0; k < cfg.PredictionSockets; k++ {
 				port := base + k*peer.PortStep
@@ -161,11 +171,14 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 				eps = append(eps, Endpoint{Addr: addr, Kind: "predicted", Order: order, Socket: k})
 				order++
 			}
-		} else if cfg.PredictionSockets > 1 && (hardPeer || hardMy) {
+		} else if hardPeer || hardMy {
 			// Hard-symmetric handling. A cellular CGNAT neither preserves the
 			// local source port nor reports a PortStep, so the n4 block bet
 			// alone misses every peer mapping. The two complementary roles are
-			// what actually connect it (EasyTier's "hard-sym" birthday attack):
+			// what actually connect it (EasyTier's "hard-sym" birthday attack).
+			// This runs regardless of the socket-pool size: the multi-IP spray
+			// (the leg that cracks a destination-rotating CGNAT) uses only the
+			// primary socket, so disabling the pool must NOT disable it.
 			//
 			//   hard side (this host, when hardMy): PLANT. Aim every pool
 			//     socket at the peer's advertised public address so the NAT
@@ -174,29 +187,43 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 			//     spray then has something to hit.
 			//
 			//   easy side (peer is the hard one, we are cone): SPRAY. Fire a
-			//     wide, freshly randomized port set at the peer's public IP
-			//     from the primary socket, whose public port is the one the
-			//     hard side planted toward, so the spray collides with one of
-			//     the peer's random mapping ports.
+			//     wide, freshly randomized port set at EVERY candidate public IP
+			//     (primary + observation points) from the primary socket, whose
+			//     public port is the one the hard side planted toward, so the
+			//     spray collides with one of the peer's random mapping ports.
 			//
-			//   the block offset (n4) is kept as a cheap first bet for NATs
-			//     that do roughly preserve ports; harmless alongside the spray.
-			if hardMy {
+			//   the block offset (n4) and the step diagonal are cheap extra bets
+			//     for NATs that roughly preserve ports / report a step; they are
+			//     never a replacement for the spray.
+			if cfg.PredictionSockets > 1 && peer.PortStep > 0 {
+				for k := 0; k < cfg.PredictionSockets; k++ {
+					port := peer.PublicAddr.Port + k*peer.PortStep
+					if port < 1 || port > 65535 {
+						continue
+					}
+					addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: port}
+					eps = append(eps, Endpoint{Addr: addr, Kind: "predicted", Order: order, Socket: k})
+					order++
+				}
+			}
+			if hardMy && cfg.PredictionSockets > 1 {
 				for k := 1; k < cfg.PredictionSockets; k++ {
 					eps = append(eps, Endpoint{Addr: peer.PublicAddr, Kind: "plant", Order: order, Socket: k})
 					order++
 				}
 			}
-			offset := cfg.PeerPortOffset
-			if offset == 0 {
-				offset = defaultPeerPortOffset
-			}
-			port := peer.PublicAddr.Port + offset
-			if port >= 1 && port <= 65535 {
-				addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: port}
-				for k := 0; k < cfg.PredictionSockets; k++ {
-					eps = append(eps, Endpoint{Addr: addr, Kind: "block", Order: order, Socket: k})
-					order++
+			if cfg.PredictionSockets > 1 {
+				offset := cfg.PeerPortOffset
+				if offset == 0 {
+					offset = defaultPeerPortOffset
+				}
+				port := peer.PublicAddr.Port + offset
+				if port >= 1 && port <= 65535 {
+					addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: port}
+					for k := 0; k < cfg.PredictionSockets; k++ {
+						eps = append(eps, Endpoint{Addr: addr, Kind: "block", Order: order, Socket: k})
+						order++
+					}
 				}
 			}
 			if hardPeer {
@@ -216,37 +243,6 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 					}
 				}
 			}
-		} else if cfg.PortPrediction && peer.Type == stun.NatSymmetric {
-			// Legacy single-socket sweep using per-destination PortDelta.
-			span := cfg.PredictionRange
-			if span <= 0 {
-				span = 4
-			}
-			if peer.PortDelta == 0 {
-				span *= 3
-			}
-			base := peer.PublicAddr.Port
-			if peer.PortDelta != 0 {
-				for k := -span; k <= span*2; k++ {
-					port := base + k*peer.PortDelta
-					if port < 1 || port > 65535 {
-						continue
-					}
-					addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: port}
-					eps = append(eps, Endpoint{Addr: addr, Kind: "predicted", Order: order})
-					order++
-				}
-			} else {
-				for k := 1; k <= span; k++ {
-					port := base + k
-					if port < 1 || port > 65535 {
-						continue
-					}
-					addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: port}
-					eps = append(eps, Endpoint{Addr: addr, Kind: "predicted", Order: order})
-					order++
-				}
-			}
 		}
 	}
 
@@ -260,6 +256,19 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 
 func sameLAN(a, b net.IP) bool {
 	return len(a) == 4 && len(b) == 4 && a[0] == b[0] && a[1] == b[1] && a[2] == b[2]
+}
+
+// isHardNAT reports whether a NAT type must use the plant+spray traversal.
+// symmetric/unmeasurable are definitive; unknown/blocked are included so an
+// unclassified network fails safe into the aggressive path rather than into the
+// cone fast path that silently drops the spray a symmetric NAT requires.
+func isHardNAT(t stun.NATType) bool {
+	switch t {
+	case stun.NatSymmetric, stun.NatUnmeasurable, stun.NatUnknown, stun.NatBlocked:
+		return true
+	default:
+		return false
+	}
 }
 
 // distinctPorts returns n unique ports in the unprivileged UDP range, used for

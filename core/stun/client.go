@@ -152,20 +152,35 @@ func (c *Client) secondaryAddrs() []*net.UDPAddr {
 		list = DefaultSecondaries
 	}
 	out := make([]*net.UDPAddr, 0, len(list)+1)
+	seen := map[string]bool{}
 	if c.Server != nil && c.Server.IP != nil {
 		out = append(out, &net.UDPAddr{IP: c.Server.IP, Port: c.Server.Port + 1})
+		seen[c.Server.String()] = true
 	}
 	for _, s := range list {
-		addr, err := ResolveUDPAddr(s)
-		if err != nil {
-			continue
+		// A hostname may carry several A records; probe each so one configured
+		// multi-homed STUN contributes several observation destinations, widening
+		// the enumerable egress pool on a rotating CGNAT.
+		for _, addr := range ResolveAllUDPAddr(s) {
+			if addr == nil {
+				continue
+			}
+			k := addr.String()
+			if k == seenKey(c.Server) || seen[k] {
+				continue
+			}
+			seen[k] = true
+			out = append(out, addr)
 		}
-		if c.Server != nil && addr.String() == c.Server.String() {
-			continue
-		}
-		out = append(out, addr)
 	}
 	return out
+}
+
+func seenKey(a *net.UDPAddr) string {
+	if a == nil {
+		return ""
+	}
+	return a.String()
 }
 
 // observeEgressIPs concurrently probes each alternate destination from its own

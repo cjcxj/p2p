@@ -14,12 +14,13 @@
 | 虚拟 IP + 子网 | 服务器按房间从 `--network` 子网分配地址（默认 10.9.0.0/24），节点按 IP 寻址 |
 | 多跳网状路由 | 无法直连的节点经中间节点转发（泛洪 + TTL + 包去重，任意拓扑可达） |
 | 广播/组播仿真 | 子网广播地址与组播范围在虚拟网络内泛洪 |
-| NAT 检测 | RFC 3489 行为探测 + 对称端口增量测量 |
-| UDP 打洞 | 4 类 NAT 任意组合的策略矩阵 + 对称端口预测 |
+| NAT 检测 | RFC 3489 行为探测 + 对称端口增量测量 + 多 STUN 观测点枚举公网出口 IP |
+| UDP 打洞 | 4 类 NAT 任意组合的策略矩阵 + 对称端口预测 + 多候选出口 IP 宽喷；分类不明一律按对称 NAT 走激进路径 |
 | 中继回退 | 类 TURN 房间级中继（房间 token 鉴权），可关闭以强制走对等多跳 |
 | 双向鉴权 | HMAC-SHA256 挑战-应答：客户端证明身份给服务器（服务器鉴权），服务器证明身份给客户端（客户端鉴权），防伪服务器/未授权客户端 |
 | 数据面加密 | 新客户端间自动协商 X25519 + HKDF + ChaCha20-Poly1305 AEAD；与旧版互通时回退明文 |
 | TUN 虚拟网卡 | Windows（wintun.dll）/ Linux（/dev/net/tun）创建网卡，OS 流量直通虚拟网络 |
+| WireGuard 数据面 | 打洞成功后在**同一个 UDP socket** 上跑 WireGuard，发现帧与隧道帧按首字节分流；IP 流量不再逐包 AEAD 或用户态转发（`--legacy-mesh` 可回退旧路径做 A/B） |
 
 ## 目录结构
 
@@ -35,10 +36,14 @@ core/
   protocol/          共享 wire 协议
 cmd/
   p2p/                统一 CLI（server / client / nat-check / connect / mesh）
+  tput/               隧道吞吐与丢包实测（开发工具，TCP/UDP 双向）
   server/             p2p-server 兼容入口（调用统一 CLI）
   client/             p2p-client 兼容入口（调用统一 CLI）
+wgengine/            WireGuard 数据面：隧道设备 + 复用打洞所用 UDP socket 的 bind
 android/             gomobile 产出的 p2p.aar + Kotlin 示例
-scripts/build.ps1    一键构建三端 + AAR + wintun.dll
+android-demo/        Compose 演示 App（四页界面 + VPN 真接入）
+scripts/             build.ps1 / build.sh 一键构建三端 + AAR + wintun.dll；
+                     nat34-check.sh / cloud-symtest.sh 真机 NAT3↔NAT4 实测
 ```
 
 ## 快速开始
@@ -111,7 +116,20 @@ Linux 端会自动为虚拟网卡添加 iptables 放行规则（需 root），�
 
 ```bash
 p2p nat-check --server <服务器IP>:8080
+
+# 带多个 STUN 观测点，枚举本网络暴露的全部公网出口 IP
+p2p nat-check --server <服务器IP>:8080 \
+    --stun-list stun.miwifi.com:3478,74.125.250.129:19302
 ```
+
+输出 `NAT type` / `local` / `public` / `candidates` / `port step` / `evidence`（判据本身）。
+调网络时先看 `candidates`：只有 1 个地址，要么本机是真 cone（没事），要么是对目的地
+轮换出口的 CGNAT 而当前 STUN 列表没枚举到它——后者就要加更多可达的 `--stun-list` 观测点，
+否则对称 NAT 那侧的宽喷没有正确的目标 IP 可打，只能退回中继。`--stun-list` 里的主机名
+会按 A 记录逐条探测，一个多宿主的公共 STUN 就能贡献多个观测点。
+
+`connect` / `mesh` 用同一个 `--stun-list`（`--punch-sockets`、`--sym-spray`、
+`--peer-port-offset` 控制池大小与宽喷宽度），见「NAT 组合与路由」。
 
 ## SDK 用法（Go）
 
@@ -233,6 +251,37 @@ TCP 端口（demo 里是 7000）直接从虚拟网可达。VPN 只路由虚拟�
 探测。16 种组合全部打通（对称↔对称走中继或对等多跳）。`core/mesh` 在此基础上提供虚拟 IP
 寻址与多跳转发：有直连链路则直达，否则泛洪经中间节点，循环由 `(srcIP, pktID)` 去重与
 TTL 抑制。
+
+「硬」对端（`symmetric` / `unmeasurable`，以及**分类不明的 `unknown` / `blocked`**——认不出来
+就失败安全地按对称处理，不能悄悄走 cone 快路径把对称 NAT 需要的遍历丢掉）走 plant + spray
+两条互补角色：
+
+- 本机是硬的那侧：**plant**，把池里每个 socket 都朝对端公布的公网地址发，让自己的映射落到
+  对端要打的端口上；
+- 本机是 cone 的那侧：**spray**，用主 socket 向对端**每一个候选公网 IP**（服务器看到的 +
+  各 STUN 观测点）随机撒 `--sym-spray` 个端口（默认 1024），撞中对称映射的生日攻击。
+
+宽喷只用主 socket，所以 `--punch-sockets 0` 关掉 socket 池**不会**连带关掉它；测出
+`port step` 时 step 对角线只是额外一份赌注，不顶掉宽喷（它的前提「出口 IP 稳定」对轮换
+CGNAT 不成立）。对端是 symmetric 却只报一个候选出口时，debug 日志会直接提示为该网络加
+`--stun-list` 观测点，而不是无声退回中继。
+
+### 真机实测
+
+```bash
+# 两台机器（如公司 NAT3 + 手机 CGNAT NAT4）同时跑，同一 server 与 room 前缀：
+# 逐轮报本机 NAT 类型、是否 punched、建连耗时、取胜的对端端点、候选 IP 数
+bash scripts/nat34-check.sh -s <服务器IP>:8080 -r demo -n 10 \
+    --stuns "stun.miwifi.com:3478,74.125.250.129:19302"
+
+# 没有手机时：在云服务器上用临时 netns + MASQUERADE --random-fully 造出真·按目的地
+# 轮换端口的对称 NAT，与本机的 cone 网络跨真实公网做 NAT3↔NAT4
+P2P_SSH=user@host P2P_SSH_PORT=<端口> bash scripts/cloud-symtest.sh
+```
+
+`cloud-symtest.sh` 会修改共享主机的 netfilter（规则作用域限定在专用链与 veth 子网，
+`trap` 保证退出时回滚），**先读脚本再运行**。两个脚本的 SSH 主机与端口只能由参数或环境
+变量传入，脚本里不落任何管理端点。
 
 ## 构建
 

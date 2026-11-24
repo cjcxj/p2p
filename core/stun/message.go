@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 )
 
 // Type is a STUN message type.
@@ -15,9 +16,9 @@ type Type uint16
 
 // STUN message types used by this package.
 const (
-	BindingRequest  Type = 0x0001
-	BindingSuccess  Type = 0x0101
-	BindingError    Type = 0x0111
+	BindingRequest Type = 0x0001
+	BindingSuccess Type = 0x0101
+	BindingError   Type = 0x0111
 )
 
 // MagicCookie is the RFC 5389 fixed magic cookie.
@@ -270,4 +271,50 @@ func ResolveUDPAddr(addr string) (*net.UDPAddr, error) {
 		return nil, fmt.Errorf("stun: empty address")
 	}
 	return net.ResolveUDPAddr("udp", addr)
+}
+
+// ResolveAllUDPAddr expands a host:port to one address per IPv4 A record, so a
+// multi-homed or load-balanced STUN host contributes several distinct
+// observation destinations from a single configured entry. That widens the
+// candidate egress-IP pool an operator can enumerate on a rotating CGNAT without
+// listing more --stun-list entries. Literal IPv4 inputs return themselves (and
+// work with no DNS, e.g. adb shell); any resolution error falls back to the
+// single-address resolver so behaviour is never worse than before.
+func ResolveAllUDPAddr(addr string) []*net.UDPAddr {
+	if addr == "" {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		if a, e := ResolveUDPAddr(addr); e == nil {
+			return []*net.UDPAddr{a}
+		}
+		return nil
+	}
+	p, _ := strconv.Atoi(port)
+	if ip := net.ParseIP(host); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			return []*net.UDPAddr{{IP: ip4, Port: p}}
+		}
+		return []*net.UDPAddr{{IP: ip, Port: p}}
+	}
+	ips, lerr := net.LookupIP(host)
+	if lerr != nil || len(ips) == 0 {
+		if a, e := ResolveUDPAddr(addr); e == nil {
+			return []*net.UDPAddr{a}
+		}
+		return nil
+	}
+	var out []*net.UDPAddr
+	for _, ip := range ips {
+		if ip4 := ip.To4(); ip4 != nil {
+			out = append(out, &net.UDPAddr{IP: ip4, Port: p})
+		}
+	}
+	if len(out) == 0 {
+		if a, e := ResolveUDPAddr(addr); e == nil {
+			return []*net.UDPAddr{a}
+		}
+	}
+	return out
 }

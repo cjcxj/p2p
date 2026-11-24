@@ -23,11 +23,13 @@ func (c *recConn) WriteTo(_ []byte, a net.Addr) (int, error) {
 	c.dst = a
 	return 0, nil
 }
-func (c *recConn) Close() error                              { return nil }
-func (c *recConn) LocalAddr() net.Addr                        { return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 30000 + c.idx} }
-func (c *recConn) SetDeadline(time.Time) error               { return nil }
-func (c *recConn) SetReadDeadline(time.Time) error           { return nil }
-func (c *recConn) SetWriteDeadline(time.Time) error          { return nil }
+func (c *recConn) Close() error { return nil }
+func (c *recConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 30000 + c.idx}
+}
+func (c *recConn) SetDeadline(time.Time) error      { return nil }
+func (c *recConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *recConn) SetWriteDeadline(time.Time) error { return nil }
 
 // The WireGuard data plane must leave through the socket that actually punched
 // the peer, not the primary socket, so it rides the same live NAT mapping.
