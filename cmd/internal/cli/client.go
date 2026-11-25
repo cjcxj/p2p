@@ -112,6 +112,9 @@ func runNatCheck(args []string) int {
 		}
 		fmt.Printf("candidates: %v\n", ips)
 	}
+	if pool := det.CoveringPool(); pool != nil {
+		fmt.Printf("egress pool: %s (cone peers spray this whole block, not just the sampled IPs)\n", pool)
+	}
 	if det.PortStep > 0 {
 		fmt.Printf("port step: %d\n", det.PortStep)
 	}
@@ -146,7 +149,9 @@ func runConnect(args []string) int {
 	noLAN := fs.Bool("no-lan", false, "disable same-LAN shortcut")
 	punchSockets := fs.Int("punch-sockets", 25, "socket pool size for symmetric plant/block legs (0=off)")
 	peerPortOffset := fs.Int("peer-port-offset", 20, "block spray aims at peer public port + this offset (must be < --punch-sockets)")
-	symSpray := fs.Int("sym-spray", 1024, "random ports the cone side sprays per round at a symmetric peer (birthday attack; 0=default)")
+	symSpray := fs.Int("sym-spray", 1024, "random ports the cone side sprays per round at each symmetric-peer public IP (birthday attack; 0=default)")
+	punchPPS := fs.Int("punch-pps", 1500, "max probe packets per second per peer during punching (safety cap so a wide spray cannot overflow the router/NIC; 0=default)")
+	escalateMs := fs.Int("escalate-ms", 3000, "ms a cone-classified peer may fail to connect before re-planning it as hard plant+spray (recovers a misdetected symmetric NAT; 0=default)")
 	noEncrypt := fs.Bool("no-encrypt", false, "experimental: disable data-plane encryption (both ends must set it)")
 	timeout := fs.Int("timeout", 15, "connect timeout in seconds")
 	verbose := fs.Bool("verbose", false, "show detailed hole-punching flow logs")
@@ -189,6 +194,8 @@ func runConnect(args []string) int {
 	cfg.PredictionSockets = *punchSockets
 	cfg.PeerPortOffset = *peerPortOffset
 	cfg.SymmetricSpray = *symSpray
+	cfg.PunchPPS = *punchPPS
+	cfg.EscalateAfterMs = *escalateMs
 	cfg.STUNSecondaries = *stunList
 
 	cli := &cliListener{}
@@ -244,7 +251,9 @@ func runMesh(args []string) int {
 	noLAN := fs.Bool("no-lan", false, "disable same-LAN shortcut")
 	punchSockets := fs.Int("punch-sockets", 25, "socket pool size for symmetric plant/block legs (0=off)")
 	peerPortOffset := fs.Int("peer-port-offset", 20, "block spray aims at peer public port + this offset (must be < --punch-sockets)")
-	symSpray := fs.Int("sym-spray", 1024, "random ports the cone side sprays per round at a symmetric peer (birthday attack; 0=default)")
+	symSpray := fs.Int("sym-spray", 1024, "random ports the cone side sprays per round at each symmetric-peer public IP (birthday attack; 0=default)")
+	punchPPS := fs.Int("punch-pps", 1500, "max probe packets per second per peer during punching (safety cap so a wide spray cannot overflow the router/NIC; 0=default)")
+	escalateMs := fs.Int("escalate-ms", 3000, "ms a cone-classified peer may fail to connect before re-planning it as hard plant+spray (recovers a misdetected symmetric NAT; 0=default)")
 	noEncrypt := fs.Bool("no-encrypt", false, "experimental: disable data-plane encryption (both ends must set it)")
 	timeout := fs.Int("timeout", 15, "connect timeout in seconds")
 	useTun := fs.Bool("tun", false, "create a TUN device and route OS traffic")
@@ -290,6 +299,8 @@ func runMesh(args []string) int {
 	cfg.PredictionSockets = *punchSockets
 	cfg.PeerPortOffset = *peerPortOffset
 	cfg.SymmetricSpray = *symSpray
+	cfg.PunchPPS = *punchPPS
+	cfg.EscalateAfterMs = *escalateMs
 	cfg.STUNSecondaries = *stunList
 	cfg.LegacyMesh = *legacyMesh
 

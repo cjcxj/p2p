@@ -713,6 +713,9 @@ func (s *Session) run(room string) {
 		PredictionSockets: s.cfg.PredictionSockets,
 		PeerPortOffset:    s.cfg.PeerPortOffset,
 		SymmetricSpray:    s.cfg.SymmetricSpray,
+		SprayIPMax:        s.cfg.SprayIPMax,
+		PunchPPS:          s.cfg.PunchPPS,
+		EscalateAfterMs:   s.cfg.EscalateAfterMs,
 	})
 	if s.cfg.Debug {
 		ph.Config.OnLog = func(format string, args ...interface{}) {
@@ -1037,11 +1040,12 @@ func (s *Session) onPeerCandidate(m protocol.Message) {
 		return
 	}
 	// Actionable diagnostic for the one case that can still defeat a symmetric
-	// peer: its candidate set enumerates only one public IP. If that IP is not
-	// the address it uses toward us (a destination-rotating CGNAT), the spray
-	// has nothing correct to aim at. Rather than fail silently onto the relay,
-	// surface the fix: configure more STUN observation points.
-	if s.cfg.Debug && info.Type == stun.NatSymmetric && len(info.CandidateIPs()) <= 1 {
+	// peer: its candidate set enumerates only one public IP AND it announced no
+	// egress pool. If that IP is not the address it uses toward us (a
+	// destination-rotating CGNAT), the spray has nothing correct to aim at.
+	// Rather than fail silently onto the relay, surface the fix: configure more
+	// STUN observation points.
+	if s.cfg.Debug && info.Type == stun.NatSymmetric && info.PoolCIDR == nil && len(info.CandidateIPs()) <= 1 {
 		s.debugf("p2p: peer " + sender + " is symmetric but exposes a single candidate IP; " +
 			"if punching falls back to relay, add more --stun-list observation points so its egress pool is enumerated")
 	}
@@ -1171,6 +1175,19 @@ func (s *Session) buildCandidate() *protocol.Candidate {
 				}
 				c.PublicAddr += "," + ip.String()
 			}
+			// Announce the egress POOL, not just the sampled addresses. A
+			// carrier CGNAT re-dials inside a contiguous block and only shows a
+			// few of its IPs to any STUN point, so the address it uses toward a
+			// given peer is often absent from the sample above. Carriers pick
+			// that address by destination and no fixed observation list can
+			// guarantee seeing it, but the block can be inferred from the
+			// sampled addresses: advertise their smallest covering prefix as a
+			// CIDR token and let the easy side spray the whole block. Tokens
+			// containing "/" are ignored by older peers, so this stays on the
+			// verbatim-forwarded string field and needs no server redeploy.
+			if pool := coveringPrefix(det); pool != nil {
+				c.PublicAddr += "," + pool.String()
+			}
 		}
 		if det.LocalAddr != nil {
 			c.PrivateAddr = det.LocalAddr.String()
@@ -1200,6 +1217,14 @@ func candidateToNAT(c *protocol.Candidate) (punch.NATInfo, error) {
 			return info, err
 		}
 		for _, e := range extras {
+			if strings.IndexByte(e, '/') >= 0 {
+				// An announced egress pool (CIDR). Older senders never emit
+				// it; peers that do not expand it simply ignore it.
+				if _, ipnet, err := net.ParseCIDR(e); err == nil {
+					info.PoolCIDR = ipnet
+				}
+				continue
+			}
 			if ip := net.ParseIP(e); ip != nil {
 				info.PublicIPs = append(info.PublicIPs, ip)
 			}
@@ -1234,6 +1259,17 @@ func splitCandidateAddr(s string) (string, []string) {
 		}
 	}
 	return head, extras
+}
+
+// coveringPrefix returns the peer's announced egress pool: the smallest prefix
+// covering its mapped address and every STUN-observed address. The CGNAT block
+// is inferable from clustered samples even though the specific egress IP used
+// toward a given peer was never observed, so the easy peer can spray the whole
+// block. nil means there is nothing to expand. The logic lives in one place
+// (stun.Detection.CoveringPool) so nat-check reports exactly what a session
+// would advertise.
+func coveringPrefix(det *stun.Detection) *net.IPNet {
+	return det.CoveringPool()
 }
 
 // emit dispatches an event to the listener.

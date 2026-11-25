@@ -217,6 +217,18 @@ func (p *Punch) punchTimeout() time.Duration {
 	return time.Duration(p.Config.PunchTimeoutMs) * time.Millisecond
 }
 
+// escalateMs is how long a soft (cone-classified) plan may run without
+// connecting before we re-plan the peer as hard. A few seconds is enough for a
+// true cone peer to have connected via its public address, so waiting this long
+// before spraying only delays recovery from a misclassification and never
+// slows a correctly-classified link.
+func (p *Punch) escalateMs() int {
+	if p.Config.EscalateAfterMs > 0 {
+		return p.Config.EscalateAfterMs
+	}
+	return 3000
+}
+
 // Send delivers a data payload to a connected peer.
 func (p *Punch) Send(id protocol.PeerID, data []byte) error {
 	ps := p.peer(id)
@@ -448,6 +460,37 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 	start := time.Now()
 	lastAnnounce := time.Time{}
 	round := 0
+	// Fail-safe escalation. A cellular symmetric NAT is flakily classified as
+	// cone on real networks (the second-destination probe sometimes repeats the
+	// mapping), and a "cone" verdict gives the peer only a single public probe
+	// that never re-rolls -- so a misclassification permanently strands the link
+	// on relay. If a soft (non-spraying) plan has not connected within
+	// escalateAfter, re-plan the peer as hard (plant+spray). This is additive:
+	// a genuinely-cone peer would already be connected by now, so escalating it
+	// costs only a little extra traffic and recovers the misdetected case.
+	escalated := false
+	escalateAfter := time.Duration(p.escalateMs()) * time.Millisecond
+	// planInfo is the peer info the plan is built from; escalation switches it
+	// from the (possibly misclassified) reported type to hard so every later
+	// re-roll keeps the aggressive plan instead of reverting to the soft one.
+	planInfo := info
+	// planMy mirrors planInfo for our OWN side. A symmetric host can also be
+	// flakily misdetected as cone, and then it never PLANTS (fans its socket
+	// pool), leaving the peer a single external port to hit. Escalation forces
+	// our own type hard too, so the full plant+spray birthday attack runs and
+	// self-misdetection is recovered.
+	planMy := p.My
+	// Probe rate ceiling. A wide CGNAT spray is tens of thousands of targets a
+	// round; blasting them as fast as the loop allows saturates the host NIC and
+	// overflows the router's NAT conntrack table, which takes the entire network
+	// offline. Pace the sweep instead -- EasyTier-class punching lands within
+	// seconds at a couple thousand packets/s, so a cap costs nothing real.
+	pps := cfg.PunchPPS
+	if pps <= 0 {
+		pps = defaultPunchPPS
+	}
+	pace := time.Second / time.Duration(pps)
+	nextSend := time.Now()
 	for {
 		if p.stopped() {
 			return
@@ -465,12 +508,33 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 			p.keepaliveLoop(id, stop)
 			return
 		}
+		if !spraying && !escalated && !relayOnly && time.Since(start) > escalateAfter {
+			escalated = true
+			planInfo.Type = stun.NatSymmetric
+			planMy.Type = stun.NatSymmetric
+			nt := planTargets(planMy, planInfo, cfg)
+			replanned := punchEps[:0]
+			for i := range nt {
+				switch nt[i].Kind {
+				case "relay":
+					ep := nt[i]
+					relayEp = &ep
+				case "spray":
+					spraying = true
+					replanned = append(replanned, nt[i])
+				default:
+					replanned = append(replanned, nt[i])
+				}
+			}
+			punchEps = replanned
+			p.logf("peer %s: cone-classified peer not connected after %s, escalating to hard plant+spray", id.String()[:8], escalateAfter)
+		}
 		wait := interval
 		if spraying && round > 0 {
 			// Re-roll the spray window each round. A fixed random subset can
 			// miss the peer's planted mapping ports forever; new ports every
 			// round grow coverage until a collision lands.
-			nt := planTargets(p.My, info, cfg)
+			nt := planTargets(planMy, planInfo, cfg)
 			replanned := punchEps[:0]
 			for i := range nt {
 				if nt[i].Kind != "relay" {
@@ -503,6 +567,7 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 				eps = append(append([]Endpoint(nil), eps...), *relayEp)
 			}
 		}
+		nextSend = time.Now()
 		for _, ep := range eps {
 			if p.stopped() {
 				return
@@ -513,6 +578,17 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 			default:
 			}
 			p.sendProbe(ps, ep)
+			// Rate-limit the sweep: block until this probe's scheduled slot.
+			nextSend = nextSend.Add(pace)
+			if d := time.Until(nextSend); d > 0 {
+				select {
+				case <-p.done:
+					return
+				case <-stop:
+					return
+				case <-time.After(d):
+				}
+			}
 		}
 		round++
 		// periodic activity heartbeat

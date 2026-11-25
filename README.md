@@ -15,7 +15,7 @@
 | 多跳网状路由 | 无法直连的节点经中间节点转发（泛洪 + TTL + 包去重，任意拓扑可达） |
 | 广播/组播仿真 | 子网广播地址与组播范围在虚拟网络内泛洪 |
 | NAT 检测 | RFC 3489 行为探测 + 对称端口增量测量 + 多 STUN 观测点枚举公网出口 IP |
-| UDP 打洞 | 4 类 NAT 任意组合的策略矩阵 + 对称端口预测 + 多候选出口 IP 宽喷；分类不明一律按对称 NAT 走激进路径 |
+| UDP 打洞 | 4 类 NAT 任意组合的策略矩阵 + 对称端口预测 + 多候选出口 IP 宽喷（含 **CGNAT 出口池通告**：采样采不到对端方向那个出口时，按其地址的最长公共前缀整块喷）；分类不明或误判一律失败安全升级到对称路径 |
 | 中继回退 | 类 TURN 房间级中继（房间 token 鉴权），可关闭以强制走对等多跳 |
 | 双向鉴权 | HMAC-SHA256 挑战-应答：客户端证明身份给服务器（服务器鉴权），服务器证明身份给客户端（客户端鉴权），防伪服务器/未授权客户端 |
 | 数据面加密 | 新客户端间自动协商 X25519 + HKDF + ChaCha20-Poly1305 AEAD；与旧版互通时回退明文 |
@@ -122,14 +122,21 @@ p2p nat-check --server <服务器IP>:8080 \
     --stun-list stun.miwifi.com:3478,74.125.250.129:19302
 ```
 
-输出 `NAT type` / `local` / `public` / `candidates` / `port step` / `evidence`（判据本身）。
-调网络时先看 `candidates`：只有 1 个地址，要么本机是真 cone（没事），要么是对目的地
-轮换出口的 CGNAT 而当前 STUN 列表没枚举到它——后者就要加更多可达的 `--stun-list` 观测点，
-否则对称 NAT 那侧的宽喷没有正确的目标 IP 可打，只能退回中继。`--stun-list` 里的主机名
-会按 A 记录逐条探测，一个多宿主的公共 STUN 就能贡献多个观测点。
+输出 `NAT type` / `local` / `public` / `candidates` / `egress pool` / `port step` /
+`evidence`（判据本身）。调网络时按这个顺序看：
 
-`connect` / `mesh` 用同一个 `--stun-list`（`--punch-sockets`、`--sym-spray`、
-`--peer-port-offset` 控制池大小与宽喷宽度），见「NAT 组合与路由」。
+- `candidates` 只有 1 个地址：要么本机是真 cone（没事），要么是对目的地轮换出口的
+  CGNAT 而当前 STUN 列表没枚举到第二个出口。
+- `egress pool` 出现（如 `111.55.212.96/27`）：本机会把这个块通告给对端，对端的宽喷
+  就能覆盖**采样没采到的那个出口**——这正好是「按目的地换出口」的 CGNAT 打不通的根因。
+  只有 1 个候选、又没有这一行，说明观测点不够，加更多可达且路由多样的
+  `--stun-list`（主机名会按 A 记录逐条探测，一个多宿主的公共 STUN 就能贡献多个观测点）。
+
+`connect` / `mesh` 用同一套开关：`--stun-list` 决定观测点，`--sym-spray` 是每个候选 IP
+的端口窗口，`--punch-pps` 给整轮探测限速，`--escalate-ms` 控制误判自愈，
+`--punch-sockets` / `--peer-port-offset` 控制 socket 池。出口块的地址数上限
+（`SprayIPMax`，默认 64）目前只在 SDK `Config` 里设，CLI 未暴露。
+详见「NAT 组合与路由」与 [CHANGELOG.md](CHANGELOG.md)。
 
 ## SDK 用法（Go）
 
@@ -192,7 +199,12 @@ SDK 关键 API：
 
 配置项见 `sdk/config.go`：`RelayEnabled`（中继回退，默认开；关闭后不可打洞的对端走多跳）、
 `PortPrediction`（对称端口预测，默认开）、`EnableLAN`（局域网捷径，默认开）、
-`TimeoutSec`、`ProbeIntervalMs`、`PunchTimeoutMs`。
+`TimeoutSec`、`ProbeIntervalMs`、`PunchTimeoutMs`；打洞调参一组——`STUNSecondaries`
+（逗号分隔的额外 STUN 观测点，主机名按 A 记录逐条探测）、`PredictionSockets` /
+`PeerPortOffset` / `SymmetricSpray`（socket 池与每个候选 IP 的端口窗口）、
+`SprayIPMax`（对端出口块展开的地址数上限，默认 64）、`PunchPPS`（每 peer 探测发包速率上限，
+默认 1500，防止打爆路由器）、`EscalateAfterMs`（cone 判定多久未连通即升级为硬路径，默认
+3000）。
 
 ## Android SDK
 
@@ -259,18 +271,37 @@ TTL 抑制。
 - 本机是硬的那侧：**plant**，把池里每个 socket 都朝对端公布的公网地址发，让自己的映射落到
   对端要打的端口上；
 - 本机是 cone 的那侧：**spray**，用主 socket 向对端**每一个候选公网 IP**（服务器看到的 +
-  各 STUN 观测点）随机撒 `--sym-spray` 个端口（默认 1024），撞中对称映射的生日攻击。
+  各 STUN 观测点 + 对端**通告的出口池整块**）随机撒 `--sym-spray` 个端口（默认 1024），
+  撞中对称映射的生日攻击。出口池这一步是根因级的：轮换型 CGNAT 朝不同目的地换出口 IP，
+  对端方向那个地址 STUN 往往根本采不到（多加观测点也只是采到同一簇的另几个），所以硬端把
+  自己采样地址的最长公共前缀（`stun.Detection.CoveringPool()`，不足两个地址、或公共前缀短于
+  `/20`——簇太散不像同一个运营商块——就不通告）作为 CIDR 塞进 `Candidate.PublicAddr`
+  随信令下发——旧服务器逐字转发、
+  **不需要重新部署**，旧 peer 解析不了会直接忽略；cone 侧把块展开喷一遍，块内地址数上限 64，
+  避免一个误通告的 `/24` 把攻击乘成洪水。
 
 宽喷只用主 socket，所以 `--punch-sockets 0` 关掉 socket 池**不会**连带关掉它；测出
 `port step` 时 step 对角线只是额外一份赌注，不顶掉宽喷（它的前提「出口 IP 稳定」对轮换
-CGNAT 不成立）。对端是 symmetric 却只报一个候选出口时，debug 日志会直接提示为该网络加
-`--stun-list` 观测点，而不是无声退回中继。
+CGNAT 不成立）。另外两条是踩出来的修正：`predicted` / `block` 腿必须从 **socket 0** 发出
+——对端 plant 时瞄准的是主 socket 的公网端口，从池里其它 socket 发的探测会被对端的映射
+过滤直接丢弃，看起来在忙其实一条都到不了；`--punch-pps`（默认 1500）给整轮探测限速，因为
+目标数变成「IP 块 × 端口窗口」之后不限速会**打穿家用路由器的 NAT 会话表**，真机自测时造成
+过整网断连。限速的代价是算得出来的：满打满算 32 个地址 × 1024 端口 ÷ 1500pps ≈ 22 秒才走完
+一轮，所以命中靠的是每轮重掷端口窗口、多轮累积覆盖，而不是把一轮硬塞进几秒——反正对称映射
+本身也在按秒轮换。
+
+**分类错误可以自愈**：蜂窝对称 NAT 的第二目的地探测偶尔重复返回同一映射，于是被判成 cone，
+而 cone 计划只有一个公网目标、永不重掷，一次误判就把链路永久困在中继上。跑满
+`--escalate-ms`（默认 3000）仍未连通就重规划成 hard 的 plant+spray，并把**本机自己**也按
+对称处理（本机误判成 cone 时从来不会 plant，对端就只有一个端口可撞）。若对端是 symmetric
+却既只有一个候选 IP 又没有池通告，debug 日志会提示为它所在网络加 `--stun-list` 观测点。
 
 ### 真机实测
 
 ```bash
 # 两台机器（如公司 NAT3 + 手机 CGNAT NAT4）同时跑，同一 server 与 room 前缀：
-# 逐轮报本机 NAT 类型、是否 punched、建连耗时、取胜的对端端点、候选 IP 数
+# 逐轮报本机 NAT 类型、是否 punched、建连耗时、取胜的对端端点、候选 IP 与 egress pool
+# （默认 --pps 800 限流，--spray/--sockets 调宽喷宽度与池大小）
 bash scripts/nat34-check.sh -s <服务器IP>:8080 -r demo -n 10 \
     --stuns "stun.miwifi.com:3478,74.125.250.129:19302"
 
@@ -316,5 +347,12 @@ scripts/build.sh
   客户端（服务器鉴权），客户端同时验证服务器（客户端鉴权），任一方失败即断开。
 - 房间级 `token` 保护房间准入与中继注册，叠加在服务级鉴权之上。
 - TUN 模式需管理员/root 权限；请仅加入可信房间。
+- **直连数据面就是标准 WireGuard**（v0.24 起）：打洞成功后在同一个 UDP socket 上跑
+  wireguard-go 的握手与 AEAD，密钥由 `Candidate` 携带的 X25519 公钥与信令分配的虚拟 IP 直接
+  构成，不再有自研的逐包加密层。下面提到的逐包 AEAD / 端到端加密只属于 `--legacy-mesh` 旧路径。
+- **打洞发包有速率上限**：宽喷的目标数是「对端出口 IP 块 × 端口窗口」，默认 `--punch-pps 1500`
+  时一轮约二十几秒。调高之前请确认你的路由器 NAT 会话表与网卡 TX 扛得住——本项目在真机自测中
+  就曾因不限速的宽喷打爆家用路由器，导致该网络下所有设备断网。共享网络（公司、校园、咖啡馆）
+  上尤其要注意。
 - 数据通道默认使用 **X25519 + HKDF-SHA256 + ChaCha20-Poly1305** 加密：新版本客户端之间自动协商密钥；与旧版客户端互通时自动回退明文。单播应用载荷额外做**端到端加密**（v0.22），中间节点无法读取应用数据。
 - 信令支持可选 **TLS**：服务器 `--tls-cert/--tls-key`，客户端 `--tls`（或 SDK `Config.TLS`）；可用 `go run ./cmd/gencert` 快速生成自签名证书；未启用 TLS 时信令为明文，请勿在不可信网络传输高度敏感凭证。

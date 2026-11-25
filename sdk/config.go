@@ -71,6 +71,20 @@ type Config struct {
 	// a hard peer's public IP (paired with the hard side's plant leg -- the
 	// birthday attack that connects a cellular CGNAT). 0 = SDK default (1024).
 	SymmetricSpray int
+	// SprayIPMax bounds how many distinct public addresses the cone side sprays
+	// when a hard peer announces its CGNAT egress pool (a CIDR block inferred
+	// from its sampled STUN addresses). 0 = SDK default (64).
+	SprayIPMax int
+	// PunchPPS caps probe packets sent per second per peer during punching. It
+	// is a safety limit: an unthrottled wide CGNAT spray saturates the host NIC
+	// and overflows the router's NAT conntrack table, taking the whole network
+	// down. 0 = SDK default (1500).
+	PunchPPS int
+	// EscalateAfterMs is how long a peer classified as cone may fail to connect
+	// before the engine re-plans it as hard (plant+spray). This recovers a
+	// symmetric CGNAT that was flakily misdetected as cone, which otherwise
+	// strands the link on a single public probe. 0 = engine default (3000).
+	EscalateAfterMs int
 	// STUNSecondaries is a comma-separated list of extra observation addresses
 	// ("host:port,host:port") used to discover the destination-rotating CGNAT
 	// candidate public IPs. Empty uses the built-in DefaultSecondaries. Set this
@@ -93,6 +107,7 @@ func Defaults() *Config {
 		PredictionSockets: 25,
 		PeerPortOffset:    20,
 		SymmetricSpray:    1024,
+		PunchPPS:          1500,
 	}
 }
 

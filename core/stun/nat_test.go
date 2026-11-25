@@ -292,3 +292,47 @@ func TestDetectCollectsMultiSTUNCandidateIPs(t *testing.T) {
 		t.Fatal("unreachable observation point must not contribute a candidate")
 	}
 }
+
+// The exact China Unicom 111.55 field sample, run through the PRODUCTION
+// CoveringPool (the function buildCandidate advertises and nat-check prints).
+// STUN saw .114/.98/.110/.106 but never the .102 the carrier uses toward a
+// given peer; the covering prefix must still contain .102 so the cone peer's
+// whole-block spray reaches it. This pins the real-world numbers that the
+// 111.55 NAT3<->NAT4 rescue depends on.
+func TestCoveringPoolRealUnicomSample(t *testing.T) {
+	d := &Detection{
+		MappedAddr: &net.UDPAddr{IP: net.ParseIP("111.55.212.114"), Port: 7857},
+		ObservedIPs: []net.IP{
+			net.ParseIP("111.55.212.114"),
+			net.ParseIP("111.55.212.98"),
+			net.ParseIP("111.55.212.110"),
+			net.ParseIP("111.55.212.106"),
+		},
+	}
+	pool := d.CoveringPool()
+	if pool == nil {
+		t.Fatal("clustered Unicom sample must yield a covering pool")
+	}
+	if ones, _ := pool.Mask.Size(); ones != 27 {
+		t.Fatalf("Unicom sample should collapse to /27, got /%d (%s)", ones, pool)
+	}
+	for _, ip := range []string{"111.55.212.102", "111.55.212.114", "111.55.212.98"} {
+		if !pool.Contains(net.ParseIP(ip)) {
+			t.Fatalf("pool %s must contain %s (the un-sampled .102 is the whole point)", pool, ip)
+		}
+	}
+}
+
+// The China Mobile 223.104 field sample: a symmetric NAT that keeps ONE egress
+// IP across all destinations (only the port rotates). CoveringPool must return
+// nil -- there is nothing to expand, and a single candidate already reaches the
+// peer, so no wide spray is triggered.
+func TestCoveringPoolIPStableSymmetric(t *testing.T) {
+	d := &Detection{
+		MappedAddr:  &net.UDPAddr{IP: net.ParseIP("223.104.80.77"), Port: 15684},
+		ObservedIPs: []net.IP{net.ParseIP("223.104.80.77")},
+	}
+	if pool := d.CoveringPool(); pool != nil {
+		t.Fatalf("single egress IP must not announce a pool, got %s", pool)
+	}
+}

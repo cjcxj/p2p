@@ -21,7 +21,7 @@
 # -n trials  -w max-seconds-per-trial  --spray <ports/ip>  --sockets <pool>
 set -u
 
-SERVER="" ROOM="demo" TRIALS=10 MAXW=25 BIN="./bin/p2p" STUNS="" SPRAY="" SOCKETS=""
+SERVER="" ROOM="demo" TRIALS=10 MAXW=25 BIN="./bin/p2p" STUNS="" SPRAY="" SOCKETS="" PPS="800"
 while [ $# -gt 0 ]; do
   case "$1" in
     -s) SERVER="$2"; shift 2;;
@@ -32,6 +32,7 @@ while [ $# -gt 0 ]; do
     --stuns) STUNS="$2"; shift 2;;
     --spray) SPRAY="$2"; shift 2;;
     --sockets) SOCKETS="$2"; shift 2;;
+    --pps) PPS="$2"; shift 2;;
     *) echo "unknown arg: $1"; exit 2;;
   esac
 done
@@ -49,7 +50,7 @@ mkdir -p "$OUT"
 # latter is the #1 cause of NAT3<->NAT4 failing on a stubborn network; add more
 # diverse --stuns until candidates > 1 and the egress is covered.
 echo "=== local NAT + candidate enumeration (this network) ==="
-"$BIN" nat-check -server "$SERVER" ${STUNS:+-stun-list "$STUNS"} 2>&1 | tr -d '\000' | grep -aE "NAT type|public|candidates|port step|evidence" | sed 's/^/  /'
+"$BIN" nat-check -server "$SERVER" ${STUNS:+-stun-list "$STUNS"} 2>&1 | tr -d '\000' | grep -aE "NAT type|public|candidates|egress pool|port step|evidence" | sed 's/^/  /'
 echo
 
 pass=0; times=""; hitips=""
@@ -64,6 +65,7 @@ for i in $(seq 1 "$TRIALS"); do
   [ -n "$STUNS" ]   && args+=(-stun-list "$STUNS")
   [ -n "$SPRAY" ]   && args+=(-sym-spray "$SPRAY")
   [ -n "$SOCKETS" ] && args+=(-punch-sockets "$SOCKETS")
+  [ -n "$PPS" ]     && args+=(-punch-pps "$PPS")
   "$BIN" "${args[@]}" >"$log" 2>&1 &
   pid=$!
 
@@ -91,5 +93,9 @@ echo "NAT3<->NAT4 punch success: $pass/$TRIALS"
 [ -n "$times" ] && echo "time-to-direct (s):$times"
 [ -n "$hitips" ] && echo "winning peer addresses:$hitips"
 echo "logs in $OUT/  -- attach this dir when reporting a network to me."
-echo "If success < N/N: add more reachable --stuns (diverse public IPs) so the"
-echo "peer-direction egress IP is inside the candidate set; then re-run."
+echo "If success < N/N: the 'egress pool' line shows the block the peer announced"
+echo "(derived from its sampled STUN addresses). A symmetric peer with a SINGLE"
+echo "candidate and no pool means the STUN list did not enumerate its rotation --"
+echo "add more reachable, route-diverse --stuns so candidates > 1 and a /NN pool"
+echo "appears; the cone side then sprays the whole block, not just the sampled IPs."
+echo "PPS is capped at $PPS/s by default so a wide pool spray cannot flood the router."

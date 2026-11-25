@@ -73,6 +73,64 @@ func (d *Detection) PublicAddr() string {
 	return d.MappedAddr.String()
 }
 
+// CoveringPool returns the smallest IPv4 prefix that contains the mapped
+// address and every observed egress address. A destination-rotating CGNAT only
+// shows STUN a few of the public IPs in its contiguous block, so the address it
+// uses toward a particular peer is often absent from the sample -- but the
+// block is inferable from the clustered samples. Advertising this prefix lets
+// the easy peer spray the whole block instead of guessing the one egress IP.
+// Returns nil when there is nothing to expand (fewer than two distinct IPv4
+// addresses) or when the samples are too far apart to be one carrier block
+// (covering prefix shorter than /20), so an absurd range is never announced.
+func (d *Detection) CoveringPool() *net.IPNet {
+	if d.MappedAddr == nil {
+		return nil
+	}
+	ips := make([]net.IP, 0, len(d.ObservedIPs)+1)
+	seen := map[string]bool{}
+	add := func(ip net.IP) {
+		ip4 := ip.To4()
+		if ip4 == nil || seen[ip4.String()] {
+			return
+		}
+		seen[ip4.String()] = true
+		ips = append(ips, ip4)
+	}
+	if d.MappedAddr != nil {
+		add(d.MappedAddr.IP)
+	}
+	for _, ip := range d.ObservedIPs {
+		add(ip)
+	}
+	if len(ips) < 2 {
+		return nil
+	}
+	first := u32(ips[0])
+	var diff uint32
+	for _, ip := range ips[1:] {
+		diff |= first ^ u32(ip)
+	}
+	ones := 32
+	for ones > 0 && diff != 0 {
+		diff >>= 1
+		ones--
+	}
+	if ones < 20 {
+		return nil
+	}
+	mask := net.CIDRMask(ones, 32)
+	base := net.IPv4(byte(first>>24), byte(first>>16), byte(first>>8), byte(first)).Mask(mask)
+	return &net.IPNet{IP: base, Mask: mask}
+}
+
+func u32(ip net.IP) uint32 {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return 0
+	}
+	return uint32(ip4[0])<<24 | uint32(ip4[1])<<16 | uint32(ip4[2])<<8 | uint32(ip4[3])
+}
+
 // Method explains what the classification actually rested on, which is the
 // first thing to look at when a peer's punching plan seems wrong: a symmetric
 // NAT only ever shows up if an alternate destination answered.

@@ -12,10 +12,22 @@ import (
 // one, so the peer's own block spray lands inside this socket's public port.
 const defaultPeerPortOffset = 20
 
-// defaultSymmetricSpray is how many random ports the easy side fires at a hard
-// peer's public IP each round -- the EasyTier "hard-sym" birthday leg that
+// defaultSymmetricSpray is how many random ports the easy side fires at each
+// hard peer public IP each round -- the EasyTier "hard-sym" birthday leg that
 // works when the peer's NAT randomizes the per-socket public port.
 const defaultSymmetricSpray = 1024
+
+// defaultSprayIPMax bounds how many distinct public addresses the spray leg
+// covers when a peer announces an egress pool. A CGNAT block is usually a few
+// dozen contiguous addresses; the cap stops a mistakenly-wide prefix (e.g. /24)
+// from multiplying the birthday attack into an unbounded flood.
+const defaultSprayIPMax = 64
+
+// defaultPunchPPS is the probe rate ceiling. EasyTier-class hard-sym punching
+// lands within seconds at a couple thousand packets/s; going far above that
+// buys no coverage and instead starves the host NIC and overflows the router's
+// NAT session table, which is what takes an entire network offline.
+const defaultPunchPPS = 1500
 
 // Endpoint is one address the punch engine will probe.
 type Endpoint struct {
@@ -39,6 +51,13 @@ type NATInfo struct {
 	// Empty for ordinary NATs; the spray leg aims at all of them plus
 	// PublicAddr.IP.
 	PublicIPs []net.IP
+	// PoolCIDR is the address block the peer announced as its egress pool. A
+	// carrier CGNAT that re-dials within a contiguous block exposes only a few
+	// of its IPs to STUN observation points, so the sampled PublicIPs can miss
+	// the exact address used toward a given destination. When present the spray
+	// leg covers the whole block (bounded by Config.SprayIPMax), which turns
+	// "we happened to sample the right IP" into a deterministic hit.
+	PoolCIDR *net.IPNet
 }
 
 // CandidateIPs returns every public IPv4 address the peer might be reached at:
@@ -68,6 +87,61 @@ func (n NATInfo) CandidateIPs() []net.IP {
 		add(ip)
 	}
 	return out
+}
+
+// SprayIPs returns the addresses the easy-side spray leg must cover: every
+// sampled candidate first (cheap, likely), then the whole announced egress
+// pool so a destination-rotating CGNAT cannot hide behind the one IP it uses
+// toward us. Expansion is capped at max hosts (<=0 uses defaultSprayIPMax) so a
+// peer that reports a /24 pool cannot make the spray explode.
+func (n NATInfo) SprayIPs(max int) []net.IP {
+	out := n.CandidateIPs()
+	if n.PoolCIDR == nil {
+		return out
+	}
+	if max <= 0 {
+		max = defaultSprayIPMax
+	}
+	seen := make(map[string]bool, len(out))
+	for _, ip := range out {
+		seen[ip.String()] = true
+	}
+	base := n.PoolCIDR.IP.To4()
+	ones, bits := n.PoolCIDR.Mask.Size()
+	if base == nil || bits != 32 {
+		return out
+	}
+	// Number of hosts the prefix covers; never exceed max, and skip a prefix
+	// already fully represented by the sampled set.
+	span := 1 << (32 - ones)
+	if span > max {
+		span = max
+	}
+	// Start from the sampled base address and walk forward, wrapping inside the
+	// block, so the addresses we were most likely to observe are sprayed first.
+	start := ipToU32(base)
+	block := start & ^uint32(span-1)
+	for i := 0; i < span; i++ {
+		ip := u32ToIP(block + uint32(i))
+		if ip == nil || seen[ip.String()] {
+			continue
+		}
+		seen[ip.String()] = true
+		out = append(out, ip)
+	}
+	return out
+}
+
+func ipToU32(ip net.IP) uint32 {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return 0
+	}
+	return uint32(ip4[0])<<24 | uint32(ip4[1])<<16 | uint32(ip4[2])<<8 | uint32(ip4[3])
+}
+
+func u32ToIP(v uint32) net.IP {
+	return net.IPv4(byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
 
 // Config tunes the punch engine.
@@ -104,6 +178,19 @@ type Config struct {
 	// birthday attack, the path that works against cellular CGNAT. 0 = use
 	// defaultSymmetricSpray (1024).
 	SymmetricSpray int
+	// SprayIPMax bounds how many distinct public addresses the spray leg covers
+	// when a hard peer announces an egress pool. 0 = defaultSprayIPMax (64).
+	SprayIPMax int
+	// PunchPPS caps how many probe packets the engine sends per second per peer.
+	// Without it a wide CGNAT spray (pool IPs x port window) blasts the host NIC
+	// and, worse, exhausts the home router's NAT conntrack table, which takes
+	// the whole network down -- not just this app. 0 = defaultPunchPPS.
+	PunchPPS int
+	// EscalateAfterMs is how long a cone-classified peer may fail to connect
+	// before the engine re-plans it as hard (plant+spray). Guards against a
+	// symmetric CGNAT being flakily classified as cone, which otherwise strands
+	// the link on a single public probe that never re-rolls. 0 = 3000ms.
+	EscalateAfterMs int
 	// OnLog, when set, receives verbose hole-punching flow messages.
 	OnLog func(format string, args ...interface{})
 }
@@ -168,7 +255,7 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 					continue
 				}
 				addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: port}
-				eps = append(eps, Endpoint{Addr: addr, Kind: "predicted", Order: order, Socket: k})
+				eps = append(eps, Endpoint{Addr: addr, Kind: "predicted", Order: order, Socket: 0})
 				order++
 			}
 		} else if hardPeer || hardMy {
@@ -202,7 +289,7 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 						continue
 					}
 					addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: port}
-					eps = append(eps, Endpoint{Addr: addr, Kind: "predicted", Order: order, Socket: k})
+					eps = append(eps, Endpoint{Addr: addr, Kind: "predicted", Order: order, Socket: 0})
 					order++
 				}
 			}
@@ -221,7 +308,7 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 				if port >= 1 && port <= 65535 {
 					addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: port}
 					for k := 0; k < cfg.PredictionSockets; k++ {
-						eps = append(eps, Endpoint{Addr: addr, Kind: "block", Order: order, Socket: k})
+						eps = append(eps, Endpoint{Addr: addr, Kind: "block", Order: order, Socket: 0})
 						order++
 					}
 				}
@@ -232,10 +319,14 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 					n = defaultSymmetricSpray
 				}
 				// Spray the full window at EVERY candidate IP: the primary the
-				// server knows plus any observation-point addresses, because a
-				// destination-rotating CGNAT may answer on any of them.
+				// server knows plus any observation-point addresses, and the
+				// whole announced egress pool, because a destination-rotating
+				// CGNAT may answer on any of them. Widening the target set is
+				// what turns "we happened to sample the right IP" into a hit;
+				// the per-round packet count it implies is held down by the
+				// PunchPPS sweep cap, not by starving any single IP.
 				ports := distinctPorts(n)
-				for _, ip := range peer.CandidateIPs() {
+				for _, ip := range peer.SprayIPs(cfg.SprayIPMax) {
 					for _, sp := range ports {
 						addr := &net.UDPAddr{IP: ip, Port: sp}
 						eps = append(eps, Endpoint{Addr: addr, Kind: "spray", Order: order, Socket: 0})

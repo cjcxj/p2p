@@ -189,6 +189,10 @@ func asPC(conns []*natConn) []net.PacketConn {
 // published candidate set includes the peer-direction IP). includeEgress picks
 // whether that IP is in the candidate set.
 func runNat34(t *testing.T, poolIP []string, includeEgress bool) bool {
+	return runNat34With(t, poolIP, includeEgress, nil)
+}
+
+func runNat34With(t *testing.T, poolIP []string, includeEgress bool, announced *net.IPNet) bool {
 	t.Helper()
 	atomic.StoreInt64(&delivered, 0)
 	in := &internet{owner: map[string]*nat{}}
@@ -228,10 +232,10 @@ func runNat34(t *testing.T, poolIP []string, includeEgress bool) bool {
 	id4, id3 := protocol.NewPeerID(), protocol.NewPeerID()
 
 	ph4 := New(p4[0], id4, NATInfo{Type: stun.NatSymmetric, PublicAddr: adv4},
-		Config{PredictionSockets: 8, PeerPortOffset: 2, SymmetricSpray: 512, ProbeIntervalMs: 1, PunchTimeoutMs: 9000})
+		Config{PredictionSockets: 8, PeerPortOffset: 2, SymmetricSpray: 512, ProbeIntervalMs: 1, PunchTimeoutMs: 9000, PunchPPS: 1000000})
 	ph4.Conns = asPC(p4)
 	ph3 := New(p3[0], id3, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv3},
-		Config{PredictionSockets: 1, SymmetricSpray: 512, ProbeIntervalMs: 1, PunchTimeoutMs: 9000})
+		Config{PredictionSockets: 1, SymmetricSpray: 512, ProbeIntervalMs: 1, PunchTimeoutMs: 9000, PunchPPS: 1000000})
 	ph3.Conns = asPC(p3)
 	ph4.Start()
 	ph3.Start()
@@ -247,7 +251,7 @@ func runNat34(t *testing.T, poolIP []string, includeEgress bool) bool {
 	}()
 
 	ph4.AddPeer(id3, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv3})
-	ph3.AddPeer(id4, NATInfo{Type: stun.NatSymmetric, PublicAddr: adv4, PublicIPs: cand4})
+	ph3.AddPeer(id4, NATInfo{Type: stun.NatSymmetric, PublicAddr: adv4, PublicIPs: cand4, PoolCIDR: announced})
 
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
@@ -323,6 +327,39 @@ func TestNat34LargePoolUncovered(t *testing.T) {
 	}
 }
 
+// The 111.55 (China Unicom) reality, reproduced and RESOLVED: a destination-
+// rotating CGNAT whose egress IP toward the cone peer is NOT among the sampled
+// STUN addresses (the exact gap that made EasyTier connect but us fall to
+// relay). When the hard peer announces its covering egress POOL, the cone side
+// sprays the whole block, so the un-sampled egress address is reached and NAT3
+// <-> NAT4 punches direct -- with a single signalling server and no extra STUN
+// observation luck. The same scenario without the announced pool is the
+// negative control above (must fail), so this is the pool mechanism, not a
+// lenient model, that closes it.
+func TestNat34AnnouncedPoolRescuesUncovered(t *testing.T) {
+	pool := &net.IPNet{IP: net.ParseIP("127.0.4.192").To4(), Mask: net.CIDRMask(27, 32)}
+	if !runNat34With(t, rotatingPool, false, pool) {
+		t.Fatal("announced egress pool must let the cone side reach the un-sampled egress IP")
+	}
+}
+
+// Same rescue at scale: an 8-IP rotating pool where none of the addresses is
+// individually enumerated as the egress -- announcing the covering /27 makes
+// the spray reach whichever one the peer uses toward us.
+func TestNat34AnnouncedPoolRescuesLarge(t *testing.T) {
+	pool8 := []string{
+		"127.0.4.210", "127.0.4.211", "127.0.4.212", "127.0.4.213",
+		"127.0.4.214", "127.0.4.215", "127.0.4.216", "127.0.4.217",
+	}
+	pool := &net.IPNet{IP: net.ParseIP("127.0.4.192").To4(), Mask: net.CIDRMask(27, 32)}
+	const trials = 6
+	for i := 0; i < trials; i++ {
+		if !runNat34With(t, pool8, false, pool) {
+			t.Fatalf("announced pool must reliably punch large-pool NAT3<->NAT4 (trial %d)", i)
+		}
+	}
+}
+
 // "必须实现" means reliably, not sometimes. The spray is a birthday collision
 // over random ports; this runs the covered rotating-pool scenario many times
 // and requires EVERY run to punch, proving convergence is dependable across
@@ -364,4 +401,245 @@ func TestNat34PoolSizeSweep(t *testing.T) {
 			t.Fatalf("pool size %d: must NOT punch when the egress IP is excluded (too lenient)", k)
 		}
 	}
+}
+
+// runNat44 drives the hardest combination: BOTH peers are destination-rotating
+// symmetric NATs, each with its own egress pool, and each announces the peer's
+// covering pool. Neither side's peer-direction egress IP needs to have been
+// sampled by STUN -- both spray the whole announced block, so each reaches the
+// address the other actually uses toward it. announceA/announceB are the pools
+// advertised to the receiving side; nil means no pool is announced (the
+// under-covered baseline). Returns whether both sides reached a punched
+// transport.
+func runNat44(t *testing.T, poolA, poolB []string, announceA, announceB *net.IPNet) bool {
+	t.Helper()
+	atomic.StoreInt64(&delivered, 0)
+	in := &internet{owner: map[string]*nat{}}
+
+	pA := newNat(in, true, poolA, 8)
+	pB := newNat(in, true, poolB, 8)
+
+	// Server-direction advertised externals (a fixed destination to hash).
+	srv := &net.UDPAddr{IP: net.ParseIP("203.0.113.10").To4(), Port: 8080}
+	advA := pA[0].n.external(0, srv)
+	advB := pB[0].n.external(0, srv)
+
+	idA, idB := protocol.NewPeerID(), protocol.NewPeerID()
+	cfg := Config{PredictionSockets: 8, PeerPortOffset: 2, SymmetricSpray: 512, ProbeIntervalMs: 1, PunchTimeoutMs: 9000, PunchPPS: 1000000}
+
+	phA := New(pA[0], idA, NATInfo{Type: stun.NatSymmetric, PublicAddr: advA}, cfg)
+	phA.Conns = asPC(pA)
+	phB := New(pB[0], idB, NATInfo{Type: stun.NatSymmetric, PublicAddr: advB}, cfg)
+	phB.Conns = asPC(pB)
+	phA.Start()
+	phB.Start()
+	defer func() {
+		for _, c := range pA {
+			_ = c.Close()
+		}
+		for _, c := range pB {
+			_ = c.Close()
+		}
+		phA.Stop()
+		phB.Stop()
+	}()
+
+	// Each side learns the peer's advertised address; the announced pool is the
+	// only thing that carries the peer-direction egress when it was not sampled.
+	phA.AddPeer(idB, NATInfo{Type: stun.NatSymmetric, PublicAddr: advB, PoolCIDR: announceB})
+	phB.AddPeer(idA, NATInfo{Type: stun.NatSymmetric, PublicAddr: advA, PoolCIDR: announceA})
+
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		okA, trA := phA.Connected(idB)
+		okB, trB := phB.Connected(idA)
+		if okA && okB && trA == StatePunched && trB == StatePunched {
+			return true
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Logf("nat44 delivered-to-sockets=%d", atomic.LoadInt64(&delivered))
+	return false
+}
+
+// NAT4<->NAT4 with announced pools is reachable (the mechanism works), proven by
+// at least one of a few attempts punching direct. It is a BONUS beyond the
+// NAT3<->NAT4 objective: both sides have strict symmetric filters, so traversal
+// is a double birthday collision that does not always land inside one 8s window
+// -- we therefore assert reachability, not a guaranteed single-shot hit, and do
+// NOT claim 100% NAT4<->NAT4 (the goal's NAT3<->NAT4 reliability is separately
+// and strictly tested).
+func TestNat44AnnouncedPoolsPunch(t *testing.T) {
+	poolA := []string{"127.0.4.212", "127.0.4.216", "127.0.4.220"}
+	poolB := []string{"127.0.4.213", "127.0.4.217", "127.0.4.221"}
+	cov := &net.IPNet{IP: net.ParseIP("127.0.4.192").To4(), Mask: net.CIDRMask(27, 32)}
+	punched := false
+	for i := 0; i < 3 && !punched; i++ {
+		punched = runNat44(t, poolA, poolB, cov, cov)
+	}
+	if !punched {
+		t.Fatal("NAT4<->NAT4 should punch direct within 3 attempts when both announce the peer's egress pool")
+	}
+}
+
+// Reliability of NAT4<->NAT4 is a BONUS beyond the stated NAT3<->NAT4 goal.
+// Both sides carry strict symmetric filters, so traversal is a DOUBLE birthday
+// collision -- each side must independently land a probe on the other's
+// peer-direction egress IP AND port within the window. That converges in most
+// 8s trials but not provably every one, so this asserts a clear majority and
+// that announcing pools is strictly better than the no-pool baseline (which
+// TestNat44NoPoolUndercovered shows never succeeds). We deliberately do NOT
+// claim 100% NAT4<->NAT4 here; the objective's NAT3<->NAT4 reliability is the
+// separately-tested, guaranteed case.
+func TestNat44AnnouncedPoolsReliable(t *testing.T) {
+	poolA := []string{"127.0.4.212", "127.0.4.216", "127.0.4.220"}
+	poolB := []string{"127.0.4.213", "127.0.4.217", "127.0.4.221"}
+	cov := &net.IPNet{IP: net.ParseIP("127.0.4.192").To4(), Mask: net.CIDRMask(27, 32)}
+	const trials = 6
+	ok := 0
+	for i := 0; i < trials; i++ {
+		if runNat44(t, poolA, poolB, cov, cov) {
+			ok++
+		}
+	}
+	if ok < 3 {
+		t.Fatalf("NAT4<->NAT4 with pools should punch in a majority of trials; got %d/%d", ok, trials)
+	}
+	t.Logf("nat44 with pools converged %d/%d trials (double-birthday, best-effort)", ok, trials)
+}
+
+// Negative control: with no announced pool and a wide (8-IP) rotating egress on
+// each side, the lone advertised address almost never coincides with the
+// peer-direction egress, so the punch must NOT succeed. Guards that the
+// positive result comes from the pool mechanism, not a permissive model.
+func TestNat44NoPoolUndercovered(t *testing.T) {
+	poolA := []string{"127.0.4.210", "127.0.4.211", "127.0.4.212", "127.0.4.213", "127.0.4.214", "127.0.4.215", "127.0.4.216", "127.0.4.217"}
+	poolB := []string{"127.0.4.220", "127.0.4.221", "127.0.4.222", "127.0.4.223", "127.0.4.224", "127.0.4.225", "127.0.4.226", "127.0.4.227"}
+	if runNat44(t, poolA, poolB, nil, nil) {
+		t.Fatal("NAT4<->NAT4 should not punch an 8-IP pool with nothing announced (model too lenient?)")
+	}
+}
+
+// The live failure mode observed on real hardware: a cellular symmetric CGNAT is
+// FLAKILY classified as cone (the second-destination probe sometimes repeats the
+// mapping). A cone verdict gives the easy peer only a single public probe that
+// never re-rolls, so the link strands forever -- exactly rel2/rel3 in the field
+// test. The engine must fail-safe: after a few seconds without a connection,
+// re-plan the peer as hard and spray. This test misreports a symmetric NAT as
+// cone and requires the punch to still converge via escalation.
+func TestNat34EscalatesMisdetectedCone(t *testing.T) {
+	atomic.StoreInt64(&delivered, 0)
+	in := &internet{owner: map[string]*nat{}}
+	p4 := newNat(in, true, rotatingPool, 8)                 // actually symmetric
+	p3 := newNat(in, false, []string{"127.9.0.3"}, 1)       // cone
+
+	adv3 := p3[0].n.external(0, &net.UDPAddr{IP: net.ParseIP(rotatingPool[0]).To4(), Port: 1})
+	egress4to3 := p4[0].n.external(0, adv3)                 // rotating address to reach p4
+	// Advertise a DIFFERENT pool IP as the "public" address so a single public
+	// probe (the soft cone plan) can never land on the real egress.
+	adv4 := &net.UDPAddr{IP: net.ParseIP(rotatingPool[0]).To4(), Port: 6000}
+	if egress4to3.IP.String() == rotatingPool[0] {
+		adv4 = &net.UDPAddr{IP: net.ParseIP(rotatingPool[1]).To4(), Port: 6000}
+	}
+
+	id4, id3 := protocol.NewPeerID(), protocol.NewPeerID()
+	ph4 := New(p4[0], id4, NATInfo{Type: stun.NatSymmetric, PublicAddr: adv4},
+		Config{PredictionSockets: 8, PeerPortOffset: 2, SymmetricSpray: 512, ProbeIntervalMs: 1, PunchTimeoutMs: 9000, PunchPPS: 1000000})
+	ph4.Conns = asPC(p4)
+	ph3 := New(p3[0], id3, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv3},
+		Config{PredictionSockets: 1, SymmetricSpray: 512, ProbeIntervalMs: 1, PunchTimeoutMs: 9000, PunchPPS: 1000000, EscalateAfterMs: 1500})
+	ph3.Conns = asPC(p3)
+	ph4.Start()
+	ph3.Start()
+	defer func() {
+		for _, c := range p4 {
+			_ = c.Close()
+		}
+		for _, c := range p3 {
+			_ = c.Close()
+		}
+		ph4.Stop()
+		ph3.Stop()
+	}()
+
+	// MISREPORT: tell the cone peer the symmetric peer is also cone. Its initial
+	// plan is the soft single public probe; only escalation to the hard spray
+	// (over the candidate set that includes the rotating egress) can connect.
+	cand4 := []net.IP{adv4.IP, egress4to3.IP}
+	ph4.AddPeer(id3, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv3})
+	ph3.AddPeer(id4, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv4, PublicIPs: cand4})
+
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		ok4, tr4 := ph4.Connected(id3)
+		ok3, tr3 := ph3.Connected(id4)
+		if ok4 && ok3 && tr4 == StatePunched && tr3 == StatePunched {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatal("a symmetric peer misdetected as cone must still punch via hard-path escalation")
+}
+
+// The worst real-world combination, composed: a destination-rotating CGNAT that
+// is ALSO misdetected as cone, whose peer-direction egress IP was never sampled
+// (so it is absent from the published candidates). Neither fix alone is enough:
+// escalation to the hard path is required to start spraying at all, AND the
+// announced egress pool is required for that spray to reach the un-sampled
+// address. This is the exact stubborn Unicom-class case, and it must still
+// punch -- proving the two mechanisms compose rather than each working in
+// isolation.
+func TestNat34EscalatePlusPoolRescuesRotating(t *testing.T) {
+	atomic.StoreInt64(&delivered, 0)
+	in := &internet{owner: map[string]*nat{}}
+	p4 := newNat(in, true, rotatingPool, 8)
+	p3 := newNat(in, false, []string{"127.9.0.3"}, 1)
+
+	adv3 := p3[0].n.external(0, &net.UDPAddr{IP: net.ParseIP(rotatingPool[0]).To4(), Port: 1})
+	egress4to3 := p4[0].n.external(0, adv3)
+	// Advertise a pool IP that is NOT the peer-direction egress, and do NOT
+	// include the egress in the published candidates -- only the announced pool
+	// carries it.
+	adv4IP := rotatingPool[0]
+	if egress4to3.IP.String() == adv4IP {
+		adv4IP = rotatingPool[1]
+	}
+	adv4 := &net.UDPAddr{IP: net.ParseIP(adv4IP).To4(), Port: 6000}
+
+	id4, id3 := protocol.NewPeerID(), protocol.NewPeerID()
+	ph4 := New(p4[0], id4, NATInfo{Type: stun.NatSymmetric, PublicAddr: adv4},
+		Config{PredictionSockets: 8, PeerPortOffset: 2, SymmetricSpray: 512, ProbeIntervalMs: 1, PunchTimeoutMs: 9000, PunchPPS: 1000000})
+	ph4.Conns = asPC(p4)
+	ph3 := New(p3[0], id3, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv3},
+		Config{PredictionSockets: 1, SymmetricSpray: 512, ProbeIntervalMs: 1, PunchTimeoutMs: 9000, PunchPPS: 1000000, EscalateAfterMs: 1500})
+	ph3.Conns = asPC(p3)
+	ph4.Start()
+	ph3.Start()
+	defer func() {
+		for _, c := range p4 {
+			_ = c.Close()
+		}
+		for _, c := range p3 {
+			_ = c.Close()
+		}
+		ph4.Stop()
+		ph3.Stop()
+	}()
+
+	// MISREPORT as cone (so the initial plan is the soft single probe) and give
+	// candidates WITHOUT the egress -- only the announced /27 pool carries it.
+	pool := &net.IPNet{IP: net.ParseIP("127.0.4.192").To4(), Mask: net.CIDRMask(27, 32)}
+	ph4.AddPeer(id3, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv3})
+	ph3.AddPeer(id4, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv4, PoolCIDR: pool})
+
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		ok4, tr4 := ph4.Connected(id3)
+		ok3, tr3 := ph3.Connected(id4)
+		if ok4 && ok3 && tr4 == StatePunched && tr3 == StatePunched {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatal("rotating + misdetected-cone peer must punch via escalation AND announced pool together")
 }
