@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -382,6 +383,12 @@ func (s *Session) memberList() []*Member {
 		}
 		out = append(out, m)
 	}
+	// Deterministic order: MemberAt(i) re-snapshots the map on every call, and
+	// Go map iteration is randomized. Without sorting, the app's
+	// "for i in 0..MemberCount(): MemberAt(i)" loop can return the same peer at
+	// two indices (and skip another) whenever there are 2+ nodes -- producing
+	// duplicate LazyColumn keys and a crash. Sorting makes indices stable.
+	sort.Slice(out, func(i, j int) bool { return out[i].PeerID < out[j].PeerID })
 	return out
 }
 

@@ -382,7 +382,9 @@ class MeshController(context: Context) {
         val id = s.localID().orEmpty()
         _state.update { prev ->
             prev.copy(
-                peers = rows.sortedWith(compareBy({ !it.connected }, { it.virtualIp })),
+                peers = rows
+                    .distinctBy { it.virtualIp + it.peerId }
+                    .sortedWith(compareBy({ !it.connected }, { it.virtualIp })),
                 localId = id.ifEmpty { prev.localId },
                 localIp = vip.ifEmpty { prev.localIp },
                 natType = nat.ifEmpty { prev.natType },
