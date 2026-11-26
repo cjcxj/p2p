@@ -94,7 +94,6 @@ func puncher(t testing.TB, c *net.UDPConn, id protocol.PeerID) *punch.Punch {
 	}, punch.Config{
 		EnableLAN:       true,
 		PortPrediction:  false,
-		RelayFallback:   false,
 		ProbeIntervalMs: 50,
 		PunchTimeoutMs:  2000,
 	})

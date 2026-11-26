@@ -93,7 +93,6 @@ func fakeSession(t *testing.T, vip net.IP) *Session {
 	}, punch.Config{
 		EnableLAN:       true,
 		PortPrediction:  false,
-		RelayFallback:   false,
 		ProbeIntervalMs: 50,
 		PunchTimeoutMs:  2000,
 	})

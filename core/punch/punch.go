@@ -15,11 +15,11 @@ import (
 	"p2p/core/stun"
 )
 
-// States reported through OnState.
+// States reported through OnState. Pure P2P: a link is either still punching or
+// punched -- there is no relay state.
 const (
 	StatePunching = "punching"
 	StatePunched  = "punched"
-	StateRelay    = "relay"
 )
 
 // WireGuardSink consumes a WireGuard datagram received on the punch socket. It
@@ -43,16 +43,6 @@ const keepaliveInterval = 15 * time.Second
 // peerIdleTimeout is how long a connected peer may stay silent before the
 // link is considered stale and hole punching is restarted.
 const peerIdleTimeout = 45 * time.Second
-
-// relaySweepInterval is how often a peer that is only reachable over the relay
-// is probed again for a direct path. A NAT that maps each destination
-// separately rotates that mapping on the order of seconds, so a sweep that
-// stops the moment the relay answers never lines up.
-const relaySweepInterval = time.Second
-
-// directSweepDeadline bounds the background sweep: past it the relay is
-// accepted as the link and only keepalives continue.
-const directSweepDeadline = 3 * time.Minute
 
 // Punch drives hole punching for a set of remote peers over one or more shared
 // UDP sockets.
@@ -96,7 +86,6 @@ type peer struct {
 	transport string
 	connected bool
 	seq       uint16
-	relayOn   bool
 	stop      chan struct{}
 	lastSeen  time.Time
 }
@@ -177,30 +166,6 @@ func (p *Punch) Start() {
 	}
 	p.wg.Add(1)
 	go p.sendLoop()
-}
-
-// RegisterRelay sends a relay registration packet so the relay learns our
-// address. The payload carries "room\0token" so the shared relay socket can
-// route to the right room. It keeps re-sending until ack'd or stopped.
-func (p *Punch) RegisterRelay(relayAddr *net.UDPAddr, room, token string) {
-	p.wg.Add(1)
-	go func() {
-		defer p.wg.Done()
-		payload := []byte(room + "\x00" + token)
-		ticker := time.NewTicker(time.Duration(p.intervalMs()) * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-p.done:
-				return
-			case <-ticker.C:
-			}
-			pkt := &Packet{Type: PktRegister, Src: p.MyID, Dst: protocol.PeerID{}, Payload: payload}
-			buf := encodePooled(pkt)
-			p.Conn.WriteTo(buf, relayAddr)
-			putEncode(buf)
-		}
-	}()
 }
 
 func (p *Punch) intervalMs() int {
@@ -394,38 +359,18 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 
 	cfg := p.Config
 
-	// canSpray is true when the pool is active. An active pool is enough to
-	// replace the old symmetric-to-symmetric give-up path: planTargets picks
-	// the step-aligned spray when the peer reports a PortStep, and otherwise
-	// falls back to the deterministic n4-style block spray, which needs no
-	// step measurement at all (so it works against a cellular CGNAT).
-	canSpray := cfg.PredictionSockets > 1
-	bothSymmetric := p.My.Type == stun.NatSymmetric && info.Type == stun.NatSymmetric
-	if bothSymmetric && !canSpray && !cfg.RelayFallback {
-		return
-	}
-
+	// Pure P2P: there is no relay fallback, so every peer gets the full direct
+	// attempt. canSpray (an active socket pool) enables the step-aligned and
+	// n4 block legs; the multi-IP spray leg runs regardless of pool size, so a
+	// destination-rotating CGNAT is still attacked even with a single socket.
 	targets := planTargets(p.My, info, cfg)
 	var punchEps []Endpoint
-	var relayEp *Endpoint
 	spraying := false
 	for i := range targets {
-		switch targets[i].Kind {
-		case "relay":
-			ep := targets[i]
-			relayEp = &ep
-		case "spray":
+		if targets[i].Kind == "spray" {
 			spraying = true
-			punchEps = append(punchEps, targets[i])
-		default:
-			punchEps = append(punchEps, targets[i])
 		}
-	}
-
-	relayOnly := bothSymmetric && !canSpray
-	if relayOnly {
-		punchEps = nil
-		spraying = false
+		punchEps = append(punchEps, targets[i])
 	}
 
 	interval := time.Duration(p.intervalMs()) * time.Millisecond
@@ -449,22 +394,14 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 	if sprayPorts > 0 {
 		p.logf("  target kind=spray %d random ports at %s (re-rolled each round)", sprayPorts, sprayIP)
 	}
-	if relayEp != nil {
-		if relayOnly {
-			p.logf("  symmetric-to-symmetric: relay only")
-		} else {
-			p.logf("  dual-path relay %s (parallel with direct punching)", relayEp.Addr)
-		}
-	}
-
 	start := time.Now()
 	lastAnnounce := time.Time{}
 	round := 0
 	// Fail-safe escalation. A cellular symmetric NAT is flakily classified as
 	// cone on real networks (the second-destination probe sometimes repeats the
 	// mapping), and a "cone" verdict gives the peer only a single public probe
-	// that never re-rolls -- so a misclassification permanently strands the link
-	// on relay. If a soft (non-spraying) plan has not connected within
+	// that never re-rolls -- so a misclassification permanently strands the
+	// link. If a soft (non-spraying) plan has not connected within
 	// escalateAfter, re-plan the peer as hard (plant+spray). This is additive:
 	// a genuinely-cone peer would already be connected by now, so escalating it
 	// costs only a little extra traffic and recovers the misdetected case.
@@ -501,30 +438,21 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 		default:
 		}
 		connected, transport := p.Connected(id)
-		if connected && transport != StateRelay {
-			if relayEp != nil {
-				p.logf("peer %s: direct path confirmed, upgrading from relay", id.String()[:8])
-			}
+		if connected && transport == StatePunched {
 			p.keepaliveLoop(id, stop)
 			return
 		}
-		if !spraying && !escalated && !relayOnly && time.Since(start) > escalateAfter {
+		if !spraying && !escalated && time.Since(start) > escalateAfter {
 			escalated = true
 			planInfo.Type = stun.NatSymmetric
 			planMy.Type = stun.NatSymmetric
 			nt := planTargets(planMy, planInfo, cfg)
 			replanned := punchEps[:0]
 			for i := range nt {
-				switch nt[i].Kind {
-				case "relay":
-					ep := nt[i]
-					relayEp = &ep
-				case "spray":
+				if nt[i].Kind == "spray" {
 					spraying = true
-					replanned = append(replanned, nt[i])
-				default:
-					replanned = append(replanned, nt[i])
 				}
+				replanned = append(replanned, nt[i])
 			}
 			punchEps = replanned
 			p.logf("peer %s: cone-classified peer not connected after %s, escalating to hard plant+spray", id.String()[:8], escalateAfter)
@@ -536,37 +464,10 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 			// round grow coverage until a collision lands.
 			nt := planTargets(planMy, planInfo, cfg)
 			replanned := punchEps[:0]
-			for i := range nt {
-				if nt[i].Kind != "relay" {
-					replanned = append(replanned, nt[i])
-				}
-			}
+			replanned = append(replanned, nt...)
 			punchEps = replanned
 		}
 		eps := punchEps
-		if relayEp != nil {
-			if !ps.relayOn {
-				p.logf("peer %s: probing direct + relay in parallel", id.String()[:8])
-			}
-			ps.mu.Lock()
-			ps.relayOn = true
-			ps.mu.Unlock()
-			if connected {
-				// A working relay is not a result. A NAT that maps each
-				// destination separately usually only lines up after several
-				// rounds, and one burst is not a round: keep the relay mapping
-				// warm and keep sweeping for a direct path, more slowly.
-				p.keepAliveOnce(id)
-				if time.Since(start) > directSweepDeadline {
-					p.logf("peer %s: no direct path after %s, staying on relay", id.String()[:8], directSweepDeadline)
-					p.keepaliveLoop(id, stop)
-					return
-				}
-				wait = relaySweepInterval
-			} else {
-				eps = append(append([]Endpoint(nil), eps...), *relayEp)
-			}
-		}
 		nextSend = time.Now()
 		for _, ep := range eps {
 			if p.stopped() {
@@ -819,22 +720,15 @@ func (ps *peer) note(p *Punch, ua *net.UDPAddr, sockIdx int) (first, upgraded bo
 	if ua == nil {
 		return first, false
 	}
-	viaRelay := ps.info.RelayAddr != nil &&
-		ua.IP.Equal(ps.info.RelayAddr.IP) && ua.Port == ps.info.RelayAddr.Port
-	if viaRelay && ps.transport == StatePunched {
-		return first, false
-	}
 	was := ps.transport
 	ps.endpoint = ua
-	if !viaRelay {
-		ps.sockIdx = sockIdx
-	}
+	ps.sockIdx = sockIdx
 	ps.transport = StatePunched
-	if viaRelay {
-		ps.transport = StateRelay
-	}
 	ps.connected = true
-	return first, was == StateRelay && ps.transport == StatePunched
+	// Pure P2P: any inbound packet from the peer confirms the direct punched
+	// endpoint. "upgraded" marks the first transition into a punched link.
+	upgraded = was != StatePunched
+	return first, upgraded
 }
 
 func (p *Punch) report(ps *peer, id protocol.PeerID) {

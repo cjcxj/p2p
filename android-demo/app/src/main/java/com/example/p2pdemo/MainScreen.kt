@@ -245,7 +245,6 @@ private fun OverviewTab(state: MeshUiState) {
             InfoRow("房间", state.config.room)
             InfoRow("服务器", state.config.serverAddr)
             InfoRow("数据面", if (state.config.legacyMesh) "旧版逐包转发（A/B）" else "WireGuard 隧道")
-            InfoRow("中继回退", if (state.config.relayEnabled) "开启" else "关闭")
         }
         SectionCard(title = "怎么用") {
             Hint("1. 另一台设备填同一个服务器地址和房间名接入。")

@@ -19,8 +19,6 @@ type Config struct {
 	// client connects to an open server.
 	AuthSecret string
 
-	// RelayEnabled enables the relay fallback when hole punching fails.
-	RelayEnabled bool
 	// PortPrediction enables symmetric-NAT port prediction.
 	PortPrediction bool
 	// EnableLAN allows same-LAN direct connections.
@@ -98,7 +96,6 @@ type Config struct {
 // Defaults returns a Config with the recommended values filled in.
 func Defaults() *Config {
 	return &Config{
-		RelayEnabled:      true,
 		PortPrediction:    true,
 		EnableLAN:         true,
 		TimeoutSec:        15,

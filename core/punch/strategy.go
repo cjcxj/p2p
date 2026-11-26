@@ -158,8 +158,6 @@ func u32ToIP(v uint32) net.IP {
 type Config struct {
 	// PortPrediction enables port-range probing for symmetric NATs.
 	PortPrediction bool
-	// RelayFallback enables the relay endpoint as a last resort.
-	RelayFallback bool
 	// EnableLAN allows probing the private address for same-LAN peers.
 	EnableLAN bool
 	// PredictionRange is the number of ports probed on each side of the
@@ -167,7 +165,7 @@ type Config struct {
 	PredictionRange int
 	// ProbeInterval is the delay between probe bursts (default 200ms).
 	ProbeIntervalMs int
-	// PunchTimeout is how long to punch before trying the relay.
+	// PunchTimeout is how long to punch before giving up on this peer.
 	PunchTimeoutMs int
 	// PredictionSockets is the number of source sockets in the spray pool
 	// (default 0 = no pool; 1 = primary only). Values > 1 bind a contiguous
@@ -377,11 +375,8 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 		}
 	}
 
-	// Relay: always reachable if the relay is up; keep as last resort.
-	if cfg.RelayFallback && peer.RelayAddr != nil {
-		eps = append(eps, Endpoint{Addr: peer.RelayAddr, Kind: "relay", Order: order})
-		order++
-	}
+	// (No relay fallback: this is a pure-P2P engine. If direct punching fails,
+	// the link simply does not connect -- there is no relay data path.)
 	return eps
 }
 

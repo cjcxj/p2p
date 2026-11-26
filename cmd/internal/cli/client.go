@@ -58,7 +58,6 @@ options:
   --user <u>       username for server authentication
   --secret <s>     shared secret / password for server authentication
   --no-predict     disable symmetric-NAT port prediction
-  --no-relay       disable relay fallback
   --no-lan         disable same-LAN shortcut
   --no-encrypt     experimental: disable data-plane encryption (both ends)
   --timeout <sec>  connect timeout
@@ -145,7 +144,6 @@ func runConnect(args []string) int {
 	user := fs.String("user", "", "username for server authentication")
 	secret := fs.String("secret", "", "shared secret / password for server authentication")
 	noPredict := fs.Bool("no-predict", false, "disable symmetric-NAT port prediction")
-	noRelay := fs.Bool("no-relay", false, "disable relay fallback")
 	noLAN := fs.Bool("no-lan", false, "disable same-LAN shortcut")
 	punchSockets := fs.Int("punch-sockets", 128, "socket pool size for symmetric plant/block legs (0=off)")
 	peerPortOffset := fs.Int("peer-port-offset", 20, "block spray aims at peer public port + this offset (must be < --punch-sockets)")
@@ -184,9 +182,6 @@ func runConnect(args []string) int {
 	cfg.Plaintext = *noEncrypt
 	if *noPredict {
 		cfg.PortPrediction = false
-	}
-	if *noRelay {
-		cfg.RelayEnabled = false
 	}
 	if *noLAN {
 		cfg.EnableLAN = false
@@ -247,7 +242,6 @@ func runMesh(args []string) int {
 	user := fs.String("user", "", "username for server authentication")
 	secret := fs.String("secret", "", "shared secret / password for server authentication")
 	noPredict := fs.Bool("no-predict", false, "disable symmetric-NAT port prediction")
-	noRelay := fs.Bool("no-relay", false, "disable relay fallback")
 	noLAN := fs.Bool("no-lan", false, "disable same-LAN shortcut")
 	punchSockets := fs.Int("punch-sockets", 128, "socket pool size for symmetric plant/block legs (0=off)")
 	peerPortOffset := fs.Int("peer-port-offset", 20, "block spray aims at peer public port + this offset (must be < --punch-sockets)")
@@ -289,9 +283,6 @@ func runMesh(args []string) int {
 	cfg.Plaintext = *noEncrypt
 	if *noPredict {
 		cfg.PortPrediction = false
-	}
-	if *noRelay {
-		cfg.RelayEnabled = false
 	}
 	if *noLAN {
 		cfg.EnableLAN = false

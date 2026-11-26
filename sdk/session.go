@@ -55,8 +55,6 @@ type Session struct {
 	mesh       *mesh.Node
 	room       string
 
-	relayAddr *net.UDPAddr
-
 	x25519     *ecdh.PrivateKey
 	protector  SocketProtector
 	localStack *netstack.LocalStack
@@ -706,7 +704,6 @@ func (s *Session) run(room string) {
 
 	ph := punch.New(s.conn, s.id, my, punch.Config{
 		PortPrediction:    s.cfg.PortPrediction,
-		RelayFallback:     s.cfg.RelayEnabled,
 		EnableLAN:         s.cfg.EnableLAN,
 		ProbeIntervalMs:   s.cfg.ProbeIntervalMs,
 		PunchTimeoutMs:    s.cfg.PunchTimeoutMs,
@@ -893,35 +890,6 @@ func (s *Session) onSignaling(m protocol.Message) error {
 			return nil
 		}
 		s.onPeerCandidate(m)
-	case protocol.MsgRelayGrant:
-		// Single-port server: TCP signaling, UDP STUN and UDP relay all share
-		// the same host:port. If the server omits --public it may advertise a
-		// loopback/unspecified relay address; in that case use the address the
-		// client actually used to reach the server.
-		relayAddrStr := s.cfg.ServerAddr
-		if m.RelayAddr != "" {
-			if host, _, err := net.SplitHostPort(m.RelayAddr); err == nil {
-				ip := net.ParseIP(host)
-				if ip == nil || (!ip.IsLoopback() && !ip.IsUnspecified()) {
-					relayAddrStr = m.RelayAddr
-				}
-			}
-		}
-		addr, err := net.ResolveUDPAddr("udp", relayAddrStr)
-		if err == nil {
-			tok := m.RelayToken
-			if tok == "" {
-				tok = s.cfg.Token // older servers: fall back to room token
-			}
-			s.mu.Lock()
-			s.relayAddr = addr
-			ph := s.ph
-			room := s.room
-			s.mu.Unlock()
-			if ph != nil {
-				ph.RegisterRelay(addr, room, tok)
-			}
-		}
 	case protocol.MsgError:
 		s.emit(EventError, "", []byte(m.Error))
 	}
@@ -1012,9 +980,6 @@ func (s *Session) onPeerCandidate(m protocol.Message) {
 	}
 	key := s.negotiateDataKey(senderID, c.X25519Pub)
 	s.mu.Lock()
-	if s.relayAddr != nil && info.RelayAddr == nil {
-		info.RelayAddr = s.relayAddr
-	}
 	// record the peer's virtual address and negotiated key
 	r := s.peers[sender]
 	if r == nil {
@@ -1199,9 +1164,6 @@ func (s *Session) buildCandidate() *protocol.Candidate {
 			c.PrivateAddr = det.LocalAddr.String()
 		}
 	}
-	if s.relayAddr != nil {
-		c.RelayAddr = s.relayAddr.String()
-	}
 	c.X25519Pub = dataPublicHex(s.x25519)
 	return c
 }
@@ -1238,11 +1200,6 @@ func candidateToNAT(c *protocol.Candidate) (punch.NATInfo, error) {
 	}
 	if c.PrivateAddr != "" {
 		if info.PrivateAddr, err = net.ResolveUDPAddr("udp", c.PrivateAddr); err != nil {
-			return info, err
-		}
-	}
-	if c.RelayAddr != "" {
-		if info.RelayAddr, err = net.ResolveUDPAddr("udp", c.RelayAddr); err != nil {
 			return info, err
 		}
 	}

@@ -83,12 +83,6 @@ fun SettingsSheet(
                 Spacer(Modifier.height(6.dp))
 
                 ToggleRow(
-                    label = "中继回退",
-                    support = "打洞失败时经服务器转发，隧道不会使用中继节点",
-                    checked = draft.relayEnabled,
-                    onChange = { draft = draft.copy(relayEnabled = it) },
-                )
-                ToggleRow(
                     label = "详细打洞日志",
                     support = "把探测、候选地址、握手过程写进日志页",
                     checked = draft.debug,

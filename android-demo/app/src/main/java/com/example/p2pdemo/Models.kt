@@ -13,7 +13,6 @@ data class ConnConfig(
     val token: String = "",
     val authUser: String = "",
     val authSecret: String = "",
-    val relayEnabled: Boolean = true,
     val debug: Boolean = true,
     val plaintext: Boolean = false,
     val legacyMesh: Boolean = false,
@@ -29,7 +28,6 @@ data class ConnConfig(
         cfg.setToken(token)
         cfg.setAuthUser(authUser)
         cfg.setAuthSecret(authSecret)
-        cfg.setRelayEnabled(relayEnabled)
         cfg.setPortPrediction(true)
         cfg.setEnableLAN(true)
         // Hard-symmetric birthday attack. The phone is the CGNAT (hard) side:
