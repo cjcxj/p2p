@@ -29,7 +29,6 @@ class MainActivity : AppCompatActivity() {
         cfg.serverAddr = server + ":8080"
         cfg.stunAddr = server + ":8080" // 单端口服务器：STUN 与信令同端口
         cfg.token = token
-        cfg.relayEnabled = true
         cfg.portPrediction = true
         cfg.enableLan = true
         // Hard-symmetric birthday attack: as the CGNAT (hard) side the phone

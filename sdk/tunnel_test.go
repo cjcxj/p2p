@@ -220,29 +220,6 @@ func TestSDKCloseTUNReattachesSamePeer(t *testing.T) {
 	}
 }
 
-// TestSDKTunnelDropsRelayPeer checks a peer that is only reachable through the
-// relay is not handed to WireGuard: the tunnel writes raw frames to the
-// endpoint and a relay forwards only the punch engine's own framing.
-func TestSDKTunnelDropsRelayPeer(t *testing.T) {
-	a, _, _, _ := punchedPair(t)
-	id := protocol.NewPeerID()
-	vip := net.ParseIP("10.9.0.9")
-	a.mu.Lock()
-	a.peers[id.String()] = &remote{
-		id:        id,
-		vip:       vip,
-		wgPub:     "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
-		connected: true,
-		transport: TransportRelay,
-		endpoint:  "127.0.0.1:5555",
-	}
-	tp, ok := a.tunnelPeer(id.String(), a.peers[id.String()])
-	a.mu.Unlock()
-	if ok {
-		t.Fatalf("relay peer offered to the tunnel: %+v", tp)
-	}
-}
-
 // TestSDKOpenTUNRejectsLegacyMesh keeps the two data planes from being
 // requested at once: the desktop interface is created by the tunnel, and the
 // legacy bridge expects the caller to own it.

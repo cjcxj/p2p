@@ -56,7 +56,6 @@ const (
 	MsgWelcome    = "welcome"
 	MsgMembers    = "members"
 	MsgCandidate  = "candidate"
-	MsgRelayGrant = "relay_grant"
 	MsgPing       = "ping"
 	MsgError      = "error"
 	MsgLeave      = "leave"
@@ -76,7 +75,6 @@ type Candidate struct {
 	NATType     string `json:"nat_type"`
 	PublicAddr  string `json:"public_addr"`
 	PrivateAddr string `json:"private_addr"`
-	RelayAddr   string `json:"relay_addr"`
 	PortDelta   int    `json:"port_delta"`
 	PortStep    int    `json:"port_step,omitempty"`
 	// X25519Pub is the sender's X25519 public key (hex, 32 bytes) used to
@@ -95,8 +93,6 @@ type Message struct {
 	Network    string       `json:"network,omitempty"`
 	Members    []MemberInfo `json:"members,omitempty"`
 	Candidate  *Candidate   `json:"candidate,omitempty"`
-	RelayAddr  string       `json:"relay_addr,omitempty"`
-	RelayToken string       `json:"relay_token,omitempty"`
 	User       string       `json:"user,omitempty"`
 	Nonce      string       `json:"nonce,omitempty"`
 	Proof      string       `json:"proof,omitempty"`

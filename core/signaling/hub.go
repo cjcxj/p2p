@@ -21,7 +21,6 @@ type member struct {
 type Room struct {
 	id        string
 	token     string
-	relayAddr string
 	network   *net.IPNet
 	usedIP    map[string]bool
 	mu        sync.Mutex
@@ -53,7 +52,7 @@ var ErrBadToken = errors.New("signaling: room token mismatch")
 // join adds a member to a room, creating it on first use. When the room is
 // created the given token becomes its secret; later joiners must match it.
 // network is the virtual subnet addresses are allocated from.
-func (h *Hub) join(roomID, token string, m *member, relayAddr string, network *net.IPNet) (vip string, created bool, err error) {
+func (h *Hub) join(roomID, token string, m *member, network *net.IPNet) (vip string, created bool, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	r, ok := h.rooms[roomID]
@@ -61,7 +60,6 @@ func (h *Hub) join(roomID, token string, m *member, relayAddr string, network *n
 		r = &Room{
 			id:        roomID,
 			token:     token,
-			relayAddr: relayAddr,
 			network:   network,
 			usedIP:    make(map[string]bool),
 			members:   make(map[string]*member),

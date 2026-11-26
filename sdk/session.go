@@ -1013,12 +1013,12 @@ func (s *Session) onPeerCandidate(m protocol.Message) {
 	// Actionable diagnostic for the one case that can still defeat a symmetric
 	// peer: its candidate set enumerates only one public IP AND it announced no
 	// egress pool. If that IP is not the address it uses toward us (a
-	// destination-rotating CGNAT), the spray has nothing correct to aim at.
-	// Rather than fail silently onto the relay, surface the fix: configure more
-	// STUN observation points.
+	// destination-rotating CGNAT), the spray has nothing correct to aim at and
+	// the link will not connect (pure P2P: no relay to fall back to). Surface
+	// the fix: configure more STUN observation points.
 	if s.cfg.Debug && info.Type == stun.NatSymmetric && info.PoolCIDR == nil && len(info.CandidateIPs()) <= 1 {
 		s.debugf("p2p: peer " + sender + " is symmetric but exposes a single candidate IP; " +
-			"if punching falls back to relay, add more --stun-list observation points so its egress pool is enumerated")
+			"if punching fails, add more --stun-list observation points so its egress pool is enumerated")
 	}
 	ph.AddPeer(senderID, info)
 	if needTunnel {
@@ -1042,13 +1042,7 @@ func (s *Session) onPeerConnected(id protocol.PeerID, transport, endpoint string
 	r.transport = transport
 	r.endpoint = endpoint
 	idStr := id.String()
-	// A link that fell back to relay no longer carries raw WireGuard frames:
-	// the relay only forwards the punch engine's own framing.
 	var gonePub, goneEndpoint string
-	if transport == TransportRelay && r.wgEndpoint != "" {
-		gonePub, goneEndpoint = r.wgPub, r.wgEndpoint
-		r.wgEndpoint = ""
-	}
 	tp, needTunnel := s.tunnelPeer(idStr, r)
 	vip := ""
 	var vipIP net.IP

@@ -75,14 +75,10 @@ data class PeerRow(
     val isDirect: Boolean
         get() = transport == P2p.TransportPunched
 
-    val isRelay: Boolean
-        get() = transport == P2p.TransportRelay
-
     val linkLabel: String
         get() = when {
             !connected -> "未连通"
             isDirect -> "直连"
-            isRelay -> "中继"
             else -> transport
         }
 }

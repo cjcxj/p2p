@@ -146,9 +146,6 @@ func (s *Session) tunnelPeer(id string, r *remote) (tunnelPeer, bool) {
 	if r == nil || !r.connected || r.wgPub == "" || r.endpoint == "" || r.vip == nil {
 		return tunnelPeer{}, false
 	}
-	if r.transport == TransportRelay {
-		return tunnelPeer{}, false
-	}
 	// Nothing to do while the configured endpoint is the one in use.
 	if r.wgEndpoint == r.endpoint {
 		return tunnelPeer{}, false

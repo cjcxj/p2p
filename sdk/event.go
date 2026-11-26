@@ -32,10 +32,10 @@ const (
 	StateFailed     = "failed"
 )
 
-// Transports reported through EventPeerConnected.
+// Transports reported through EventPeerConnected. Pure P2P: a connected peer is
+// reached by a punched direct link only -- there is no relay transport.
 const (
 	TransportPunched = "punched"
-	TransportRelay   = "relay"
 )
 
 // Listener receives asynchronous events from a Session. The implementation

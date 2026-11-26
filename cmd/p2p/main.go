@@ -56,7 +56,7 @@ func usage() {
 	fmt.Println(`p2p — unified P2P client/server CLI
 
 usage:
-  p2p server [options]                  run signaling + STUN + relay server
+  p2p server [options]                  run signaling + STUN server
   p2p client <nat-check|connect|mesh>   run the client
   p2p <nat-check|connect|mesh>          compatibility form of the client
 

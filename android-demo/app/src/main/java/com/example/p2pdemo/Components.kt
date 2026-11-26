@@ -84,11 +84,6 @@ fun LinkBadge(row: PeerRow) {
             Color(0xFF1B5E20),
             Color(0xFFB9F6CA),
         )
-        row.isRelay -> Triple(
-            "中继",
-            Color(0xFF6D4C00),
-            Color(0xFFFFE082),
-        )
         else -> Triple(
             row.transport,
             MaterialTheme.colorScheme.secondaryContainer,

@@ -18,8 +18,6 @@ const DefaultNetwork = "10.9.0.0/24"
 type Server struct {
 	ln            net.Listener
 	hub           *Hub
-	relayAlloc    func(roomID, token string) (addr string, err error)
-	relayGrant    func(roomID, peerID, token string)
 	network       *net.IPNet
 	auth          *authConfig
 	logger        *log.Logger
@@ -40,12 +38,6 @@ const idleTimeout = 75 * time.Second
 
 // Options configures the server.
 type Options struct {
-	// RelayAlloc allocates a relay socket for a room on demand, gated by the
-	// room token. Optional.
-	RelayAlloc func(roomID, token string) (addr string, err error)
-	// RelayGrant, when set, records a per-peer relay token so the relay can
-	// authenticate a specific peer instead of only checking the room token.
-	RelayGrant func(roomID, peerID, token string)
 	// Logger receives operational messages; nil disables logging.
 	Logger *log.Logger
 	// Verbose enables per-member join/leave and rejection logs in addition
@@ -93,8 +85,6 @@ func NewServer(addr string, opts Options) (*Server, error) {
 	s := &Server{
 		ln:            ln,
 		hub:           NewHub(),
-		relayAlloc:    opts.RelayAlloc,
-		relayGrant:    opts.RelayGrant,
 		network:       ipnet,
 		logger:        opts.Logger,
 		verbose:       opts.Verbose,
@@ -236,25 +226,12 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	mem := &member{id: id, conn: conn}
 
-	// Allocate a relay socket for the room if enabled.
-	relayAddr := ""
-	relayToken := ""
-	if s.relayAlloc != nil {
-		if ra, err := s.relayAlloc(roomID, token); err == nil {
-			relayAddr = ra
-			relayToken = auth.RandomNonce()
-			if s.relayGrant != nil {
-				s.relayGrant(roomID, id.String(), relayToken)
-			}
+		vip, created, err := s.hub.join(roomID, token, mem, s.network)
+		if err != nil {
+			s.fail(conn, err.Error())
+			s.logf("member rejected room %q from %s: %v", roomID, conn.RemoteAddr(), err)
+			return
 		}
-	}
-
-	vip, created, err := s.hub.join(roomID, token, mem, relayAddr, s.network)
-	if err != nil {
-		s.fail(conn, err.Error())
-		s.logf("member rejected room %q from %s: %v", roomID, conn.RemoteAddr(), err)
-		return
-	}
 	if created {
 		s.logf("room %q created (token %s)", roomID, tokenState(token))
 	}
@@ -265,9 +242,6 @@ func (s *Server) handleConn(conn net.Conn) {
 	members := s.hub.membersInfo(roomID)
 	mem.mu.Lock()
 	WriteMsg(conn, protocol.Message{Type: protocol.MsgWelcome, PeerID: id.String(), VirtualIP: vip, Network: s.Network()})
-	if relayAddr != "" {
-		WriteMsg(conn, protocol.Message{Type: protocol.MsgRelayGrant, RelayAddr: relayAddr, RelayToken: relayToken})
-	}
 	WriteMsg(conn, protocol.Message{Type: protocol.MsgMembers, Members: members})
 	mem.mu.Unlock()
 	// Announce the full member list to everyone else.

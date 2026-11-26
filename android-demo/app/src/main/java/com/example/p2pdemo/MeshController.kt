@@ -502,7 +502,6 @@ class MeshController(context: Context) {
 
     private fun linkOf(transport: String): String = when (transport) {
         P2p.TransportPunched -> "直连"
-        P2p.TransportRelay -> "中继"
         else -> transport.ifEmpty { "未知" }
     }
 

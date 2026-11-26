@@ -6,7 +6,6 @@ package cli
 
 import (
 	"crypto/tls"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
@@ -16,8 +15,6 @@ import (
 	"strings"
 	"syscall"
 
-	"p2p/core/punch"
-	"p2p/core/relay"
 	"p2p/core/signaling"
 	"p2p/core/stun"
 )
@@ -26,7 +23,6 @@ func RunServer(args []string) int {
 	fs := flag.NewFlagSet("p2p server", flag.ExitOnError)
 	port := fs.Int("port", 8080, "single service port (TCP signaling + UDP STUN/relay)")
 	verbose := fs.Bool("verbose", false, "log room membership and signaling events")
-	publicIP := fs.String("public", "", "public IP of this server (required for relay reachability)")
 	stunIP2 := fs.String("stun-ip2", "", "optional secondary IP for full-cone detection")
 	stunSecondary := fs.Bool("stun-secondary", false, "also bind STUN on port+1 for richer NAT detection (firewall must open it)")
 	network := fs.String("network", "10.9.0.0/24", "virtual subnet for per-room address allocation (0.0.0.0/0 disables)")
@@ -60,14 +56,7 @@ func RunServer(args []string) int {
 	}
 	defer udpConn.Close()
 
-	relaySrv := relay.NewServer()
-	relaySrv.MaxRoomMembers = *maxRoomMembers
-	relaySrv.UseConn(udpConn)
-	relaySrv.OnRegister = func(room, peerID string) {
-		logger.Printf("relay: peer %s registered in room %q", peerID[:8], room)
-	}
-	defer relaySrv.Close()
-	logger.Printf("STUN + relay UDP on :%d (ensure UDP %d is open on the firewall)", *port, *port)
+	logger.Printf("STUN UDP on :%d (ensure UDP %d is open on the firewall)", *port, *port)
 
 	// Optional best-effort secondary STUN socket on port+1 (enables the
 	// change-port test and symmetric detection when reachable; not required
@@ -97,12 +86,6 @@ func RunServer(args []string) int {
 
 	// ---- Signaling (TCP) ----
 	sigSrv, err := signaling.NewServer(fmt.Sprintf("0.0.0.0:%d", *port), signaling.Options{
-		RelayAlloc: func(roomID, token string) (string, error) {
-			return relaySrv.Allocate(roomID, token, *publicIP)
-		},
-		RelayGrant: func(roomID, peerID, token string) {
-			relaySrv.Grant(roomID, peerID, token)
-		},
 		Network:        *network,
 		Secret:         *secret,
 		Users:          parseUsers(*users),
@@ -119,7 +102,7 @@ func RunServer(args []string) int {
 	logger.Printf("signaling TCP on :%d", *port)
 	logger.Printf("virtual network: %s", sigSrv.Network())
 
-	// ---- Shared socket demux loop: relay packets vs STUN ----
+	// ---- Shared socket STUN loop ----
 	go func() {
 		buf := make([]byte, 65536)
 		for {
@@ -128,16 +111,12 @@ func RunServer(args []string) int {
 				return
 			}
 			data := buf[:n]
-			if isPunch(data) {
-				relaySrv.Handle(src, data)
-				continue
-			}
 			if stun.IsSTUN(data) {
 				if msg, err := stun.Decode(data); err == nil && msg.Type == stun.BindingRequest {
 					stun.AnswerBinding(udpConn, secondary, ip2Conn, msg, src)
 				}
 			}
-			// else: drop unknown traffic
+			// else: drop unknown traffic (pure P2P: no relay to forward to)
 		}
 	}()
 
@@ -146,10 +125,6 @@ func RunServer(args []string) int {
 	<-quit
 	logger.Printf("shutting down")
 	return 0
-}
-
-func isPunch(b []byte) bool {
-	return len(b) >= 4 && binary.BigEndian.Uint32(b[0:4]) == punch.Magic
 }
 
 // parseUsers parses "user:pass,user2:pass2" into a map.

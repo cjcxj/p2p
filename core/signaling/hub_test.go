@@ -16,12 +16,12 @@ func TestHubMaxMembers(t *testing.T) {
 	}
 
 	m1 := &member{id: protocol.NewPeerID()}
-	if _, _, err := h.join("room", "tok", m1, "", network); err != nil {
+	if _, _, err := h.join("room", "tok", m1, network); err != nil {
 		t.Fatalf("first join: %v", err)
 	}
 
 	m2 := &member{id: protocol.NewPeerID()}
-	if _, _, err := h.join("room", "tok", m2, "", network); err == nil {
+	if _, _, err := h.join("room", "tok", m2, network); err == nil {
 		t.Fatal("expected room-full error")
 	}
 }
