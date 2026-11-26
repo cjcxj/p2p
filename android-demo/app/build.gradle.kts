@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -12,13 +14,34 @@ android {
         applicationId = "com.example.p2pdemo"
         minSdk = 24
         targetSdk = 36
-        versionCode = 19
-        versionName = "3.0"
+        versionCode = 20
+        versionName = "3.1"
+    }
+
+    // Release signing reads keystore.properties (gitignored) so the keystore
+    // and its password never enter the public repo; without that file the
+    // release build falls back to unsigned.
+    val keystorePropsFile = rootProject.file("keystore.properties")
+    signingConfigs {
+        create("release") {
+            if (keystorePropsFile.exists()) {
+                val props = Properties().apply {
+                    keystorePropsFile.inputStream().use { load(it) }
+                }
+                storeFile = rootProject.file(props.getProperty("storeFile"))
+                storePassword = props.getProperty("storePassword")
+                keyAlias = props.getProperty("keyAlias")
+                keyPassword = props.getProperty("keyPassword")
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (keystorePropsFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

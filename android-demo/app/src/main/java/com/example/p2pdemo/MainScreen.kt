@@ -16,7 +16,12 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AssistChip
@@ -28,6 +33,8 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
@@ -41,12 +48,14 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 
 /**
  * 主界面。数据全部来自 [MeshController] 的 StateFlow，这里只负责显示和把操作交给控制器，
@@ -61,9 +70,11 @@ fun MainScreen(controller: MeshController, requestVpn: () -> Unit) {
     val logs by controller.logs.collectAsState()
     val context = LocalContext.current
 
-    var tab by remember { mutableStateOf(0) }
     var showSettings by remember { mutableStateOf(false) }
-    val tabs = listOf("总览", "节点", "工具", "日志")
+    var detail by remember { mutableStateOf<PeerRow?>(null) }
+    val tabs = listOf("控制", "状态", "节点", "工具", "日志")
+    val pager = rememberPagerState(pageCount = { tabs.size })
+    val scope = rememberCoroutineScope()
 
     Scaffold(
         topBar = {
@@ -76,54 +87,77 @@ fun MainScreen(controller: MeshController, requestVpn: () -> Unit) {
                 },
             )
         },
-    ) { padding ->
-        Column(
-            modifier = Modifier
-                .padding(padding)
-                .fillMaxSize()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            StatusCard(
-                state = state,
-                onTunnel = { on ->
-                    if (on) {
-                        if (!state.config.isValid) {
-                            Toast.makeText(context, "请先填写服务器地址和房间", Toast.LENGTH_SHORT).show()
-                        } else {
-                            requestVpn()
-                        }
-                    } else {
-                        controller.setTunnel(false)
-                    }
-                },
-                onConnect = { controller.connect() },
-                onDisconnect = { controller.disconnect() },
-                onRefresh = { controller.refreshNow() },
-            )
-
-            TabRow(selectedTabIndex = tab) {
+        bottomBar = {
+            NavigationBar {
+                val icons = listOf(
+                    Icons.Default.Settings, Icons.Default.Info, Icons.Default.List,
+                    Icons.Default.Refresh, Icons.Default.Menu,
+                )
                 tabs.forEachIndexed { index, label ->
-                    Tab(
-                        selected = tab == index,
-                        onClick = { tab = index },
-                        text = { Text(label) },
+                    NavigationBarItem(
+                        selected = pager.currentPage == index,
+                        onClick = { scope.launch { pager.animateScrollToPage(index) } },
+                        icon = { Icon(icons[index], contentDescription = label) },
+                        label = { Text(label) },
                     )
                 }
             }
-
-            Box(Modifier.weight(1f)) {
-                when (tab) {
-                    0 -> OverviewTab(state)
-                    1 -> PeersTab(state) { ip ->
-                        controller.selectTarget(ip)
-                        Toast.makeText(context, "测试目标：$ip", Toast.LENGTH_SHORT).show()
-                    }
-                    2 -> ToolsTab(state, controller)
+        },
+    ) { padding ->
+        HorizontalPager(
+            state = pager,
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize(),
+        ) { page ->
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                when (page) {
+                    0 -> StatusCard(
+                        state = state,
+                        onTunnel = { on ->
+                            if (on) {
+                                if (!state.config.isValid) {
+                                    Toast.makeText(context, "请先填写服务器地址和房间", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    requestVpn()
+                                }
+                            } else {
+                                controller.setTunnel(false)
+                            }
+                        },
+                        onConnect = { controller.connect() },
+                        onDisconnect = { controller.disconnect() },
+                        onRefresh = { controller.refreshNow() },
+                    )
+                    1 -> OverviewTab(state)
+                    2 -> PeersTab(state) { row -> detail = row }
+                    3 -> ToolsTab(state, controller)
                     else -> LogsTab(logs, controller)
                 }
             }
         }
+    }
+
+    detail?.let { row ->
+        PeerDetailScreen(
+            row = row,
+            onBack = { detail = null },
+            onSetTarget = {
+                controller.selectTarget(row.virtualIp)
+                Toast.makeText(context, "测试目标：${row.virtualIp}", Toast.LENGTH_SHORT).show()
+                detail = null
+            },
+            onPing = {
+                controller.selectTarget(row.virtualIp)
+                controller.runPing()
+                detail = null
+            },
+        )
     }
 
     if (showSettings) {
@@ -223,7 +257,7 @@ private fun OverviewTab(state: MeshUiState) {
 }
 
 @Composable
-private fun PeersTab(state: MeshUiState, onPick: (String) -> Unit) {
+private fun PeersTab(state: MeshUiState, onOpen: (PeerRow) -> Unit) {
     Column(
         modifier = Modifier.fillMaxSize().padding(top = 10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -239,7 +273,7 @@ private fun PeersTab(state: MeshUiState, onPick: (String) -> Unit) {
                 contentPadding = PaddingValues(bottom = 12.dp),
             ) {
                 items(state.peers, key = { it.virtualIp + it.peerId }) { row ->
-                    PeerCard(row, selected = row.virtualIp == state.targetIp, onPick = { onPick(row.virtualIp) })
+                    PeerCard(row, selected = row.virtualIp == state.targetIp, onOpen = { onOpen(row) })
                 }
             }
         }
@@ -247,11 +281,11 @@ private fun PeersTab(state: MeshUiState, onPick: (String) -> Unit) {
 }
 
 @Composable
-private fun PeerCard(row: PeerRow, selected: Boolean, onPick: () -> Unit) {
+private fun PeerCard(row: PeerRow, selected: Boolean, onOpen: () -> Unit) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onPick),
+            .clickable(onClick = onOpen),
     ) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {

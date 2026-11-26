@@ -36,10 +36,14 @@ data class ConnConfig(
         // a contiguous local block lets it PLANT one mapping per socket at the
         // peer's advertised port, so the cone peer's wide random SPRAY has
         // mappings to collide with. PeerPortOffset keeps n4's cheap block bet
-        // for port-preserving NATs.
-        cfg.setPredictionSockets(25L)
+        // for port-preserving NATs. 128 sockets + PunchPPS cap match the
+        // live-verified tuning (rotating-pool NAT3<->NAT4 direct, tail 51s->9s);
+        // the engine staggers the plant refresh from round 2 so the larger pool
+        // does not flood the cellular port quota.
+        cfg.setPredictionSockets(128L)
         cfg.setPeerPortOffset(20L)
         cfg.setSymmetricSpray(1024L)
+        cfg.setPunchPPS(1500L)
         cfg.setDebug(debug)
         cfg.setPlaintext(plaintext)
         cfg.setLegacyMesh(legacyMesh)
