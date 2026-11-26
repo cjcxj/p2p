@@ -1,6 +1,6 @@
 // Package p2p is the application-facing SDK. It hides NAT detection, hole
-// punching, signaling and relay fallback behind a small connect/send/event
-// API that is also bindable to Android via gomobile.
+// punching and signaling behind a small connect/send/event API that is also
+// bindable to Android via gomobile. Pure P2P: there is no relay fallback.
 package p2p
 
 // Config controls a Session. All addresses are "host:port" strings.
@@ -50,7 +50,7 @@ type Config struct {
 	TimeoutSec int
 	// ProbeIntervalMs is the delay between probe bursts (default 200).
 	ProbeIntervalMs int
-	// PunchTimeoutMs is how long to punch before falling back to relay
+	// PunchTimeoutMs is how long to keep punching a peer before giving up
 	// (default 4000).
 	PunchTimeoutMs int
 	// PredictionSockets is the number of UDP source sockets used for the

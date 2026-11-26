@@ -1,5 +1,5 @@
 // Package punch implements UDP hole punching with a strategy matrix that
-// handles every NAT combination, plus a relay fallback path.
+// handles every NAT combination. Pure P2P: there is no relay fallback.
 package punch
 
 import (

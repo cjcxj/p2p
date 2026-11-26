@@ -1,7 +1,7 @@
 // RunServer runs the all-in-one P2P server on a single port: signaling
-// (TCP) plus STUN and relay (UDP) share the same port number, with an
-// optional best-effort STUN secondary socket on port+1 for richer NAT
-// detection.
+// (TCP) plus STUN (UDP) share the same port number, with an optional
+// best-effort STUN secondary socket on port+1 for richer NAT detection.
+// Pure P2P: the server does signaling and STUN only, never relays data.
 package cli
 
 import (
@@ -21,7 +21,7 @@ import (
 
 func RunServer(args []string) int {
 	fs := flag.NewFlagSet("p2p server", flag.ExitOnError)
-	port := fs.Int("port", 8080, "single service port (TCP signaling + UDP STUN/relay)")
+	port := fs.Int("port", 8080, "single service port (TCP signaling + UDP STUN)")
 	verbose := fs.Bool("verbose", false, "log room membership and signaling events")
 	stunIP2 := fs.String("stun-ip2", "", "optional secondary IP for full-cone detection")
 	stunSecondary := fs.Bool("stun-secondary", false, "also bind STUN on port+1 for richer NAT detection (firewall must open it)")

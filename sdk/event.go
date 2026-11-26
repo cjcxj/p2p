@@ -10,7 +10,7 @@ const (
 	// EventPeerLeft: a peer left the room; data is the peer id.
 	EventPeerLeft = 3
 	// EventPeerConnected: a peer became reachable; data carries the
-	// transport used ("punched" or "relay").
+	// transport used ("punched").
 	EventPeerConnected = 4
 	// EventData: data is an application payload from peerID.
 	EventData = 5
@@ -20,7 +20,7 @@ const (
 	// when Config.Debug is enabled).
 	EventDebug = 7
 	// EventPathChanged: an already-connected peer switched transport; data
-	// carries the new transport ("punched" or "relay").
+	// carries the new transport ("punched").
 	EventPathChanged = 8
 )
 

@@ -42,7 +42,7 @@ const plantStaggerDiv = 8
 // Endpoint is one address the punch engine will probe.
 type Endpoint struct {
 	Addr   *net.UDPAddr
-	Kind   string // "lan","public","predicted","block","plant","spray","relay"
+	Kind   string // "lan","public","predicted","block","plant","spray"
 	Order  int
 	Socket int // index into Punch.Conns; 0 = primary
 }
