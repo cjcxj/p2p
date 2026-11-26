@@ -577,6 +577,17 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 				return
 			default:
 			}
+			// Staggered plant/block refresh. A 128-socket plant pool re-sent in
+			// full every round floods the cellular CGNAT's port quota / anti-flood
+			// (measured: pps 3000 with full re-send dropped to 1/4). UDP mappings
+			// live 15-60s, so after the first two rounds that spread every socket,
+			// only a rotating 1/plantStaggerDiv slice needs refreshing each round to
+			// keep them warm -- freeing the rate budget for the spray that actually
+			// collides. Spray/predicted/public always send every round.
+			if round >= 2 && (ep.Kind == "plant" || ep.Kind == "block") &&
+				(ep.Socket+round)%plantStaggerDiv != 0 {
+				continue
+			}
 			p.sendProbe(ps, ep)
 			// Rate-limit the sweep: block until this probe's scheduled slot.
 			nextSend = nextSend.Add(pace)

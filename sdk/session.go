@@ -846,7 +846,13 @@ func (s *Session) detect() (*stun.Detection, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &stun.Client{Conn: s.conn, Server: server, Retries: 1, Timeout: 400 * time.Millisecond, StepSamples: stun.DefaultStepSamples}
+	// Timeout/SecondaryTimeout must be generous: a cellular CGNAT's path to a
+	// public STUN observation point routinely exceeds 400ms on the first packet,
+	// and if the alternate probes time out we sample only the primary egress IP,
+	// announce no egress pool, and the cone peer cannot reach the rotating
+	// address it uses toward us. The concurrent observeEgressIPs sweep needs this
+	// window to collect the multi-IP candidate set that the pool is derived from.
+	c := &stun.Client{Conn: s.conn, Server: server, Retries: 1, Timeout: 1200 * time.Millisecond, SecondaryTimeout: 1200 * time.Millisecond, StepSamples: stun.DefaultStepSamples}
 	// Operator-supplied observation points override the built-in (China-carrier
 	// reachable) defaults, so the CGNAT candidate discovery generalizes to the
 	// deployment's own network instead of a fixed public STUN list.

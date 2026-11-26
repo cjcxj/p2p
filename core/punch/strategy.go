@@ -23,11 +23,21 @@ const defaultSymmetricSpray = 1024
 // from multiplying the birthday attack into an unbounded flood.
 const defaultSprayIPMax = 64
 
+// coldSprayFloor is the minimum probe ports given to each un-observed pool IP
+// in the weighted spray. Half the full window, but never below this, so a wide
+// pool speeds up the observed IPs without starving the unsampled-egress rescue.
+const coldSprayFloor = 128
+
 // defaultPunchPPS is the probe rate ceiling. EasyTier-class hard-sym punching
 // lands within seconds at a couple thousand packets/s; going far above that
 // buys no coverage and instead starves the host NIC and overflows the router's
 // NAT session table, which is what takes an entire network offline.
 const defaultPunchPPS = 1500
+
+// plantStaggerDiv: after the first two rounds, each round refreshes only 1 of
+// every plantStaggerDiv plant/block sockets (rotating), so a large plant pool
+// keeps its NAT mappings warm without re-flooding the CGNAT port quota.
+const plantStaggerDiv = 8
 
 // Endpoint is one address the punch engine will probe.
 type Endpoint struct {
@@ -318,19 +328,49 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 				if n <= 0 {
 					n = defaultSymmetricSpray
 				}
-				// Spray the full window at EVERY candidate IP: the primary the
-				// server knows plus any observation-point addresses, and the
-				// whole announced egress pool, because a destination-rotating
-				// CGNAT may answer on any of them. Widening the target set is
-				// what turns "we happened to sample the right IP" into a hit;
-				// the per-round packet count it implies is held down by the
-				// PunchPPS sweep cap, not by starving any single IP.
-				ports := distinctPorts(n)
+				// Weighted anti-dilution spray. The announced pool can hold many
+				// addresses STUN never observed (a /28 has 16, only 2-3 sampled).
+				// Equal-window spray spends ~90% of the budget on cold IPs -- the
+				// 51s convergence we measured live. So OBSERVED egress IPs get the
+				// full window (interleaved, fast common case), while cold pool IPs
+				// keep max(half-window, coldSprayFloor) ports each -- enough to
+				// still collide with the peer's planted mappings so the rare
+				// UNSAMPLED-egress rescue (Unicom .102) does not regress. This is
+				// the formula the sibling build validated live (10/10, 2-4s).
+				observed := peer.CandidateIPs()
+				isObserved := make(map[string]bool, len(observed))
+				for _, ip := range observed {
+					isObserved[ip.String()] = true
+				}
+				var coldIPs []net.IP
 				for _, ip := range peer.SprayIPs(cfg.SprayIPMax) {
-					for _, sp := range ports {
+					if !isObserved[ip.String()] {
+						coldIPs = append(coldIPs, ip)
+					}
+				}
+				hotPorts := distinctPorts(n)
+				for _, sp := range hotPorts {
+					for _, ip := range observed {
 						addr := &net.UDPAddr{IP: ip, Port: sp}
 						eps = append(eps, Endpoint{Addr: addr, Kind: "spray", Order: order, Socket: 0})
 						order++
+					}
+				}
+				if len(coldIPs) > 0 {
+					coldN := len(hotPorts) / 2
+					if coldN < coldSprayFloor {
+						coldN = coldSprayFloor
+					}
+					if coldN > len(hotPorts) {
+						coldN = len(hotPorts)
+					}
+					coldPorts := distinctPorts(coldN)
+					for _, sp := range coldPorts {
+						for _, ip := range coldIPs {
+							addr := &net.UDPAddr{IP: ip, Port: sp}
+							eps = append(eps, Endpoint{Addr: addr, Kind: "spray", Order: order, Socket: 0})
+							order++
+						}
 					}
 				}
 			}

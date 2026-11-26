@@ -104,7 +104,12 @@ func Defaults() *Config {
 		TimeoutSec:        15,
 		ProbeIntervalMs:   200,
 		PunchTimeoutMs:    4000,
-		PredictionSockets: 25,
+		// 128 plant sockets: at 25 the cone peer only had ~25 mappings to collide
+		// with against a 256-port blind window (~9.4%/round), which left a ~17s
+		// tail on real cellular CGNATs. 128 raises per-round hit rate to ~40-53%,
+		// pulling the tail into 2-4s. PunchPPS caps the rate so the larger pool
+		// cannot flood the NIC/router.
+		PredictionSockets: 128,
 		PeerPortOffset:    20,
 		SymmetricSpray:    1024,
 		PunchPPS:          1500,

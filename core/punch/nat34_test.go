@@ -643,3 +643,62 @@ func TestNat34EscalatePlusPoolRescuesRotating(t *testing.T) {
 	}
 	t.Fatal("rotating + misdetected-cone peer must punch via escalation AND announced pool together")
 }
+
+// Regression guard for the live self-misdetection case: a symmetric host that
+// misjudges ITSELF as cone must still end up connected (not stranded by its own
+// wrong verdict). NOTE: this emulator keys a NAT's inbound filter on the
+// destination address, not the exact external port, so the hard port-collision
+// that makes the REAL misdetected-cone case slow is NOT modeled here -- the
+// link comes up well before the 1.5s escalation in this model. So this test
+// proves "self-misdetection does not regress connectivity"; it does NOT by
+// itself validate the plant-on-escalation fix, which the lenient port model
+// cannot exercise. plant-on-escalation is a defensive change verified by the
+// live trials + code review, not by this test.
+func TestNat34SelfMisdetectedConeEscalatesPlant(t *testing.T) {
+	atomic.StoreInt64(&delivered, 0)
+	in := &internet{owner: map[string]*nat{}}
+	pool := []string{"127.0.4.216"} // IP-stable symmetric: same egress toward everyone
+	p4 := newNat(in, true, pool, 8)
+	p3 := newNat(in, false, []string{"127.9.0.3"}, 1)
+
+	adv4 := p4[0].n.external(0, &net.UDPAddr{IP: net.ParseIP("127.9.0.3").To4(), Port: 1})
+	adv3 := p3[0].n.external(0, adv4)
+
+	id4, id3 := protocol.NewPeerID(), protocol.NewPeerID()
+	// ph4 = the symmetric host, but its my-info CLAIMS cone (self-misdetection).
+	ph4 := New(p4[0], id4, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv4},
+		Config{PredictionSockets: 8, PeerPortOffset: 2, SymmetricSpray: 512, ProbeIntervalMs: 1, PunchTimeoutMs: 9000, PunchPPS: 1000000, EscalateAfterMs: 1500})
+	ph4.Conns = asPC(p4)
+	ph3 := New(p3[0], id3, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv3},
+		Config{PredictionSockets: 1, SymmetricSpray: 1024, ProbeIntervalMs: 1, PunchTimeoutMs: 9000, PunchPPS: 1000000})
+	ph3.Conns = asPC(p3)
+	ph4.Start()
+	ph3.Start()
+	defer func() {
+		for _, c := range p4 {
+			_ = c.Close()
+		}
+		for _, c := range p3 {
+			_ = c.Close()
+		}
+		ph4.Stop()
+		ph3.Stop()
+	}()
+
+	// ph3 correctly sees ph4 as symmetric (sprays its single IP). ph4 sees ph3 as
+	// cone (soft) and, having misdetected itself as cone, would not plant until
+	// escalation forces its own side hard.
+	ph4.AddPeer(id3, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv3})
+	ph3.AddPeer(id4, NATInfo{Type: stun.NatSymmetric, PublicAddr: adv4})
+
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		ok4, tr4 := ph4.Connected(id3)
+		ok3, tr3 := ph3.Connected(id4)
+		if ok4 && ok3 && tr4 == StatePunched && tr3 == StatePunched {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatal("a self-misdetected-cone symmetric host must plant via escalation so the cone peer can collide")
+}
