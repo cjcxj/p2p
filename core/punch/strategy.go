@@ -55,7 +55,6 @@ type NATInfo struct {
 	PrivateAddr *net.UDPAddr
 	PortDelta   int
 	PortStep    int
-	RelayAddr   *net.UDPAddr
 	// PublicIPs are additional distinct public addresses this peer was seen at
 	// across multiple STUN observation points (a destination-rotating CGNAT).
 	// Empty for ordinary NATs; the spray leg aims at all of them plus
