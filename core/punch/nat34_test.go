@@ -19,6 +19,21 @@ import (
 // honesty guard: it shows the spray must really reach the rotating address and
 // the strict filters are not being bypassed.
 
+// raceAwareBudget widens a simulated-punching deadline on the race detector.
+// Whether a blind spray collides depends on the number of ROUNDS it gets, and a
+// round is a CPU-bound loop here (PunchPPS is deliberately uncapped in these
+// tests): with the race instrumention a round costs several times more, so a plain
+// wall-clock deadline silently becomes a much smaller search and the statistical
+// tests fail without any behaviour having regressed. Success still returns in well
+// under a second -- verified locally at ~0.5s per trial -- so widening only stretches
+// the path that is going to fail anyway.
+func raceAwareBudget(d time.Duration) time.Duration {
+	if raceEnabled {
+		return d * 3
+	}
+	return d
+}
+
 var delivered int64
 
 type frame struct {
@@ -253,7 +268,7 @@ func runNat34With(t *testing.T, poolIP []string, includeEgress bool, announced *
 	ph4.AddPeer(id3, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv3})
 	ph3.AddPeer(id4, NATInfo{Type: stun.NatSymmetric, PublicAddr: adv4, PublicIPs: cand4, PoolCIDR: announced})
 
-	deadline := time.Now().Add(8 * time.Second)
+	deadline := time.Now().Add(raceAwareBudget(20 * time.Second))
 	for time.Now().Before(deadline) {
 		ok4, tr4 := ph4.Connected(id3)
 		ok3, tr3 := ph3.Connected(id4)
@@ -449,7 +464,7 @@ func runNat44(t *testing.T, poolA, poolB []string, announceA, announceB *net.IPN
 	phA.AddPeer(idB, NATInfo{Type: stun.NatSymmetric, PublicAddr: advB, PoolCIDR: announceB})
 	phB.AddPeer(idA, NATInfo{Type: stun.NatSymmetric, PublicAddr: advA, PoolCIDR: announceA})
 
-	deadline := time.Now().Add(8 * time.Second)
+	deadline := time.Now().Add(raceAwareBudget(20 * time.Second))
 	for time.Now().Before(deadline) {
 		okA, trA := phA.Connected(idB)
 		okB, trB := phB.Connected(idA)
@@ -569,7 +584,7 @@ func TestNat34EscalatesMisdetectedCone(t *testing.T) {
 	ph4.AddPeer(id3, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv3})
 	ph3.AddPeer(id4, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv4, PublicIPs: cand4})
 
-	deadline := time.Now().Add(8 * time.Second)
+	deadline := time.Now().Add(raceAwareBudget(20 * time.Second))
 	for time.Now().Before(deadline) {
 		ok4, tr4 := ph4.Connected(id3)
 		ok3, tr3 := ph3.Connected(id4)
@@ -632,7 +647,7 @@ func TestNat34EscalatePlusPoolRescuesRotating(t *testing.T) {
 	ph4.AddPeer(id3, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv3})
 	ph3.AddPeer(id4, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv4, PoolCIDR: pool})
 
-	deadline := time.Now().Add(8 * time.Second)
+	deadline := time.Now().Add(raceAwareBudget(20 * time.Second))
 	for time.Now().Before(deadline) {
 		ok4, tr4 := ph4.Connected(id3)
 		ok3, tr3 := ph3.Connected(id4)
@@ -691,7 +706,7 @@ func TestNat34SelfMisdetectedConeEscalatesPlant(t *testing.T) {
 	ph4.AddPeer(id3, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv3})
 	ph3.AddPeer(id4, NATInfo{Type: stun.NatSymmetric, PublicAddr: adv4})
 
-	deadline := time.Now().Add(8 * time.Second)
+	deadline := time.Now().Add(raceAwareBudget(20 * time.Second))
 	for time.Now().Before(deadline) {
 		ok4, tr4 := ph4.Connected(id3)
 		ok3, tr3 := ph3.Connected(id4)
