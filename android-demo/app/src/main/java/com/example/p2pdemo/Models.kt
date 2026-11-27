@@ -30,6 +30,12 @@ data class ConnConfig(
         cfg.setAuthSecret(authSecret)
         cfg.setPortPrediction(true)
         cfg.setEnableLAN(true)
+        // gomobile binds Config as a zero-valued struct, not Defaults(): every
+        // flag the app wants has to be set here explicitly. A gateway mapping is
+        // worth asking for on a phone -- it hands the peer an address that works
+        // before we have sent a packet -- and the probe is budget-bounded, so a
+        // network without an IGD costs 400ms of detection at most.
+        cfg.setEnableUPnP(true)
         // Hard-symmetric birthday attack. The phone is the CGNAT (hard) side:
         // a contiguous local block lets it PLANT one mapping per socket at the
         // peer's advertised port, so the cone peer's wide random SPRAY has
