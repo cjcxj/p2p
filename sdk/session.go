@@ -58,6 +58,9 @@ type Session struct {
 
 	x25519    *ecdh.PrivateKey
 	protector SocketProtector
+	// serverSTUNs are observation points the signalling server advertised. They are
+	// merged with the operator's list when a detection runs, under the session lock.
+	serverSTUNs []string
 	// ip6Conn is the dual-stack socket kept from detection when this host has a
 	// globally reachable IPv6 address; the punch engine drives it as pool index -1.
 	ip6Conn    net.PacketConn
@@ -676,7 +679,12 @@ func (s *Session) run(room string) {
 	// arrive after the first detection has already run, so they are folded into the
 	// configuration for every detection from here on -- the reconnect path included.
 	if extra := sig.STUNServers(); len(extra) > 0 {
-		s.cfg.STUNSecondaries = mergeCSV(s.cfg.STUNSecondaries, extra)
+		// A deployment configures its observation points once, on the server. They
+		// arrive after the first detection has already run, so they apply to every
+		// detection from here on -- the reconnect path included. Kept separate from
+		// cfg: cfg is read without a lock in many places, so rewriting a field of it
+		// at runtime is a data race that only shows up on the next reconnect.
+		s.serverSTUNs = extra
 	}
 	s.mu.Unlock()
 	s.emit(EventStateChanged, "", []byte(StateConnecting))
@@ -894,6 +902,15 @@ func (s *Session) run(room string) {
 	}()
 }
 
+// stunSecondaries is the effective observation-point list: what the operator
+// configured plus what the server advertised, deduplicated so one point is not
+// probed twice out of a bounded sampling budget.
+func (s *Session) stunSecondaries() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return splitCSV(mergeCSV(s.cfg.STUNSecondaries, s.serverSTUNs))
+}
+
 func (s *Session) detect() (*stun.Detection, error) {
 	server, err := net.ResolveUDPAddr("udp", s.cfg.STUNAddr)
 	if err != nil {
@@ -909,7 +926,7 @@ func (s *Session) detect() (*stun.Detection, error) {
 	// Operator-supplied observation points override the built-in (China-carrier
 	// reachable) defaults, so the CGNAT candidate discovery generalizes to the
 	// deployment's own network instead of a fixed public STUN list.
-	if list := splitCSV(s.cfg.STUNSecondaries); len(list) > 0 {
+	if list := s.stunSecondaries(); len(list) > 0 {
 		c.Secondaries = list
 	}
 	det, err := c.Detect()
@@ -962,8 +979,7 @@ func (s *Session) probeIPv6() (net.PacketConn, *net.UDPAddr) {
 	protectConn(c6, s.protector)
 	var addrs []*net.UDPAddr
 	seen := map[string]bool{}
-	list := append([]string(nil), splitCSV(s.cfg.STUNSecondaries)...)
-	list = append(list, stun.DefaultIPv6Secondaries...)
+	list := append(s.stunSecondaries(), stun.DefaultIPv6Secondaries...)
 	for _, st := range list {
 		a, rerr := net.ResolveUDPAddr("udp6", st)
 		if rerr != nil || a == nil || a.IP == nil || a.IP.To4() != nil || seen[a.String()] {
@@ -1208,6 +1224,9 @@ func (s *Session) onPeerCandidate(m protocol.Message) {
 	if c.X25519Pub != "" {
 		r.wgPub = c.X25519Pub
 	}
+	// Remembered under the lock: applyAnchor merges a lightweight address-only sync
+	// into exactly this record, so it must never be observed half-updated.
+	r.info = info
 	// A candidate for a peer we already consider connected means the far side
 	// restarted: a node only (re)announces when it newly discovers us, and the
 	// server forwards candidates verbatim without replaying them to anyone
@@ -1250,9 +1269,6 @@ func (s *Session) onPeerCandidate(m protocol.Message) {
 	if s.cfg.Debug && info.Type == stun.NatSymmetric && info.PoolCIDR == nil && len(info.CandidateIPs()) <= 1 {
 		s.debugf("p2p: peer " + sender + " is symmetric but exposes a single candidate IP; " +
 			"if punching fails, add more --stun-list observation points so its egress pool is enumerated")
-	}
-	if r != nil {
-		r.info = info
 	}
 	ph.AddPeer(senderID, info)
 	if needTunnel {
