@@ -53,8 +53,12 @@ type NATInfo struct {
 	Type        stun.NATType
 	PublicAddr  *net.UDPAddr
 	PrivateAddr *net.UDPAddr
-	PortDelta   int
-	PortStep    int
+	// ExtraPrivateAddrs are this host's other interface addresses (VPN adapter,
+	// wired plus Wi-Fi, hotspot) on the same socket port. A peer that shares one
+	// of them, but not the one we happened to report first, still gets a LAN path.
+	ExtraPrivateAddrs []*net.UDPAddr
+	PortDelta         int
+	PortStep          int
 	// PublicIPs are additional distinct public addresses this peer was seen at
 	// across multiple STUN observation points (a destination-rotating CGNAT).
 	// Empty for ordinary NATs; the spray leg aims at all of them plus
@@ -240,14 +244,25 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config, round int) []Endpoint {
 	var eps []Endpoint
 	order := 0
 
-	// LAN shortcut: same private network.
-	if cfg.EnableLAN && peer.PrivateAddr != nil && my.PrivateAddr != nil &&
-		peer.PrivateAddr.IP != nil && my.PrivateAddr.IP != nil {
-		pe := peer.PrivateAddr.IP.To4()
-		me := my.PrivateAddr.IP.To4()
-		if pe != nil && me != nil && sameLAN(pe, me, my.PrivateCIDRs, peer.PrivateCIDRs) {
-			eps = append(eps, Endpoint{Addr: peer.PrivateAddr, Kind: "lan", Order: order})
-			order++
+	// LAN shortcut: any peer private address that shares any of our links. The
+	// single-address comparison before it missed a host whose second interface
+	// (wired plus Wi-Fi, VPN, hotspot) was the one on the peer's subnet.
+	if cfg.EnableLAN {
+		peerPrivs := peer.allPrivateAddrs()
+		myPrivs := my.allPrivateAddrs()
+		seenLAN := map[string]bool{}
+		for _, pa := range peerPrivs {
+			if pa == nil || pa.IP == nil || seenLAN[pa.String()] {
+				continue
+			}
+			for _, ma := range myPrivs {
+				if ma != nil && sameLAN(ma.IP, pa.IP, my.PrivateCIDRs, peer.PrivateCIDRs) {
+					seenLAN[pa.String()] = true
+					eps = append(eps, Endpoint{Addr: pa, Kind: "lan", Order: order})
+					order++
+					break
+				}
+			}
 		}
 	}
 
@@ -426,6 +441,80 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config, round int) []Endpoint {
 	// (No relay fallback: this is a pure-P2P engine. If direct punching fails,
 	// the link simply does not connect -- there is no relay data path.)
 	return eps
+}
+
+// routeTier ranks the kinds of direct path we can end up on, best first. Once a
+// link is established on a better path it must not be dragged down by a later
+// packet that happens to arrive on a worse one: a LAN session does not give way
+// to the public mapping just because a public-socket probe still lands.
+type routeTier int
+
+const (
+	tierNone   routeTier = 0
+	tierPublic routeTier = 20
+	tierUPnP   routeTier = 30
+	tierIPv6   routeTier = 40
+	tierLAN    routeTier = 50
+)
+
+func (t routeTier) String() string {
+	switch t {
+	case tierLAN:
+		return "lan"
+	case tierIPv6:
+		return "ipv6"
+	case tierUPnP:
+		return "upnp"
+	case tierPublic:
+		return "public"
+	default:
+		return "none"
+	}
+}
+
+// classifyPacketTier reports which path an inbound packet from ua arrived on.
+// sockIdx -1 is the dual-stack socket, reserved for the IPv6 path.
+func classifyPacketTier(my, peer NATInfo, cfg Config, ua *net.UDPAddr, sockIdx int) routeTier {
+	if ua == nil {
+		return tierNone
+	}
+	if sockIdx == -1 || (ua.IP != nil && ua.IP.To4() == nil) {
+		return tierIPv6
+	}
+	if cfg.EnableLAN && ua.IP != nil && ua.IP.To4() != nil {
+		myPrivs := my.allPrivateAddrs()
+		peerPrivs := peer.allPrivateAddrs()
+		for _, pa := range peerPrivs {
+			if pa == nil || !pa.IP.Equal(ua.IP) || (pa.Port != 0 && pa.Port != ua.Port) {
+				continue
+			}
+			for _, ma := range myPrivs {
+				if ma != nil && sameLAN(ma.IP, pa.IP, my.PrivateCIDRs, peer.PrivateCIDRs) {
+					return tierLAN
+				}
+			}
+		}
+	}
+	if peer.UPnPAddr != nil && ua.IP != nil &&
+		ua.IP.Equal(peer.UPnPAddr.IP) && ua.Port == peer.UPnPAddr.Port {
+		return tierUPnP
+	}
+	return tierPublic
+}
+
+// allPrivateAddrs is the primary private address plus any the host announced from
+// its other interfaces, with the duplicate primary filtered out.
+func (n NATInfo) allPrivateAddrs() []*net.UDPAddr {
+	var out []*net.UDPAddr
+	if n.PrivateAddr != nil && n.PrivateAddr.IP != nil {
+		out = append(out, n.PrivateAddr)
+	}
+	for _, a := range n.ExtraPrivateAddrs {
+		if a != nil && a.IP != nil {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // sameLAN reports whether two private addresses share a link. The announced

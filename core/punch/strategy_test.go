@@ -351,6 +351,69 @@ func TestSprayIPsIgnoresAbsurdlyWidePool(t *testing.T) {
 	}
 }
 
+// The tier a packet arrived on decides whether it may replace the route in use,
+// so getting it wrong silently downgrades a LAN session to the public mapping.
+func TestClassifyPacketTier(t *testing.T) {
+	lanNet := &net.IPNet{IP: net.ParseIP("192.168.1.0").To4(), Mask: net.CIDRMask(24, 32)}
+	upnp := addr("203.0.113.9", 41000)
+	my := NATInfo{Type: stun.NatPortRestrictedCone, PrivateAddr: addr("192.168.1.10", 30000), PrivateCIDRs: []*net.IPNet{lanNet}}
+	peer := NATInfo{
+		Type:         stun.NatPortRestrictedCone,
+		PublicAddr:   addr("1.2.3.4", 40000),
+		PrivateAddr:  addr("192.168.1.31", 30000),
+		PrivateCIDRs: []*net.IPNet{lanNet},
+		UPnPAddr:     upnp,
+	}
+	cfg := Config{EnableLAN: true}
+
+	cases := []struct {
+		name string
+		ua   *net.UDPAddr
+		sock int
+		want routeTier
+	}{
+		{"lan", peer.PrivateAddr, 0, tierLAN},
+		{"upnp", upnp, 0, tierUPnP},
+		{"public", peer.PublicAddr, 0, tierPublic},
+		{"unrelated v4", addr("198.51.100.7", 1234), 0, tierPublic},
+		{"reserved v6 socket", addr("1.2.3.4", 40000), -1, tierIPv6},
+		{"v6 source", &net.UDPAddr{IP: net.ParseIP("2001:db8::5"), Port: 40000}, 0, tierIPv6},
+		{"no source", nil, 0, tierNone},
+	}
+	for _, c := range cases {
+		if got := classifyPacketTier(my, peer, cfg, c.ua, c.sock); got != c.want {
+			t.Errorf("%s: tier = %s, want %s", c.name, got, c.want)
+		}
+	}
+	// A private address is only a LAN path if the shortcut is allowed; disabling it
+	// must not let a LAN packet masquerade as the best route.
+	if got := classifyPacketTier(my, peer, Config{}, peer.PrivateAddr, 0); got == tierLAN {
+		t.Fatal("tierLAN reported with EnableLAN off")
+	}
+}
+
+// A peer on a multi-homed host announces every interface; only the subnet we
+// actually share becomes a LAN target, and it appears once.
+func TestPlanTargetsLANUsesEveryAnnouncedInterface(t *testing.T) {
+	ourNet := &net.IPNet{IP: net.ParseIP("10.10.0.0").To4(), Mask: net.CIDRMask(24, 32)}
+	my := NATInfo{Type: stun.NatPortRestrictedCone, PrivateAddr: addr("10.10.0.5", 30000), PrivateCIDRs: []*net.IPNet{ourNet}}
+	peer := NATInfo{
+		Type:              stun.NatPortRestrictedCone,
+		PublicAddr:        addr("1.2.3.4", 40000),
+		PrivateAddr:       addr("172.16.9.9", 30000), // a different network we cannot reach
+		ExtraPrivateAddrs: []*net.UDPAddr{addr("10.10.0.31", 30000)},
+	}
+	var lan []string
+	for _, e := range planTargets(my, peer, Config{EnableLAN: true, PredictionSockets: 1}, 0) {
+		if e.Kind == "lan" {
+			lan = append(lan, e.Addr.String())
+		}
+	}
+	if len(lan) != 1 || lan[0] != "10.10.0.31:30000" {
+		t.Fatalf("lan targets %v, want exactly the shared subnet's address", lan)
+	}
+}
+
 func countKind(eps []Endpoint, kind string) []Endpoint {
 	var out []Endpoint
 	for _, e := range eps {

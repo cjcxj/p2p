@@ -75,8 +75,12 @@ type Candidate struct {
 	NATType     string `json:"nat_type"`
 	PublicAddr  string `json:"public_addr"`
 	PrivateAddr string `json:"private_addr"`
-	PortDelta   int    `json:"port_delta"`
-	PortStep    int    `json:"port_step,omitempty"`
+	// ExtraPrivateAddrs carries the sender's other interface addresses (ip:port)
+	// so a peer that shares one of them, but not the primary, still gets a
+	// same-LAN path. Absent from older senders.
+	ExtraPrivateAddrs []string `json:"extra_private_addrs,omitempty"`
+	PortDelta         int      `json:"port_delta"`
+	PortStep          int      `json:"port_step,omitempty"`
 	// X25519Pub is the sender's X25519 public key (hex, 32 bytes) used to
 	// derive a per-pair data-plane AEAD key. Older peers omit it and the
 	// session falls back to plaintext data.

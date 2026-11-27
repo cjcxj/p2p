@@ -715,6 +715,11 @@ func (s *Session) run(room string) {
 	my.PortStep = det.PortStep
 	my.UPnPAddr = det.UPnPAddr
 	my.PrivateCIDRs = parseCIDRs(det.LocalCIDRs)
+	for _, a := range det.LocalAddrs {
+		if a != nil && (det.LocalAddr == nil || !a.IP.Equal(det.LocalAddr.IP)) {
+			my.ExtraPrivateAddrs = append(my.ExtraPrivateAddrs, a)
+		}
+	}
 
 	ph := punch.New(s.conn, s.id, my, punch.Config{
 		PortPrediction:    s.cfg.PortPrediction,
@@ -1215,6 +1220,14 @@ func (s *Session) buildCandidate() *protocol.Candidate {
 		if len(det.LocalCIDRs) > 0 {
 			c.PrivateCIDRs = det.LocalCIDRs
 		}
+		// enumerateLocalAddrs puts the primary first, and the primary already
+		// travels in PrivateAddr; the rest are the extra interfaces.
+		for _, a := range det.LocalAddrs {
+			if a == nil || (det.LocalAddr != nil && a.IP.Equal(det.LocalAddr.IP)) {
+				continue
+			}
+			c.ExtraPrivateAddrs = append(c.ExtraPrivateAddrs, a.String())
+		}
 	}
 	c.X25519Pub = dataPublicHex(s.x25519)
 	return c
@@ -1268,6 +1281,11 @@ func candidateToNAT(c *protocol.Candidate) (punch.NATInfo, error) {
 	// optimisation, and a malformed one must not lose the candidate.
 	if len(c.PrivateCIDRs) > 0 {
 		info.PrivateCIDRs = parseCIDRs(c.PrivateCIDRs)
+	}
+	for _, s := range c.ExtraPrivateAddrs {
+		if ua, aErr := net.ResolveUDPAddr("udp", s); aErr == nil && ua.IP != nil {
+			info.ExtraPrivateAddrs = append(info.ExtraPrivateAddrs, ua)
+		}
 	}
 	return info, nil
 }

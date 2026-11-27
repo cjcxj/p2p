@@ -84,6 +84,10 @@ type peer struct {
 	endpoint  *net.UDPAddr
 	sockIdx   int // which Conns entry carries this peer's data path
 	transport string
+	// tier is the class of path the endpoint belongs to. A route never downgrades,
+	// so a packet arriving later on the public mapping cannot replace a LAN or
+	// gateway-mapped path already in use.
+	tier      routeTier
 	connected bool
 	seq       uint16
 	stop      chan struct{}
@@ -149,6 +153,7 @@ func (p *Punch) AddPeer(id protocol.PeerID, info NATInfo) {
 	ps.transport = ""
 	ps.endpoint = nil
 	ps.sockIdx = 0
+	ps.tier = tierNone
 	ps.mu.Unlock()
 	p.mu.Unlock()
 	p.wg.Add(1)
@@ -694,8 +699,13 @@ func (p *Punch) handle(pkt *Packet, src net.Addr, sockIdx int) {
 	if ps == nil {
 		return
 	}
+	// Liveness is proven only by traffic that needs a working path in both
+	// directions. Our keepalives are PktAck, so a healthy peer refreshes this
+	// clock on its own; a peer whose packets only reach us one way does not, and
+	// that is exactly the half-open route the idle restart exists to recover.
+	// Refreshing it on any inbound packet made a stale endpoint look alive for
+	// ever, which is how a reconnect stayed unreachable.
 	ps.mu.Lock()
-	ps.lastSeen = time.Now()
 	switch pkt.Type {
 	case PktProbe, PktProbe2:
 		first, upgraded := ps.note(p, ua, sockIdx)
@@ -711,6 +721,7 @@ func (p *Punch) handle(pkt *Packet, src net.Addr, sockIdx int) {
 		p.report(ps, pkt.Src)
 		return
 	case PktAck:
+		ps.lastSeen = time.Now()
 		first, upgraded := ps.note(p, ua, sockIdx)
 		transport := ps.transport
 		ps.mu.Unlock()
@@ -720,6 +731,7 @@ func (p *Punch) handle(pkt *Packet, src net.Addr, sockIdx int) {
 		p.report(ps, pkt.Src)
 		return
 	case PktData:
+		ps.lastSeen = time.Now()
 		first, upgraded := ps.note(p, ua, sockIdx)
 		ps.mu.Unlock()
 		if first || upgraded {
@@ -743,14 +755,23 @@ func (ps *peer) note(p *Punch, ua *net.UDPAddr, sockIdx int) (first, upgraded bo
 	if ua == nil {
 		return first, false
 	}
+	newTier := classifyPacketTier(p.My, ps.info, p.Config, ua, sockIdx)
+	// A route never downgrades. Once a LAN or gateway-mapped path is confirmed, a
+	// straggler on the public mapping must not become the data path again.
+	if ps.connected && newTier < ps.tier {
+		return false, false
+	}
 	was := ps.transport
+	prevTier := ps.tier
 	ps.endpoint = ua
 	ps.sockIdx = sockIdx
+	ps.tier = newTier
 	ps.transport = StatePunched
 	ps.connected = true
 	// Pure P2P: any inbound packet from the peer confirms the direct punched
-	// endpoint. "upgraded" marks the first transition into a punched link.
-	upgraded = was != StatePunched
+	// endpoint. "upgraded" marks the first punched link and each move to a better
+	// class of path, both of which the caller reports as a path change.
+	upgraded = was != StatePunched || newTier > prevTier
 	return first, upgraded
 }
 

@@ -222,6 +222,10 @@ func TestCandidateCarriesGatewayMapping(t *testing.T) {
 		LocalAddr:  &net.UDPAddr{IP: net.ParseIP("192.168.1.45"), Port: 30000},
 		UPnPAddr:   &net.UDPAddr{IP: net.ParseIP("203.0.113.44"), Port: 41000},
 		LocalCIDRs: []string{"192.168.1.45/24", "10.7.3.23/29"},
+		LocalAddrs: []*net.UDPAddr{
+			{IP: net.ParseIP("192.168.1.45"), Port: 30000},
+			{IP: net.ParseIP("10.7.3.23"), Port: 30000},
+		},
 	}
 	s := &Session{det: det}
 
@@ -254,6 +258,11 @@ func TestCandidateCarriesGatewayMapping(t *testing.T) {
 	}
 	if info.PrivateCIDRs[1].Contains(net.ParseIP("10.7.3.32")) {
 		t.Fatalf("announced /29 is wider than announced: %v", info.PrivateCIDRs[1])
+	}
+	// The secondary interface has to arrive too, minus the duplicate primary that
+	// already travels in PrivateAddr.
+	if len(info.ExtraPrivateAddrs) != 1 || info.ExtraPrivateAddrs[0].IP.String() != "10.7.3.23" {
+		t.Fatalf("extra private addresses = %v, want just the second interface", info.ExtraPrivateAddrs)
 	}
 
 	// A peer that never got a mapping must not put an empty target in the plan.
