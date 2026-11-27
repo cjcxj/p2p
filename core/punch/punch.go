@@ -729,12 +729,6 @@ func (p *Punch) readLoop(conn net.PacketConn, sockIdx int) {
 				if pkt.Dst != p.MyID && pkt.Dst != (protocol.PeerID{}) {
 					continue
 				}
-			case PktRegister:
-				continue
-			case PktRegAck:
-				if pkt.Dst != p.MyID {
-					continue
-				}
 			}
 			p.handle(pkt, bp.src, sockIdx)
 		}
@@ -743,13 +737,6 @@ func (p *Punch) readLoop(conn net.PacketConn, sockIdx int) {
 
 func (p *Punch) handle(pkt *Packet, src net.Addr, sockIdx int) {
 	ua, _ := src.(*net.UDPAddr)
-
-	switch pkt.Type {
-	case PktRegAck:
-		return
-	case PktRegister:
-		return
-	}
 
 	ps := p.peer(pkt.Src)
 	if ps == nil {

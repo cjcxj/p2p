@@ -20,12 +20,13 @@ const Magic = 0x504E4348 // "PNCH"
 
 // Packet types.
 const (
-	PktProbe    uint8 = 1
-	PktAck      uint8 = 2
-	PktData     uint8 = 3
-	PktRegister uint8 = 4
-	PktRegAck   uint8 = 5
-	PktProbe2   uint8 = 6
+	PktProbe uint8 = 1
+	PktAck   uint8 = 2
+	PktData  uint8 = 3
+	// 4 and 5 were the relay registration handshake, removed with the relay
+	// data path. Numbers stay unused rather than reused: an old peer still
+	// sending them must not be understood as something else.
+	PktProbe2 uint8 = 6
 )
 
 // packetHeaderLen is the fixed part of every packet (magic,type,seq,src,dst,len).
