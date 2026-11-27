@@ -530,11 +530,11 @@ func TestNat44NoPoolUndercovered(t *testing.T) {
 func TestNat34EscalatesMisdetectedCone(t *testing.T) {
 	atomic.StoreInt64(&delivered, 0)
 	in := &internet{owner: map[string]*nat{}}
-	p4 := newNat(in, true, rotatingPool, 8)                 // actually symmetric
-	p3 := newNat(in, false, []string{"127.9.0.3"}, 1)       // cone
+	p4 := newNat(in, true, rotatingPool, 8)           // actually symmetric
+	p3 := newNat(in, false, []string{"127.9.0.3"}, 1) // cone
 
 	adv3 := p3[0].n.external(0, &net.UDPAddr{IP: net.ParseIP(rotatingPool[0]).To4(), Port: 1})
-	egress4to3 := p4[0].n.external(0, adv3)                 // rotating address to reach p4
+	egress4to3 := p4[0].n.external(0, adv3) // rotating address to reach p4
 	// Advertise a DIFFERENT pool IP as the "public" address so a single public
 	// probe (the soft cone plan) can never land on the real egress.
 	adv4 := &net.UDPAddr{IP: net.ParseIP(rotatingPool[0]).To4(), Port: 6000}

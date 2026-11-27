@@ -142,7 +142,7 @@ func TestCandidateWireToPoolSpray(t *testing.T) {
 	}
 	// With the pool expanded the spray covers .102.
 	spray := map[string]bool{}
-	for _, ip := range info.SprayIPs(64) {
+	for _, ip := range info.SprayIPs(64, 0) {
 		spray[ip.String()] = true
 	}
 	if !spray["111.55.212.102"] {
@@ -201,7 +201,7 @@ func TestProductionPublishWireDecodeSpray(t *testing.T) {
 	}
 	// After whole-pool expansion the spray reaches .102.
 	reached := false
-	for _, ip := range info.SprayIPs(0) {
+	for _, ip := range info.SprayIPs(0, 0) {
 		if ip.String() == "111.55.212.102" {
 			reached = true
 			break

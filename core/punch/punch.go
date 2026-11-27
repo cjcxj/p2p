@@ -379,7 +379,7 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 	// attempt. canSpray (an active socket pool) enables the step-aligned and
 	// n4 block legs; the multi-IP spray leg runs regardless of pool size, so a
 	// destination-rotating CGNAT is still attacked even with a single socket.
-	targets := planTargets(p.My, info, cfg)
+	targets := planTargets(p.My, info, cfg, 0)
 	var punchEps []Endpoint
 	spraying := false
 	for i := range targets {
@@ -462,7 +462,7 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 			escalated = true
 			planInfo.Type = stun.NatSymmetric
 			planMy.Type = stun.NatSymmetric
-			nt := planTargets(planMy, planInfo, cfg)
+			nt := planTargets(planMy, planInfo, cfg, round)
 			replanned := punchEps[:0]
 			for i := range nt {
 				if nt[i].Kind == "spray" {
@@ -478,7 +478,7 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 			// Re-roll the spray window each round. A fixed random subset can
 			// miss the peer's planted mapping ports forever; new ports every
 			// round grow coverage until a collision lands.
-			nt := planTargets(planMy, planInfo, cfg)
+			nt := planTargets(planMy, planInfo, cfg, round)
 			replanned := punchEps[:0]
 			replanned = append(replanned, nt...)
 			punchEps = replanned

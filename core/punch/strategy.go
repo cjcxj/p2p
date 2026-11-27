@@ -113,7 +113,13 @@ func (n NATInfo) CandidateIPs() []net.IP {
 // pool so a destination-rotating CGNAT cannot hide behind the one IP it uses
 // toward us. Expansion is capped at max hosts (<=0 uses defaultSprayIPMax) so a
 // peer that reports a /24 pool cannot make the spray explode.
-func (n NATInfo) SprayIPs(max int) []net.IP {
+// SprayIPs returns the addresses the spray leg should aim at. round selects
+// which slice of an announced pool larger than the per-round budget is covered:
+// a fixed window only ever hits the same addresses, so a peer whose egress sits
+// outside it stays unreachable no matter how many rounds run. Rotating the
+// window by one budget per round covers the whole block in total/budget rounds.
+// Observed addresses always come first and are never displaced by rotation.
+func (n NATInfo) SprayIPs(max, round int) []net.IP {
 	out := n.CandidateIPs()
 	if n.PoolCIDR == nil {
 		return out
@@ -130,17 +136,32 @@ func (n NATInfo) SprayIPs(max int) []net.IP {
 	if base == nil || bits != 32 {
 		return out
 	}
-	// Number of hosts the prefix covers; never exceed max, and skip a prefix
-	// already fully represented by the sampled set.
-	span := 1 << (32 - ones)
-	if span > max {
-		span = max
+	total := 1 << (32 - ones)
+	if ones < 20 {
+		// A block wider than /20 is not a carrier egress pool, and spraying it
+		// would spend the whole budget on addresses nobody ever assigns. Fall
+		// back to the sampled set, which is at least known-real. The announcing
+		// side refuses to emit such a prefix; this is the matching guard.
+		return out
 	}
-	// Start from the sampled base address and walk forward, wrapping inside the
-	// block, so the addresses we were most likely to observe are sprayed first.
+	limit := total
+	if limit > max {
+		limit = max
+	}
+	// Start from the sampled base address and walk forward, so the addresses we
+	// were most likely to observe are sprayed first. The window is aligned to its
+	// own size, which is the shape a CGNAT hands out contiguous blocks in.
 	start := ipToU32(base)
-	block := start & ^uint32(span-1)
-	for i := 0; i < span; i++ {
+	poolBase := start & ^uint32(total-1)
+	block := start & ^uint32(limit-1)
+	if total > limit && round > 0 {
+		// Round 0 keeps the sampled address inside its own aligned window, which is
+		// where a carrier most recently handed us a mapping. Later rounds walk the
+		// pool from its base one window at a time, so the whole block is reached
+		// within total/limit + 1 rounds instead of re-spraying one slice forever.
+		block = poolBase + uint32(round-1)%uint32(total/limit)*uint32(limit)
+	}
+	for i := 0; i < limit; i++ {
 		ip := u32ToIP(block + uint32(i))
 		if ip == nil || seen[ip.String()] {
 			continue
@@ -215,7 +236,7 @@ type Config struct {
 // planTargets builds the ordered list of endpoints to probe for the remote
 // peer, encoding the NAT combination strategy matrix. The same matrix is
 // applied symmetrically by both sides (simultaneous probing).
-func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
+func planTargets(my NATInfo, peer NATInfo, cfg Config, round int) []Endpoint {
 	var eps []Endpoint
 	order := 0
 
@@ -368,7 +389,7 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 					isObserved[ip.String()] = true
 				}
 				var coldIPs []net.IP
-				for _, ip := range peer.SprayIPs(cfg.SprayIPMax) {
+				for _, ip := range peer.SprayIPs(cfg.SprayIPMax, round) {
 					if !isObserved[ip.String()] {
 						coldIPs = append(coldIPs, ip)
 					}
