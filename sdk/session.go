@@ -68,6 +68,12 @@ type Session struct {
 	tunWriteCh   chan []byte
 	tunWriteStop chan struct{}
 
+	// tunMu serialises the tunnel's attach/detach and peer-install sequences.
+	// Without it a punching callback can install a peer into a device that is
+	// being torn down, or a dead link's callback can overwrite the entry a rejoin
+	// just installed under a new key.
+	// Lock order: always acquire tunMu before mu.
+	tunMu  sync.Mutex
 	mu     sync.Mutex
 	peers  map[string]*remote
 	closed bool
@@ -140,6 +146,9 @@ func protectConn(conn net.PacketConn, p SocketProtector) {
 // mesh data plane instead, which is how IP traffic travelled before the
 // tunnel existed.
 func (s *Session) AttachTUN(fd int, mtu int) error {
+	s.tunMu.Lock()
+	defer s.tunMu.Unlock()
+
 	if fd < 0 {
 		return errors.New("p2p: invalid tun fd")
 	}
@@ -161,7 +170,7 @@ func (s *Session) AttachTUN(fd int, mtu int) error {
 		if err != nil {
 			return err
 		}
-		return s.startTunnel(dev.TUN(), dev.Name())
+		return s.startTunnelLocked(dev.TUN(), dev.Name())
 	}
 	f := os.NewFile(uintptr(fd), "p2p-tun")
 	if f == nil {
@@ -803,7 +812,9 @@ func (s *Session) run(room string) {
 	// nowhere to receive its frames. Hook this socket up now.
 	if tun != nil {
 		wireTunnel(tun, ph)
-		s.applyTunnelPeers(s.pendingTunnelPeers())
+		s.tunMu.Lock()
+		s.applyTunnelPeersLocked(s.pendingTunnelPeers())
+		s.tunMu.Unlock()
 	}
 
 	sig.OnMessage = func(m protocol.Message) error {
@@ -1056,9 +1067,11 @@ func (s *Session) onPeerCandidate(m protocol.Message) {
 	if meshNode != nil && vipIP != nil {
 		meshNode.AddKnownIP(vipIP)
 	}
+	s.tunMu.Lock()
 	if restarted {
-		s.dropTunnelPeer(appliedPub)
+		s.dropTunnelPeerLocked(appliedPub)
 	}
+	s.tunMu.Unlock()
 	if ph == nil {
 		return
 	}
@@ -1074,8 +1087,10 @@ func (s *Session) onPeerCandidate(m protocol.Message) {
 	}
 	ph.AddPeer(senderID, info)
 	if needTunnel {
-		s.dropTunnelPeer(stalePub)
-		s.applyTunnelPeers([]tunnelPeer{tp})
+		s.tunMu.Lock()
+		s.dropTunnelPeerLocked(stalePub)
+		s.applyTunnelPeersLocked([]tunnelPeer{tp})
+		s.tunMu.Unlock()
 	}
 }
 
@@ -1123,10 +1138,12 @@ func (s *Session) onPeerConnected(id protocol.PeerID, transport, endpoint string
 	} else if oldTransport != "" && oldTransport != transport {
 		s.emit(EventPathChanged, vip, []byte(transport))
 	}
-	s.dropTunnelPeer(stalePub)
+	s.tunMu.Lock()
+	s.dropTunnelPeerLocked(stalePub)
 	if needTunnel {
-		s.applyTunnelPeers([]tunnelPeer{tp})
+		s.applyTunnelPeersLocked([]tunnelPeer{tp})
 	}
+	s.tunMu.Unlock()
 }
 
 func (s *Session) onPeerLeave(idStr string) {
@@ -1163,7 +1180,9 @@ func (s *Session) onPeerLeave(idStr string) {
 		}
 	}
 	s.emit(EventPeerLeft, vip, []byte(idStr))
-	s.dropTunnelPeer(gonePub)
+	s.tunMu.Lock()
+	s.dropTunnelPeerLocked(gonePub)
+	s.tunMu.Unlock()
 }
 
 // buildCandidate assembles this peer's punching candidate.
