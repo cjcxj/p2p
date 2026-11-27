@@ -1,11 +1,11 @@
 [Unit]
-Description=p2p all-in-one server (signaling + STUN + relay)
+Description=p2p single signaling + STUN server (pure P2P)
 After=network.target
 
 [Service]
 Type=simple
-# Adjust ExecStart to your public IP / port / TLS options.
-ExecStart=/usr/local/bin/p2p-server --public 0.0.0.0 --port 8080
+# Adjust ExecStart to your port / multi-STUN / TLS options.
+ExecStart=/usr/local/bin/p2p-server --port 8080
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65536
