@@ -607,9 +607,9 @@ func (m *meshListener) OnEvent(event int, peerID string, data []byte) {
 			}
 		}
 		if endpoint != "" {
-			fmt.Printf("[mesh] node connected: %s via %s (%s)\n", peerID, data, endpoint)
+			fmt.Printf("[mesh] %s node connected: %s via %s (%s)\n", ts(), peerID, data, endpoint)
 		} else {
-			fmt.Printf("[mesh] node connected: %s via %s\n", peerID, data)
+			fmt.Printf("[mesh] %s node connected: %s via %s\n", ts(), peerID, data)
 		}
 		if m.tunMode {
 			fmt.Printf("[mesh] 现在可以 ping 该节点: ping %s\n", peerID)
@@ -627,9 +627,14 @@ func (m *meshListener) OnEvent(event int, peerID string, data []byte) {
 	case p2p.EventError:
 		fmt.Printf("[mesh] error: %s\n", data)
 	case p2p.EventDebug:
-		fmt.Printf("[punch] %s\n", data)
+		fmt.Printf("[punch] %s %s\n", ts(), data)
 	}
 }
+
+// ts stamps the pacing-sensitive lines with a wall clock. Without it the round
+// counter has no seconds attached, and reading "how long did punching take"
+// meant cross-referencing the WireGuard debug lines for time anchors.
+func ts() string { return time.Now().Format("15:04:05") }
 
 func (m *meshListener) waitIP() string {
 	deadline := time.Now().Add(10 * time.Second)
@@ -699,7 +704,7 @@ func (c *cliListener) OnEvent(event int, peerID string, data []byte) {
 	case p2p.EventError:
 		fmt.Printf("[error] %s\n", data)
 	case p2p.EventDebug:
-		fmt.Printf("[punch] %s\n", data)
+		fmt.Printf("[punch] %s %s\n", ts(), data)
 	}
 }
 

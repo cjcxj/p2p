@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -279,6 +280,43 @@ func testTunnelPair(t *testing.T, initiatorFirst bool) {
 	// The punch engine must still be able to use the same socket afterwards.
 	if err := p.pa.Send(p.idB, []byte("still works")); err != nil {
 		t.Fatalf("punch send after tunnel up: %v", err)
+	}
+}
+
+// TestHandshakeRetryKeepsNewerEndpoint covers what happens when the peer's
+// address changes while the retry loop is still running -- the reconnect case:
+// the session installs a fresh endpoint a moment after the first attempt started.
+// A retry that re-added the address it captured on entry would silently move the
+// tunnel back to the dead path, and the session would keep believing the newer
+// one was in place.
+func TestHandshakeRetryKeepsNewerEndpoint(t *testing.T) {
+	sock := listen(t)
+	priv, _ := keypair(t)
+	_, pub := keypair(t)
+	tr := New(NewFakeTUN(1420), sock, false)
+	t.Cleanup(tr.Stop)
+	if err := tr.Start(priv); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	const stale, current = "127.0.0.1:1111", "127.0.0.1:2222"
+	// Initiator, so the retry goroutine is running against the first address.
+	if err := tr.AddPeer(pub, stale, vipB.String(), true); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := tr.addPeer(pub, current, vipB.String(), true); err != nil {
+		t.Fatalf("re-add: %v", err)
+	}
+
+	// Two retry ticks: enough for the loop to have rewritten the peer once.
+	time.Sleep(2*handshakeRetryEvery + 200*time.Millisecond)
+
+	if s, _ := tr.spec(pub); s.endpoint != current {
+		t.Fatalf("retry rewrote the endpoint to %s, want %s", s.endpoint, current)
+	}
+	dump := tr.Dump()
+	if !strings.Contains(dump, "endpoint="+current) || strings.Contains(dump, "endpoint="+stale) {
+		t.Fatalf("device holds the stale path:\n%s", dump)
 	}
 }
 

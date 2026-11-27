@@ -3,6 +3,7 @@ package p2p
 import (
 	"encoding/binary"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,19 +31,8 @@ func punchedPair(t *testing.T) (a, b *Session, tunA, tunB *wgengine.FakeTUN) {
 
 	// The candidate each peer would publish over signaling, delivered to the
 	// other -- exactly the frame onSignaling receives.
-	send := func(from, to *Session) {
-		t.Helper()
-		m := protocol.Message{
-			Type:      protocol.MsgCandidate,
-			PeerID:    from.id.String(),
-			Candidate: from.buildCandidate(),
-		}
-		if err := to.onSignaling(m); err != nil {
-			t.Fatalf("candidate to %s: %v", to.vip, err)
-		}
-	}
-	send(a, b)
-	send(b, a)
+	publishCandidate(t, a, b)
+	publishCandidate(t, b, a)
 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -55,6 +45,20 @@ func punchedPair(t *testing.T) (a, b *Session, tunA, tunB *wgengine.FakeTUN) {
 	}
 	t.Fatal("sessions did not punch each other")
 	return
+}
+
+// publishCandidate delivers one session's signaling candidate to the other --
+// the frame onSignaling receives from the server.
+func publishCandidate(t *testing.T, from, to *Session) {
+	t.Helper()
+	m := protocol.Message{
+		Type:      protocol.MsgCandidate,
+		PeerID:    from.id.String(),
+		Candidate: from.buildCandidate(),
+	}
+	if err := to.onSignaling(m); err != nil {
+		t.Fatalf("candidate to %s: %v", to.vip, err)
+	}
 }
 
 func fakeSession(t *testing.T, vip net.IP) *Session {
@@ -166,9 +170,9 @@ func TestSDKCloseTUNReattachesSamePeer(t *testing.T) {
 	afterClose := a.tunnel
 	closed := a.closed
 	r := a.peers[b.id.String()]
-	configured := ""
+	configured := tunnelPeer{}
 	if r != nil {
-		configured = r.wgEndpoint
+		configured = r.wgApplied
 	}
 	a.mu.Unlock()
 	if afterClose != nil {
@@ -180,8 +184,8 @@ func TestSDKCloseTUNReattachesSamePeer(t *testing.T) {
 	if r == nil {
 		t.Fatal("CloseTUN dropped the peer table")
 	}
-	if configured != "" {
-		t.Fatalf("peer still marked configured at %s", configured)
+	if configured != (tunnelPeer{}) {
+		t.Fatalf("peer still marked configured at %s", configured.endpoint)
 	}
 
 	tunA, tunB := wgengine.NewFakeTUN(1420), wgengine.NewFakeTUN(1420)
@@ -215,6 +219,122 @@ func TestSDKCloseTUNReattachesSamePeer(t *testing.T) {
 			if time.Now().After(deadline) {
 				dumpTunnels(t, "after timeout", a, b)
 				t.Fatal("no packet crossed the re-attached tunnel")
+			}
+		}
+	}
+}
+
+// TestSDKTunnelAdoptsFreshKeyOnRejoin is the desktop/phone "disconnect, then
+// reconnect" shape: the far side restarts its session, so it advertises a new
+// X25519 key while keeping its room identity -- and, rejoining from the same
+// network, punching lands on the endpoint the tunnel already has installed.
+// Nothing about the peer changed except the key, so an entry remembered by
+// endpoint alone looked up to date and the tunnel went on handshaking with a key
+// nobody held.
+func TestSDKTunnelAdoptsFreshKeyOnRejoin(t *testing.T) {
+	a, b, tunA, _ := punchedPair(t)
+
+	stalePub := b.buildCandidate().X25519Pub
+
+	// B comes back with a fresh key on the same socket, hence the same endpoint.
+	b.CloseTUN()
+	key, err := newDataKey()
+	if err != nil {
+		t.Fatalf("new key: %v", err)
+	}
+	b.mu.Lock()
+	b.x25519 = key
+	b.mu.Unlock()
+	tunB := wgengine.NewFakeTUN(1420)
+	if err := b.startTunnel(tunB, "p2p-b2"); err != nil {
+		t.Fatalf("re-attach b: %v", err)
+	}
+	// A gets no leave: B kept its peer id, so only the candidate changed.
+	publishCandidate(t, b, a)
+
+	deadline := time.Now().Add(10 * time.Second)
+	var applied tunnelPeer
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		if r := a.peers[b.id.String()]; r != nil {
+			applied = r.wgApplied
+		}
+		a.mu.Unlock()
+		if applied.pub != "" && applied.pub != stalePub {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if applied.pub == "" || applied.pub == stalePub {
+		t.Fatalf("A kept the stale key %q, applied %+v", stalePub, applied)
+	}
+
+	a.mu.Lock()
+	ta := a.tunnel
+	a.mu.Unlock()
+	if dump := ta.Dump(); strings.Contains(dump, "public_key="+stalePub) {
+		t.Fatalf("stale peer still configured, two entries claim one /32:\n%s", dump)
+	}
+
+	want := echoRequest(a.vip, b.vip, 64)
+	for {
+		if !tunA.Inject(want) {
+			t.Fatal("inject failed")
+		}
+		select {
+		case got := <-tunB.Outbound():
+			if len(got) != len(want) {
+				t.Fatalf("decrypted packet length %d, want %d", len(got), len(want))
+			}
+			return
+		case <-time.After(200 * time.Millisecond):
+			if time.Now().After(deadline) {
+				dumpTunnels(t, "after rejoin timeout", a, b)
+				t.Fatal("no packet crossed after the peer rejoined")
+			}
+		}
+	}
+}
+
+// TestSDKTunnelRebuildsPathOnReannounce covers the reconnect that keeps its
+// identity: the app reuses its session, so the peer returns with the same key on
+// the same socket. Its tunnel device is nevertheless new and holds no session for
+// us, so the entry has to be rebuilt -- trusting it because nothing visible
+// changed is what left the link dark.
+func TestSDKTunnelRebuildsPathOnReannounce(t *testing.T) {
+	a, b, tunA, _ := punchedPair(t)
+
+	b.CloseTUN()
+	tunB := wgengine.NewFakeTUN(1420)
+	if err := b.startTunnel(tunB, "p2p-b2"); err != nil {
+		t.Fatalf("re-attach b: %v", err)
+	}
+	publishCandidate(t, b, a)
+
+	a.mu.Lock()
+	r := a.peers[b.id.String()]
+	kept := r.wgApplied
+	a.mu.Unlock()
+	if kept != (tunnelPeer{}) {
+		t.Fatalf("A kept the dead session's tunnel entry: %+v", kept)
+	}
+
+	want := echoRequest(a.vip, b.vip, 64)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if !tunA.Inject(want) {
+			t.Fatal("inject failed")
+		}
+		select {
+		case got := <-tunB.Outbound():
+			if len(got) != len(want) {
+				t.Fatalf("decrypted packet length %d, want %d", len(got), len(want))
+			}
+			return
+		case <-time.After(200 * time.Millisecond):
+			if time.Now().After(deadline) {
+				dumpTunnels(t, "after re-announce timeout", a, b)
+				t.Fatal("no packet crossed after the peer re-announced")
 			}
 		}
 	}

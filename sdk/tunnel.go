@@ -134,23 +134,26 @@ func (s *Session) pendingTunnelPeers() []tunnelPeer {
 	}
 	out := make([]tunnelPeer, 0, len(s.peers))
 	for id, r := range s.peers {
-		if tp, ok := s.tunnelPeer(id, r); ok {
+		if tp, _, ok := s.tunnelPeer(id, r); ok {
 			out = append(out, tp)
 		}
 	}
 	return out
 }
 
-// tunnelPeer reports the tunnel entry a peer needs. Caller holds s.mu.
-func (s *Session) tunnelPeer(id string, r *remote) (tunnelPeer, bool) {
+// tunnelPeer reports the entry a peer needs in the tunnel, together with the
+// key of the entry it replaces. Caller holds s.mu.
+//
+// The replaced key matters because a peer that rejoins usually keeps its
+// virtual address -- and often its endpoint, reconnecting from the same
+// network -- while advertising a brand new X25519 key. Leaving the old entry in
+// place would give two peers a claim on the same /32, and the tunnel would keep
+// handshaking with a key nobody holds any more.
+func (s *Session) tunnelPeer(id string, r *remote) (tp tunnelPeer, stale string, need bool) {
 	if r == nil || !r.connected || r.wgPub == "" || r.endpoint == "" || r.vip == nil {
-		return tunnelPeer{}, false
+		return tunnelPeer{}, "", false
 	}
-	// Nothing to do while the configured endpoint is the one in use.
-	if r.wgEndpoint == r.endpoint {
-		return tunnelPeer{}, false
-	}
-	return tunnelPeer{
+	tp = tunnelPeer{
 		id:       id,
 		pub:      r.wgPub,
 		endpoint: r.endpoint,
@@ -159,11 +162,18 @@ func (s *Session) tunnelPeer(id string, r *remote) (tunnelPeer, bool) {
 		// exactly one of them starts the handshake instead of the two
 		// destroying each other's pending initiation.
 		initiator: s.id.Less(r.id),
-	}, true
+	}
+	if r.wgApplied == tp {
+		return tunnelPeer{}, "", false
+	}
+	if r.wgApplied.pub != "" && r.wgApplied.pub != tp.pub {
+		stale = r.wgApplied.pub
+	}
+	return tp, stale, true
 }
 
-// applyTunnelPeers installs peer entries and remembers which endpoint each one
-// was configured for.
+// applyTunnelPeers installs peer entries and remembers the exact entry each one
+// got, so a later change of key or endpoint is noticed.
 func (s *Session) applyTunnelPeers(list []tunnelPeer) {
 	if len(list) == 0 {
 		return
@@ -181,15 +191,18 @@ func (s *Session) applyTunnelPeers(list []tunnelPeer) {
 		}
 		s.mu.Lock()
 		if r := s.peers[tp.id]; r != nil && r.wgPub == tp.pub {
-			r.wgEndpoint = tp.endpoint
+			r.wgApplied = tp
 		}
 		s.mu.Unlock()
 	}
 }
 
-// dropTunnelPeer removes a peer that left or lost its direct path.
-func (s *Session) dropTunnelPeer(pub, endpoint string) {
-	if pub == "" || endpoint == "" {
+// dropTunnelPeer removes the entry a peer left behind in the tunnel. Removal is
+// keyed by the public key that was installed, which is the only thing RemovePeer
+// needs -- requiring an endpoint as well would leak the entry of a peer that was
+// installed and then lost its path.
+func (s *Session) dropTunnelPeer(pub string) {
+	if pub == "" {
 		return
 	}
 	s.mu.Lock()
@@ -222,10 +235,10 @@ func (s *Session) CloseTUN() {
 	s.tunFile = nil
 	s.tunWriteCh = nil
 	s.tunWriteStop = nil
-	// Forget which endpoint each peer was configured for. A later attach builds
-	// a fresh device, and every peer has to be installed into that one.
+	// Forget which entry each peer had. A later attach builds a fresh device, and
+	// every peer has to be installed into that one.
 	for _, r := range s.peers {
-		r.wgEndpoint = ""
+		r.wgApplied = tunnelPeer{}
 	}
 	s.mu.Unlock()
 

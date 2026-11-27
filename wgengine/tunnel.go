@@ -21,6 +21,15 @@ const (
 	handshakeRetries    = 4
 )
 
+// peerSpec is the configuration a tunnel entry was last asked to hold. The
+// handshake-retry loop compares against it so it can never re-write a peer from
+// a copy that a newer AddPeer has already superseded.
+type peerSpec struct {
+	endpoint  string
+	vip       string
+	initiator bool
+}
+
 // Tunnel is a WireGuard interface whose UDP transport is the socket the punch
 // engine already owns. Peers are added only once hole punching has produced a
 // reachable endpoint.
@@ -31,6 +40,9 @@ type Tunnel struct {
 
 	done sync.Once
 	fin  chan struct{}
+
+	mu    sync.Mutex
+	specs map[string]peerSpec
 }
 
 // New wraps tunDev and pc. pc must be the same socket passed to punch.New.
@@ -45,6 +57,7 @@ func New(tunDev tun.Device, pc net.PacketConn, verbose bool) *Tunnel {
 		bind:   bind,
 		tunDev: tunDev,
 		fin:    make(chan struct{}),
+		specs:  make(map[string]peerSpec),
 	}
 }
 
@@ -100,9 +113,23 @@ func (t *Tunnel) addPeer(pubHex, endpoint, vip string, kick bool) error {
 	if kick {
 		keepalive = "\npersistent_keepalive_interval=25"
 	}
-	return t.dev.IpcSet(fmt.Sprintf(
+	if err := t.dev.IpcSet(fmt.Sprintf(
 		"public_key=%s\nendpoint=%s%s\nallowed_ip=%s/32\n",
-		pubHex, endpoint, keepalive, vip))
+		pubHex, endpoint, keepalive, vip)); err != nil {
+		return err
+	}
+	t.mu.Lock()
+	t.specs[pubHex] = peerSpec{endpoint: endpoint, vip: vip, initiator: kick}
+	t.mu.Unlock()
+	return nil
+}
+
+// spec reports the configuration this tunnel was last asked to hold for pubHex.
+func (t *Tunnel) spec(pubHex string) (peerSpec, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s, ok := t.specs[pubHex]
+	return s, ok
 }
 
 // recoverHandshake re-opens the handshake until the responder has answered.
@@ -118,6 +145,14 @@ func (t *Tunnel) recoverHandshake(pubHex, endpoint, vip string) {
 			return
 		}
 		if t.handshook(pubHex) {
+			return
+		}
+		// A newer AddPeer -- the peer roamed, or it rejoined under this same key
+		// after reconnecting -- owns the entry now. Re-writing the captured
+		// address would point the tunnel back at a path that is already dead,
+		// and the session would keep believing the newer one was installed.
+		cur, ok := t.spec(pubHex)
+		if !ok || cur.endpoint != endpoint || cur.vip != vip {
 			return
 		}
 		if err := t.RemovePeer(pubHex); err != nil {
@@ -149,7 +184,13 @@ func (t *Tunnel) handshook(pubHex string) bool {
 
 // RemovePeer drops a peer that has left the room.
 func (t *Tunnel) RemovePeer(pubHex string) error {
-	return t.dev.IpcSet("public_key=" + pubHex + "\nremove=true\n")
+	err := t.dev.IpcSet("public_key=" + pubHex + "\nremove=true\n")
+	if err == nil {
+		t.mu.Lock()
+		delete(t.specs, pubHex)
+		t.mu.Unlock()
+	}
+	return err
 }
 
 // Stop tears the interface down and releases the bind and tun devices.

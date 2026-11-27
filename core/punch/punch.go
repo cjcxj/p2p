@@ -90,10 +90,13 @@ type peer struct {
 	lastSeen  time.Time
 }
 
-// New creates an idle Punch over conn.
+// New creates an idle Punch over conn. The single socket is installed as the
+// pool right away: AddPeer starts probing immediately, so a caller that adds a
+// peer before Start must already find a socket to write through.
 func New(conn net.PacketConn, myID protocol.PeerID, my NATInfo, cfg Config) *Punch {
 	return &Punch{
 		Conn:   conn,
+		Conns:  []net.PacketConn{conn},
 		MyID:   myID,
 		My:     my,
 		Config: cfg,
@@ -133,6 +136,19 @@ func (p *Punch) AddPeer(id protocol.PeerID, info NATInfo) {
 	stop := ps.stop
 	ps.info = info
 	ps.lastSeen = time.Now()
+	// Reaching an existing peer here means the far side restarted: a candidate is
+	// only ever (re)sent when a node newly discovers us, and the server forwards
+	// it verbatim without replaying it to anyone already connected. The endpoint
+	// and socket on record belong to the dead session. Leaving the peer marked
+	// connected would send this fresh probe loop straight into keepalive mode on a
+	// path the peer no longer uses -- and because a rejoined peer cannot reach us
+	// until WE open its side of the mapping, its own probes would meet a closed
+	// door for the whole idle timeout. That is the "disconnect, reconnect, never
+	// reconnects again" deadlock.
+	ps.connected = false
+	ps.transport = ""
+	ps.endpoint = nil
+	ps.sockIdx = 0
 	ps.mu.Unlock()
 	p.mu.Unlock()
 	p.wg.Add(1)
@@ -612,7 +628,14 @@ func (p *Punch) sendProbe(ps *peer, ep Endpoint) {
 	ps.mu.Unlock()
 	pkt := &Packet{Type: PktProbe, Seq: seq, Src: p.MyID, Dst: protocol.PeerID{}, Payload: nil}
 	buf := encodePooled(pkt)
-	p.Conns[ep.Socket].WriteTo(buf, ep.Addr)
+	// A target planned against a wider pool than this engine has -- an AddPeer
+	// that raced a pool swap -- still has to reach the peer on some socket, and
+	// indexing past the end would take the whole process down.
+	idx := ep.Socket
+	if idx >= len(p.Conns) {
+		idx = 0
+	}
+	p.Conns[idx].WriteTo(buf, ep.Addr)
 	putEncode(buf)
 }
 

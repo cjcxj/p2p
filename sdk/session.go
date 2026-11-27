@@ -76,14 +76,19 @@ type Session struct {
 }
 
 type remote struct {
-	id            protocol.PeerID
-	vip           net.IP
-	connected     bool
-	transport     string
-	endpoint      string // actual remote UDP endpoint (IP:port)
-	key           []byte // per-pair data-plane AEAD key; nil means plaintext fallback
-	wgPub         string // peer's X25519 key, hex, as advertised in signaling
-	wgEndpoint    string // endpoint the WireGuard peer entry was configured for
+	id        protocol.PeerID
+	vip       net.IP
+	connected bool
+	transport string
+	endpoint  string // actual remote UDP endpoint (IP:port)
+	key       []byte // per-pair data-plane AEAD key; nil means plaintext fallback
+	wgPub     string // peer's X25519 key, hex, as advertised in signaling
+	// wgApplied is the tunnel entry actually installed for this peer, or the
+	// zero value while none is. Comparing the whole entry -- not just the
+	// endpoint -- is what makes a rejoin under a fresh key take effect: the
+	// endpoint is often identical after a reconnect from the same network, and
+	// the stale key inside the tunnel would keep the link dark.
+	wgApplied     tunnelPeer
 	bytesSent     uint64
 	bytesReceived uint64
 }
@@ -1005,14 +1010,33 @@ func (s *Session) onPeerCandidate(m protocol.Message) {
 	if c.X25519Pub != "" {
 		r.wgPub = c.X25519Pub
 	}
+	// A candidate for a peer we already consider connected means the far side
+	// restarted: a node only (re)announces when it newly discovers us, and the
+	// server forwards candidates verbatim without replaying them to anyone
+	// already connected. Everything the old session produced -- the punched path,
+	// the data key, the tunnel entry -- is then stale, even when the peer kept the
+	// same X25519 key: a tunnel device rebuilt on the far side holds no session for
+	// ours, so the entry has to be dropped and re-established rather than trusted.
+	restarted := r.connected
+	appliedPub := r.wgApplied.pub
+	if restarted {
+		r.connected = false
+		r.transport = ""
+		r.endpoint = ""
+		r.wgApplied = tunnelPeer{}
+	}
 	// A candidate can also arrive after the link was already punched, with a
-	// better endpoint than the one the tunnel is using.
-	tp, needTunnel := s.tunnelPeer(sender, r)
+	// better endpoint -- or a fresh key after a rejoin -- than the one the tunnel
+	// is using.
+	tp, stalePub, needTunnel := s.tunnelPeer(sender, r)
 	meshNode := s.mesh
 	ph := s.ph
 	s.mu.Unlock()
 	if meshNode != nil && vipIP != nil {
 		meshNode.AddKnownIP(vipIP)
+	}
+	if restarted {
+		s.dropTunnelPeer(appliedPub)
 	}
 	if ph == nil {
 		return
@@ -1029,6 +1053,7 @@ func (s *Session) onPeerCandidate(m protocol.Message) {
 	}
 	ph.AddPeer(senderID, info)
 	if needTunnel {
+		s.dropTunnelPeer(stalePub)
 		s.applyTunnelPeers([]tunnelPeer{tp})
 	}
 }
@@ -1049,8 +1074,7 @@ func (s *Session) onPeerConnected(id protocol.PeerID, transport, endpoint string
 	r.transport = transport
 	r.endpoint = endpoint
 	idStr := id.String()
-	var gonePub, goneEndpoint string
-	tp, needTunnel := s.tunnelPeer(idStr, r)
+	tp, stalePub, needTunnel := s.tunnelPeer(idStr, r)
 	vip := ""
 	var vipIP net.IP
 	if r.vip != nil {
@@ -1078,7 +1102,7 @@ func (s *Session) onPeerConnected(id protocol.PeerID, transport, endpoint string
 	} else if oldTransport != "" && oldTransport != transport {
 		s.emit(EventPathChanged, vip, []byte(transport))
 	}
-	s.dropTunnelPeer(gonePub, goneEndpoint)
+	s.dropTunnelPeer(stalePub)
 	if needTunnel {
 		s.applyTunnelPeers([]tunnelPeer{tp})
 	}
@@ -1091,9 +1115,12 @@ func (s *Session) onPeerLeave(idStr string) {
 	meshNode := s.mesh
 	ph := s.ph
 	var vipIP net.IP
-	var gonePub, goneEndpoint string
+	var gonePub string
 	if r != nil {
-		gonePub, goneEndpoint = r.wgPub, r.wgEndpoint
+		// Remove the key that is actually in the tunnel, which is not always the
+		// one last advertised: a candidate can arrive for a peer whose link has
+		// not been punched yet, so nothing was ever installed for that key.
+		gonePub = r.wgApplied.pub
 		if r.vip != nil {
 			vipIP = r.vip
 		}
@@ -1115,7 +1142,7 @@ func (s *Session) onPeerLeave(idStr string) {
 		}
 	}
 	s.emit(EventPeerLeft, vip, []byte(idStr))
-	s.dropTunnelPeer(gonePub, goneEndpoint)
+	s.dropTunnelPeer(gonePub)
 }
 
 // buildCandidate assembles this peer's punching candidate.
