@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
 )
@@ -19,6 +20,23 @@ const maxPacket = 65536
 // device's receive goroutine. Overflow packets are dropped rather than
 // blocking the punch read loop.
 const rxQueueSize = 512
+
+// A handshake initiation that arrives before its peer is configured is dropped
+// by wireguard-go, and WireGuard then stays silent for five seconds before
+// retrying. Caching the most recent initiation per endpoint lets AddPeer replay
+// it, which is the difference between a tunnel that comes up at once and one that
+// waits a round for nothing.
+const (
+	initCacheMax = 32
+	initCacheTTL = 5 * time.Second
+	// initSize is the fixed wire length of a Handshake Initiation message.
+	initSize = 148
+)
+
+type cachedInit struct {
+	pkt []byte
+	at  time.Time
+}
 
 type ingress struct {
 	buf  []byte
@@ -75,6 +93,8 @@ type Bind struct {
 	closeCh   chan struct{}
 	rx        chan ingress
 	localPort uint16
+	// recentInit holds handshake initiations awaiting a peer to answer them.
+	recentInit map[netip.AddrPort]cachedInit
 }
 
 var _ conn.Bind = (*Bind)(nil)
@@ -85,6 +105,9 @@ func NewBind(pc net.PacketConn) *Bind {
 		pc:      pc,
 		closeCh: make(chan struct{}),
 		rx:      make(chan ingress, rxQueueSize),
+		// Allocated up front: cacheInit is reached from the receive path and a nil
+		// map there would panic.
+		recentInit: make(map[netip.AddrPort]cachedInit, initCacheMax),
 	}
 	b.pool.New = func() any {
 		buf := make([]byte, maxPacket)
@@ -108,19 +131,122 @@ func (b *Bind) SetSender(fn func([]byte, *net.UDPAddr) error) {
 // when the device cannot keep up the packet is dropped, which WireGuard treats
 // as ordinary loss.
 func (b *Bind) Ingest(pkt []byte, from *net.UDPAddr) {
-	if from == nil || len(from.IP) == 0 {
-		return
-	}
-	addr, ok := netip.AddrFromSlice(from.IP.To4())
+	ap, ok := addrPortOf(from)
 	if !ok {
 		return
+	}
+	// Type 1 is a Handshake Initiation. Cache it: the peer entry it is meant for
+	// may not exist yet, and dropping it costs a five second retry.
+	if len(pkt) == initSize && pkt[0] == 1 {
+		b.cacheInit(ap, pkt)
 	}
 	ptr := b.pool.Get().(*[]byte)
 	n := copy(*ptr, pkt)
 	select {
-	case b.rx <- ingress{buf: *ptr, n: n, from: netip.AddrPortFrom(addr, uint16(from.Port))}:
+	case b.rx <- ingress{buf: *ptr, n: n, from: ap}:
 	default:
 		b.pool.Put(ptr)
+	}
+}
+
+// addrPortOf converts a receive address, IPv4 or IPv6. Accepting only IPv4 here
+// silently discarded every IPv6 peer.
+func addrPortOf(from *net.UDPAddr) (netip.AddrPort, bool) {
+	if from == nil || len(from.IP) == 0 {
+		return netip.AddrPort{}, false
+	}
+	var addr netip.Addr
+	var ok bool
+	if ip4 := from.IP.To4(); ip4 != nil {
+		addr, ok = netip.AddrFromSlice(ip4)
+	} else {
+		addr, ok = netip.AddrFromSlice(from.IP.To16())
+	}
+	if !ok {
+		return netip.AddrPort{}, false
+	}
+	return netip.AddrPortFrom(addr, uint16(from.Port)), true
+}
+
+func (b *Bind) cacheInit(ap netip.AddrPort, pkt []byte) {
+	cp := append([]byte(nil), pkt...)
+	now := time.Now()
+	b.mu.Lock()
+	if b.recentInit == nil {
+		b.recentInit = make(map[netip.AddrPort]cachedInit, initCacheMax)
+	}
+	if len(b.recentInit) >= initCacheMax {
+		// Drop the expired ones first, then the oldest, so hitting the cap cannot
+		// throw away the fresh initiations that were just being cached to survive
+		// the race this cache exists for.
+		var oldestKey netip.AddrPort
+		var oldest time.Time
+		for k, v := range b.recentInit {
+			if now.Sub(v.at) > initCacheTTL {
+				delete(b.recentInit, k)
+				continue
+			}
+			if oldestKey == (netip.AddrPort{}) || v.at.Before(oldest) {
+				oldestKey, oldest = k, v.at
+			}
+		}
+		if len(b.recentInit) >= initCacheMax && oldestKey != (netip.AddrPort{}) {
+			delete(b.recentInit, oldestKey)
+		}
+	}
+	b.recentInit[ap] = cachedInit{pkt: cp, at: now}
+	b.mu.Unlock()
+}
+
+// ReplayInitiation feeds back a cached handshake initiation from endpointStr, if
+// it is still fresh. Called once a peer has been configured, so an initiator that
+// ran slightly ahead of us gets an answer immediately instead of after a retry.
+func (b *Bind) ReplayInitiation(endpointStr string) {
+	ap, err := netip.ParseAddrPort(endpointStr)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	b.mu.Lock()
+	c, ok := b.recentInit[ap]
+	if ok {
+		delete(b.recentInit, ap)
+	}
+	b.mu.Unlock()
+	if !ok || now.Sub(c.at) > initCacheTTL {
+		return
+	}
+	ptr := b.pool.Get().(*[]byte)
+	n := copy(*ptr, c.pkt)
+	select {
+	case b.rx <- ingress{buf: *ptr, n: n, from: ap}:
+	default:
+		b.pool.Put(ptr)
+	}
+}
+
+// ForgetInitiation discards a cached initiation for endpointStr: a peer that was
+// removed, or whose initiation the device already consumed, must not be handed a
+// replay whose anti-replay state is already used up.
+func (b *Bind) ForgetInitiation(endpointStr string) {
+	ap, err := netip.ParseAddrPort(endpointStr)
+	if err != nil {
+		return
+	}
+	b.forgetInit(ap)
+}
+
+func (b *Bind) forgetInit(ap netip.AddrPort) {
+	b.mu.Lock()
+	if b.recentInit != nil {
+		delete(b.recentInit, ap)
+	}
+	b.mu.Unlock()
+}
+
+func (b *Bind) forgetInitAddr(from *net.UDPAddr) {
+	if ap, ok := addrPortOf(from); ok {
+		b.forgetInit(ap)
 	}
 }
 
@@ -175,6 +301,11 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	sender := b.sender
 	b.mu.Unlock()
 	for _, buf := range bufs {
+		// A Handshake Response (type 2) leaving for this endpoint means the cached
+		// initiation has been consumed; replaying it later would only collide.
+		if len(buf) >= 4 && buf[0] == 2 && buf[1] == 0 && buf[2] == 0 && buf[3] == 0 {
+			b.forgetInitAddr(addr)
+		}
 		if sender != nil {
 			if err := sender(buf, addr); err != nil {
 				return err

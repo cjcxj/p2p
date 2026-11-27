@@ -102,6 +102,10 @@ func (t *Tunnel) AddPeer(pubHex, endpoint, vip string, initiator bool) error {
 	if err := t.addPeer(pubHex, endpoint, vip, initiator); err != nil {
 		return err
 	}
+	// An initiation that arrived before this peer existed was dropped by the
+	// device; feed it back so the responder answers now instead of waiting out
+	// WireGuard's five second retry.
+	t.bind.ReplayInitiation(endpoint)
 	if initiator {
 		go t.recoverHandshake(pubHex, endpoint, vip)
 	}
@@ -184,11 +188,21 @@ func (t *Tunnel) handshook(pubHex string) bool {
 
 // RemovePeer drops a peer that has left the room.
 func (t *Tunnel) RemovePeer(pubHex string) error {
+	t.mu.Lock()
+	spec, known := t.specs[pubHex]
+	t.mu.Unlock()
+
 	err := t.dev.IpcSet("public_key=" + pubHex + "\nremove=true\n")
 	if err == nil {
 		t.mu.Lock()
 		delete(t.specs, pubHex)
 		t.mu.Unlock()
+		if known && spec.endpoint != "" {
+			// Any initiation cached for this path belongs to a peer that no longer
+			// exists. A rejoining peer under a new key must not be answered with
+			// the old one, whose anti-replay state is already spent.
+			t.bind.ForgetInitiation(spec.endpoint)
+		}
 	}
 	return err
 }
