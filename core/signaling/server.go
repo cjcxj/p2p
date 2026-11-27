@@ -18,6 +18,7 @@ const DefaultNetwork = "10.9.0.0/24"
 type Server struct {
 	ln            net.Listener
 	hub           *Hub
+	stunServers   []string
 	network       *net.IPNet
 	auth          *authConfig
 	logger        *log.Logger
@@ -38,6 +39,9 @@ const idleTimeout = 75 * time.Second
 
 // Options configures the server.
 type Options struct {
+	// STUNServers is a list of STUN server host:port addresses pushed to every
+	// client in MsgWelcome so clients probe multiple public STUN endpoints.
+	STUNServers []string
 	// Logger receives operational messages; nil disables logging.
 	Logger *log.Logger
 	// Verbose enables per-member join/leave and rejection logs in addition
@@ -82,9 +86,14 @@ func NewServer(addr string, opts Options) (*Server, error) {
 			return nil, err
 		}
 	}
+	var stuns []string
+	if len(opts.STUNServers) > 0 {
+		stuns = append([]string(nil), opts.STUNServers...)
+	}
 	s := &Server{
 		ln:            ln,
 		hub:           NewHub(),
+		stunServers:   stuns,
 		network:       ipnet,
 		logger:        opts.Logger,
 		verbose:       opts.Verbose,
@@ -226,12 +235,12 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	mem := &member{id: id, conn: conn}
 
-		vip, created, err := s.hub.join(roomID, token, mem, s.network)
-		if err != nil {
-			s.fail(conn, err.Error())
-			s.logf("member rejected room %q from %s: %v", roomID, conn.RemoteAddr(), err)
-			return
-		}
+	vip, created, err := s.hub.join(roomID, token, mem, s.network)
+	if err != nil {
+		s.fail(conn, err.Error())
+		s.logf("member rejected room %q from %s: %v", roomID, conn.RemoteAddr(), err)
+		return
+	}
 	if created {
 		s.logf("room %q created (token %s)", roomID, tokenState(token))
 	}
@@ -241,7 +250,13 @@ func (s *Server) handleConn(conn net.Conn) {
 	// frame interleaving with broadcast/forward goroutines.
 	members := s.hub.membersInfo(roomID)
 	mem.mu.Lock()
-	WriteMsg(conn, protocol.Message{Type: protocol.MsgWelcome, PeerID: id.String(), VirtualIP: vip, Network: s.Network()})
+	WriteMsg(conn, protocol.Message{
+		Type:        protocol.MsgWelcome,
+		PeerID:      id.String(),
+		VirtualIP:   vip,
+		Network:     s.Network(),
+		STUNServers: s.stunServers,
+	})
 	WriteMsg(conn, protocol.Message{Type: protocol.MsgMembers, Members: members})
 	mem.mu.Unlock()
 	// Announce the full member list to everyone else.
@@ -263,6 +278,16 @@ func (s *Server) handleConn(conn net.Conn) {
 			if err != nil {
 				continue
 			}
+			s.hub.sendTo(roomID, tid, msg)
+		case protocol.MsgPunchSync:
+			if msg.TargetID == "" {
+				continue
+			}
+			tid, err := protocol.ParsePeerID(msg.TargetID)
+			if err != nil {
+				continue
+			}
+			msg.PeerID = id.String()
 			s.hub.sendTo(roomID, tid, msg)
 		case protocol.MsgPing:
 			// heartbeat: keep-alive, nothing to do

@@ -50,6 +50,11 @@ const peerIdleTimeout = 45 * time.Second
 // trip the path never had.
 const ackCorrelationWindow = 10 * time.Second
 
+// refreshAnchorEvery is how often an unconnected peer may ask the session to
+// re-announce our current external address. Ten seconds trades a handful of extra
+// signalling messages against noticing a carrier re-dial inside a human timescale.
+const refreshAnchorEvery = 10 * time.Second
+
 // Punch drives hole punching for a set of remote peers over one or more shared
 // UDP sockets.
 type Punch struct {
@@ -65,6 +70,11 @@ type Punch struct {
 
 	// OnData is called for inbound data packets (from the read goroutine).
 	OnData func(src protocol.PeerID, pkt *Packet) error
+	// OnRefreshNeeded is invoked while a peer stays unconnected, at most once per
+	// refreshAnchorEvery. A CGNAT that re-dials changes its external address
+	// mid-session, and the only way the peer learns the new anchor is for us to
+	// announce it again -- signalling never re-sends a candidate on its own.
+	OnRefreshNeeded func(peerID protocol.PeerID)
 	// OnState reports per-peer punching progress (from the read goroutine).
 	// The third argument is the actual remote UDP endpoint (IP:port) used for
 	// the connection, or an empty string when not available.
@@ -496,6 +506,7 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 	}
 	start := time.Now()
 	lastAnnounce := time.Time{}
+	lastRefresh := time.Time{}
 	round := 0
 	// Fail-safe escalation. A cellular symmetric NAT is flakily classified as
 	// cone on real networks (the second-destination probe sometimes repeats the
@@ -604,6 +615,11 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 		}
 		round++
 		// periodic activity heartbeat
+		if !connected && p.OnRefreshNeeded != nil && time.Since(lastRefresh) >= refreshAnchorEvery {
+			lastRefresh = time.Now()
+			go p.OnRefreshNeeded(id)
+		}
+
 		if time.Since(lastAnnounce) > 2*time.Second {
 			lastAnnounce = time.Now()
 			p.logf("peer %s: still probing %d target(s) (round %d)", id.String()[:8], len(eps), round)

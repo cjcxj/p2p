@@ -49,7 +49,10 @@ func ParsePeerID(s string) (PeerID, error) {
 
 // Signaling message types.
 const (
-	MsgHello     = "hello"
+	MsgHello = "hello"
+	// MsgPunchSync asks the server to relay our current external address to one
+	// peer: a CGNAT that re-dials changes its anchor while the session lives.
+	MsgPunchSync = "punch_sync"
 	MsgChallenge = "challenge"
 	MsgAuth      = "auth"
 	MsgAuthOK    = "auth_ok"
@@ -112,16 +115,28 @@ type Candidate struct {
 
 // Message is the JSON-over-TCP wire frame exchanged over signaling.
 type Message struct {
-	Type      string       `json:"type"`
-	Room      string       `json:"room,omitempty"`
-	Token     string       `json:"token,omitempty"`
-	PeerID    string       `json:"peer_id,omitempty"`
-	VirtualIP string       `json:"virtual_ip,omitempty"`
-	Network   string       `json:"network,omitempty"`
-	Members   []MemberInfo `json:"members,omitempty"`
-	Candidate *Candidate   `json:"candidate,omitempty"`
-	User      string       `json:"user,omitempty"`
-	Nonce     string       `json:"nonce,omitempty"`
-	Proof     string       `json:"proof,omitempty"`
-	Error     string       `json:"error,omitempty"`
+	Type      string `json:"type"`
+	Room      string `json:"room,omitempty"`
+	Token     string `json:"token,omitempty"`
+	PeerID    string `json:"peer_id,omitempty"`
+	VirtualIP string `json:"virtual_ip,omitempty"`
+	Network   string `json:"network,omitempty"`
+	// STUNServers is pushed by the server in MsgWelcome so one deployment can
+	// configure the observation points once instead of every client repeating them
+	// -- the multi-STUN sampling an egress-pool announcement depends on.
+	STUNServers []string `json:"stun_servers,omitempty"`
+	// TargetID names the single peer a message is meant for, used by MsgPunchSync
+	// so a re-dialled CGNAT can hand its new external address to the peer that is
+	// still failing to reach it, without broadcasting to the whole room.
+	TargetID string `json:"target_id,omitempty"`
+	// AnchorAddr is the lightweight form of a punch sync: just the sender's current
+	// external address. A full Candidate may be carried instead, which also refreshes
+	// the egress pool and allocator facts.
+	AnchorAddr string       `json:"anchor_addr,omitempty"`
+	Members    []MemberInfo `json:"members,omitempty"`
+	Candidate  *Candidate   `json:"candidate,omitempty"`
+	User       string       `json:"user,omitempty"`
+	Nonce      string       `json:"nonce,omitempty"`
+	Proof      string       `json:"proof,omitempty"`
+	Error      string       `json:"error,omitempty"`
 }

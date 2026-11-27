@@ -92,6 +92,9 @@ type remote struct {
 	endpoint  string // actual remote UDP endpoint (IP:port)
 	key       []byte // per-pair data-plane AEAD key; nil means plaintext fallback
 	wgPub     string // peer's X25519 key, hex, as advertised in signaling
+	// info is the peer's most recent punching plan input, kept so a lightweight
+	// punch sync (an address only) can be merged instead of thrown away.
+	info punch.NATInfo
 	// wgApplied is the tunnel entry actually installed for this peer, or the
 	// zero value while none is. Comparing the whole entry -- not just the
 	// endpoint -- is what makes a rejoin under a fresh key take effect: the
@@ -669,6 +672,12 @@ func (s *Session) run(room string) {
 		_, s.ipnet, _ = net.ParseCIDR(n)
 	}
 	s.sig = sig
+	// A deployment configures its observation points once, on the server. They
+	// arrive after the first detection has already run, so they are folded into the
+	// configuration for every detection from here on -- the reconnect path included.
+	if extra := sig.STUNServers(); len(extra) > 0 {
+		s.cfg.STUNSecondaries = mergeCSV(s.cfg.STUNSecondaries, extra)
+	}
 	s.mu.Unlock()
 	s.emit(EventStateChanged, "", []byte(StateConnecting))
 
@@ -789,6 +798,9 @@ func (s *Session) run(room string) {
 	s.mu.Lock()
 	ph.IPv6Conn = s.ip6Conn
 	s.mu.Unlock()
+	// A peer we cannot reach is the one case where re-announcing pays: its retry
+	// loop is aiming at an address a re-dial may already have replaced.
+	ph.OnRefreshNeeded = func(peerID protocol.PeerID) { s.sendPunchSync(peerID) }
 	ph.OnState = func(id protocol.PeerID, t string, endpoint string) {
 		s.onPeerConnected(id, t, endpoint)
 	}
@@ -974,6 +986,86 @@ func (s *Session) probeIPv6() (net.PacketConn, *net.UDPAddr) {
 	return nil, nil
 }
 
+// sendPunchSync re-announces our current external address to a single peer through
+// the server. A CGNAT that re-dials changes its anchor mid-session, and a peer
+// still probing the old one has no way to learn better: candidates are only sent
+// when a node is first discovered. Targeted rather than broadcast, so a room does
+// not pay for one link's failure.
+func (s *Session) sendPunchSync(peerID protocol.PeerID) {
+	s.mu.Lock()
+	sig, closed := s.sig, s.closed
+	s.mu.Unlock()
+	if sig == nil || closed {
+		return
+	}
+	c := *s.buildCandidate()
+	c.PeerID = peerID.String()
+	_ = sig.Send(protocol.Message{
+		Type:      protocol.MsgPunchSync,
+		PeerID:    s.id.String(),
+		TargetID:  peerID.String(),
+		Candidate: &c,
+	})
+}
+
+// applyAnchor folds an address-only punch sync into what we already know about the
+// peer and re-plans. A peer that re-dials behind a CGNAT otherwise leaves us
+// hammering an address its carrier stopped using, with no signal to stop on.
+func (s *Session) applyAnchor(peerID, addr string) {
+	if peerID == "" || peerID == s.id.String() || addr == "" {
+		return
+	}
+	ua, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	r := s.peers[peerID]
+	ph := s.ph
+	if r == nil || ph == nil || (r.info.PublicAddr != nil && r.info.PublicAddr.String() == ua.String()) {
+		s.mu.Unlock()
+		return
+	}
+	info := r.info
+	info.PublicAddr = ua
+	r.info = info
+	s.mu.Unlock()
+	if id, perr := protocol.ParsePeerID(peerID); perr == nil {
+		s.debugf("p2p: peer " + peerID[:8] + " re-announced anchor " + addr + ", re-planning")
+		ph.AddPeer(id, info)
+	}
+}
+
+// mergeCSV joins two address lists into one comma string, dropping duplicates so a
+// server that advertises what the operator already configured does not probe twice.
+func mergeCSV(existing string, add []string) string {
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range splitCSV(existing) {
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	for _, p := range add {
+		if p = trimOne(p); p != "" && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return strings.Join(out, ",")
+}
+
+func trimOne(s string) string {
+	for len(s) > 0 && (s[0] == ' ' || s[0] == '	') {
+		s = s[1:]
+	}
+	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '	') {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
 // splitCSV trims a comma-separated list into non-empty tokens.
 func splitCSV(s string) []string {
 	if s == "" {
@@ -1000,8 +1092,11 @@ func (s *Session) onSignaling(m protocol.Message) error {
 	switch m.Type {
 	case protocol.MsgMembers:
 		s.syncMembers(m.Members)
-	case protocol.MsgCandidate:
+	case protocol.MsgCandidate, protocol.MsgPunchSync:
 		if m.Candidate == nil {
+			if m.Type == protocol.MsgPunchSync {
+				s.applyAnchor(m.PeerID, m.AnchorAddr)
+			}
 			return nil
 		}
 		s.onPeerCandidate(m)
@@ -1155,6 +1250,9 @@ func (s *Session) onPeerCandidate(m protocol.Message) {
 	if s.cfg.Debug && info.Type == stun.NatSymmetric && info.PoolCIDR == nil && len(info.CandidateIPs()) <= 1 {
 		s.debugf("p2p: peer " + sender + " is symmetric but exposes a single candidate IP; " +
 			"if punching fails, add more --stun-list observation points so its egress pool is enumerated")
+	}
+	if r != nil {
+		r.info = info
 	}
 	ph.AddPeer(senderID, info)
 	if needTunnel {

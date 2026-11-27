@@ -295,3 +295,14 @@ func TestCandidateCarriesGatewayMapping(t *testing.T) {
 		t.Fatalf("absent mapping decoded as %v", q.UPnPAddr)
 	}
 }
+
+// The server may advertise points the operator already configured by hand; probing
+// one twice halves the coverage the same budget could have bought.
+func TestMergeCSVDedupesServerSTUNList(t *testing.T) {
+	if got := mergeCSV("a:3478,b:3478", []string{"b:3478", " c:3478 ", ""}); got != "a:3478,b:3478,c:3478" {
+		t.Fatalf("merge produced %q", got)
+	}
+	if got := mergeCSV("", nil); got != "" {
+		t.Fatalf("empty inputs produced %q", got)
+	}
+}
