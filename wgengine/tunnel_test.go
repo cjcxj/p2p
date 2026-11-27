@@ -131,7 +131,7 @@ func dial(t testing.TB) *pair {
 	pa.Start()
 	pb.Start()
 
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(deliverBudget)
 	for time.Now().Before(deadline) {
 		ca, _ := pa.Connected(idB)
 		cb, _ := pb.Connected(idA)
@@ -179,6 +179,13 @@ func dial(t testing.TB) *pair {
 	}
 }
 
+// deliverBudget bounds how long a delivery may take before the test calls it a
+// failure. It is generous because `go test ./...` runs packages in parallel and
+// core/punch's simulated-network suites keep every core busy: on an idle machine
+// these handshakes complete in well under a second, and only the *never arrives*
+// case is a genuine failure.
+const deliverBudget = 30 * time.Second
+
 // addPeers configures both sides, electing the initiator from the two peer ids
 // exactly as the SDK does. Which side finishes configuring first is not ours to
 // choose, so initiatorFirst reproduces the unlucky ordering too.
@@ -213,7 +220,7 @@ func established(t testing.TB) *pair {
 	}
 	select {
 	case <-p.tunB.Outbound():
-	case <-time.After(10 * time.Second):
+	case <-time.After(deliverBudget):
 		t.Fatal("tunnel never delivered its first packet")
 	}
 	return p
@@ -249,12 +256,17 @@ func testTunnelPair(t *testing.T, initiatorFirst bool) {
 	var got []byte
 	select {
 	case got = <-p.tunB.Outbound():
-	case <-time.After(10 * time.Second):
+	case <-time.After(deliverBudget):
 		t.Fatal("no decrypted packet emerged: tunnel over the punched socket did not deliver")
 	}
 	up := time.Since(start)
 	t.Logf("first packet %v after the peers were configured", up)
-	if up > 2*time.Second {
+	// The budget is deliberately below WireGuard's own five-second retry: the
+	// regression this guards is a lost initiation that only recovers after that
+	// retry, which is what happens if both sides initiate at the same instant and
+	// destroy each other's pending initiation. It is not a latency SLA, so it stays
+	// under the retry rather than pretending to measure the network.
+	if up > 4*time.Second {
 		t.Errorf("first packet took %v: handshake did not complete on the first attempts", up)
 	}
 	if len(got) != len(want) {
@@ -273,7 +285,7 @@ func testTunnelPair(t *testing.T, initiatorFirst bool) {
 	select {
 	case <-p.tunB.Outbound():
 		t.Logf("established-path latency: %v", time.Since(injected))
-	case <-time.After(5 * time.Second):
+	case <-time.After(deliverBudget):
 		t.Fatal("second packet never arrived")
 	}
 
