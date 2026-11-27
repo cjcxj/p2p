@@ -408,6 +408,12 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config, round int) []Endpoint {
 			// pool is addressable by arithmetic instead of search. It is used only
 			// when STUN actually measured the property -- inventing an offset would
 			// spend the round budget on ports the peer is certainly not on.
+			//
+			// Assumption: the peer's pool sockets bind contiguously upward from the
+			// private port it announced. Our own clients do (sdk binds
+			// StepProbePort+i), so this needs no extra wire field; a third-party
+			// peer whose pool is scattered would need it to announce the ports
+			// themselves.
 			if peer.PortPreserve && peer.PrivateAddr != nil && peer.PublicAddr != nil {
 				count := cfg.PredictionSockets
 				if count <= 0 {
