@@ -1,0 +1,44 @@
+name: ci
+
+# The gate that cannot run on the development box: `go test -race` needs a C
+# toolchain, and the Windows workstation has none (CGO_ENABLED=0, no gcc/clang),
+# so every data race found so far came either from reading the code or from a
+# second machine. This makes that check objective for every push.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.5"
+          cache: true
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test (race detector)
+        run: go test -race -timeout 25m ./...
+
+      - name: cross-compile server/client for linux and windows
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          GOOS=linux   GOARCH=amd64 go build -o /tmp/p2p-linux   ./cmd/p2p
+          GOOS=linux   GOARCH=arm64 go build -o /tmp/p2p-arm64   ./cmd/p2p
+          GOOS=windows GOARCH=amd64 go build -o /tmp/p2p-win.exe ./cmd/p2p
+
+      - name: build the Go SDK for android/arm64 (no cgo needed for the pure-Go path)
+        env:
+          CGO_ENABLED: "0"
+          GOOS: android
+          GOARCH: arm64
+        run: go build ./sdk
