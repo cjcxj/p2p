@@ -3,7 +3,6 @@ package com.example.p2pdemo
 import android.widget.Toast
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -38,8 +37,6 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
-import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -245,6 +242,8 @@ private fun OverviewTab(state: MeshUiState) {
             InfoRow("房间", state.config.room)
             InfoRow("服务器", state.config.serverAddr)
             InfoRow("数据面", if (state.config.legacyMesh) "旧版逐包转发（A/B）" else "WireGuard 隧道")
+            InfoRow("传输模式", "纯直连打洞")
+            InfoRow("自定义 STUN", state.config.stunList.ifEmpty { "信令下发 / 内置多 STUN" })
         }
         SectionCard(title = "怎么用") {
             Hint("1. 另一台设备填同一个服务器地址和房间名接入。")
@@ -304,7 +303,7 @@ private fun PeerCard(row: PeerRow, selected: Boolean, onOpen: () -> Unit) {
             InfoRow("UDP 地址", row.endpoint)
             InfoRow("NAT", row.natType)
             if (!row.isDirect && row.connected) {
-                Hint("中继节点不进入隧道：隧道只走打洞成功的直连链路。")
+                Hint("等待直连打洞路径确认。")
             }
         }
     }

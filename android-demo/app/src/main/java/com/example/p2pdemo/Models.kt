@@ -13,6 +13,7 @@ data class ConnConfig(
     val token: String = "",
     val authUser: String = "",
     val authSecret: String = "",
+    val stunList: String = "",
     val debug: Boolean = true,
     val plaintext: Boolean = false,
     val legacyMesh: Boolean = false,
@@ -23,8 +24,11 @@ data class ConnConfig(
     fun toP2p(): Config {
         val cfg = Config()
         cfg.setServerAddr(serverAddr)
-        // 单端口服务器：信令 / STUN / 中继共用同一地址。
+        // One server address carries signalling and the primary STUN endpoint.
         cfg.setSTUNAddr(serverAddr)
+        // Observation points the user added by hand; the server may push more (see
+        // sdk), and both are merged without duplicates.
+        cfg.setSTUNSecondaries(stunList)
         cfg.setToken(token)
         cfg.setAuthUser(authUser)
         cfg.setAuthSecret(authSecret)

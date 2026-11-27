@@ -12,6 +12,7 @@ object Prefs {
     private const val KEY_TOKEN = "token"
     private const val KEY_USER = "user"
     private const val KEY_SECRET = "secret"
+    private const val KEY_STUN_LIST = "stun_list"
     private const val KEY_DEBUG = "debug"
     private const val KEY_PLAINTEXT = "plaintext"
     private const val KEY_LEGACY = "legacy_mesh"
@@ -25,6 +26,7 @@ object Prefs {
             token = p.getString(KEY_TOKEN, "").orEmpty().trim(),
             authUser = p.getString(KEY_USER, "").orEmpty().trim(),
             authSecret = p.getString(KEY_SECRET, "").orEmpty().trim(),
+            stunList = p.getString(KEY_STUN_LIST, "").orEmpty().trim(),
             debug = p.getBoolean(KEY_DEBUG, true),
             plaintext = p.getBoolean(KEY_PLAINTEXT, false),
             legacyMesh = p.getBoolean(KEY_LEGACY, false),
@@ -38,6 +40,7 @@ object Prefs {
             .putString(KEY_TOKEN, cfg.token.trim())
             .putString(KEY_USER, cfg.authUser.trim())
             .putString(KEY_SECRET, cfg.authSecret.trim())
+            .putString(KEY_STUN_LIST, cfg.stunList.trim())
             .putBoolean(KEY_DEBUG, cfg.debug)
             .putBoolean(KEY_PLAINTEXT, cfg.plaintext)
             .putBoolean(KEY_LEGACY, cfg.legacyMesh)

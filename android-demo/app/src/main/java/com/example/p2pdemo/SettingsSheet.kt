@@ -79,8 +79,20 @@ fun SettingsSheet(
                     value = draft.authSecret,
                     onChange = { draft = draft.copy(authSecret = it.trim()) },
                 )
+                TextField(
+                    label = "扩展 STUN 服务器（可选，逗号分隔）",
+                    value = draft.stunList,
+                    placeholder = "留空则使用信令下发与内置多 STUN",
+                    onChange = { draft = draft.copy(stunList = it.trim()) },
+                )
 
                 Spacer(Modifier.height(6.dp))
+
+                Text(
+                    text = "纯直连打洞模式（自动启用多 STUN / IPv6 / UPnP）",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
 
                 ToggleRow(
                     label = "详细打洞日志",

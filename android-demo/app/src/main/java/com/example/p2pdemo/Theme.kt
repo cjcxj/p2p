@@ -21,7 +21,7 @@ private val DarkScheme = darkColorScheme(
 )
 
 /**
- * 界面主题。Material3 的配色跟随深浅色，状态语义（直连绿 / 中继黄 / 错误红）
+ * 界面主题。Material3 的配色跟随深浅色，状态语义（直连绿 / 连接中黄 / 错误红）
  * 由组件自己给，保证在两种主题下含义一致。
  */
 @Composable
