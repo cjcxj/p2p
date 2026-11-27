@@ -96,6 +96,15 @@ type Candidate struct {
 	// VLAN a /21, and comparing the first three octets gets both wrong. Peers
 	// that predate this field simply fall back to the coarse comparison.
 	PrivateCIDRs []string `json:"private_cidrs,omitempty"`
+	// PortPreserve / PortPreserveOffset describe a measured port-preserving
+	// allocator: the peer can then compute our mapped port from our local one
+	// instead of searching for it. Omitted when the property was not measured.
+	PortPreserve       bool `json:"port_preserve,omitempty"`
+	PortPreserveOffset int  `json:"port_preserve_offset,omitempty"`
+	// PortBlockMin/PortBlockMax bound the allocation block our NAT was measured to
+	// hand ports from, letting a peer sweep that block instead of 1..65535.
+	PortBlockMin int `json:"port_block_min,omitempty"`
+	PortBlockMax int `json:"port_block_max,omitempty"`
 }
 
 // Message is the JSON-over-TCP wire frame exchanged over signaling.

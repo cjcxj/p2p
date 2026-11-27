@@ -1239,6 +1239,11 @@ func (s *Session) buildCandidate() *protocol.Candidate {
 		if len(det.LocalCIDRs) > 0 {
 			c.PrivateCIDRs = det.LocalCIDRs
 		}
+		// Allocator behaviour is only worth announcing when it was measured.
+		c.PortPreserve = det.PortPreserve
+		c.PortPreserveOffset = det.PortPreserveOffset
+		c.PortBlockMin = det.PortBlockMin
+		c.PortBlockMax = det.PortBlockMax
 		// enumerateLocalAddrs puts the primary first, and the primary already
 		// travels in PrivateAddr; the rest are the extra interfaces.
 		for _, a := range det.LocalAddrs {
@@ -1306,6 +1311,10 @@ func candidateToNAT(c *protocol.Candidate) (punch.NATInfo, error) {
 			info.ExtraPrivateAddrs = append(info.ExtraPrivateAddrs, ua)
 		}
 	}
+	info.PortPreserve = c.PortPreserve
+	info.PortPreserveOffset = c.PortPreserveOffset
+	info.PortBlockMin = c.PortBlockMin
+	info.PortBlockMax = c.PortBlockMax
 	return info, nil
 }
 

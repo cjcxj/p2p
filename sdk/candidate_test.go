@@ -217,11 +217,15 @@ func TestProductionPublishWireDecodeSpray(t *testing.T) {
 // instead of the bare-IP list in PublicAddr.
 func TestCandidateCarriesGatewayMapping(t *testing.T) {
 	det := &stun.Detection{
-		NATType:    stun.NatPortRestrictedCone,
-		MappedAddr: &net.UDPAddr{IP: net.ParseIP("203.0.113.44"), Port: 59804},
-		LocalAddr:  &net.UDPAddr{IP: net.ParseIP("192.168.1.45"), Port: 30000},
-		UPnPAddr:   &net.UDPAddr{IP: net.ParseIP("203.0.113.44"), Port: 41000},
-		LocalCIDRs: []string{"192.168.1.45/24", "10.7.3.23/29"},
+		NATType:            stun.NatPortRestrictedCone,
+		MappedAddr:         &net.UDPAddr{IP: net.ParseIP("203.0.113.44"), Port: 59804},
+		LocalAddr:          &net.UDPAddr{IP: net.ParseIP("192.168.1.45"), Port: 30000},
+		UPnPAddr:           &net.UDPAddr{IP: net.ParseIP("203.0.113.44"), Port: 41000},
+		LocalCIDRs:         []string{"192.168.1.45/24", "10.7.3.23/29"},
+		PortPreserve:       true,
+		PortPreserveOffset: 15000,
+		PortBlockMin:       44900,
+		PortBlockMax:       45200,
 		LocalAddrs: []*net.UDPAddr{
 			{IP: net.ParseIP("192.168.1.45"), Port: 30000},
 			{IP: net.ParseIP("10.7.3.23"), Port: 30000},
@@ -263,6 +267,14 @@ func TestCandidateCarriesGatewayMapping(t *testing.T) {
 	// already travels in PrivateAddr.
 	if len(info.ExtraPrivateAddrs) != 1 || info.ExtraPrivateAddrs[0].IP.String() != "10.7.3.23" {
 		t.Fatalf("extra private addresses = %v, want just the second interface", info.ExtraPrivateAddrs)
+	}
+	// Allocator behaviour has to survive the trip too, or the peer falls back to
+	// searching instead of aiming.
+	if !info.PortPreserve || info.PortPreserveOffset != 15000 {
+		t.Fatalf("port-preserve lost: %v/%d", info.PortPreserve, info.PortPreserveOffset)
+	}
+	if info.PortBlockMin != 44900 || info.PortBlockMax != 45200 {
+		t.Fatalf("allocation block lost: %d-%d", info.PortBlockMin, info.PortBlockMax)
 	}
 
 	// A peer that never got a mapping must not put an empty target in the plan.

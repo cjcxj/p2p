@@ -61,6 +61,19 @@ type Detection struct {
 	// port prediction needs: the increment is per binding, not per destination,
 	// so it can only be learned by creating several sockets.
 	PortStep int
+	// PortPreserve reports a port-preserving allocator: the public port keeps the
+	// same offset from the local source port, so a peer can compute our external
+	// port from the local one instead of searching. Measured, never assumed; false
+	// when the samples were too few or too scattered to conclude.
+	PortPreserve bool
+	// PortPreserveOffset is that constant mapped-minus-local port offset, valid
+	// only when PortPreserve is true.
+	PortPreserveOffset int
+	// PortBlockMin/PortBlockMax bound the block this NAT allocates ports inside
+	// (port-block allocation). Zero means no block was established; a narrow block
+	// is what makes a blind spray tractable: aim inside it instead of 1..65535.
+	PortBlockMin int
+	PortBlockMax int
 	// ObservedIPs is the set of distinct public IPv4 addresses this host was
 	// seen at across the primary and every alternate destination that answered
 	// (index 0 is the primary mapping). A CGNAT that rotates its egress address
@@ -80,6 +93,19 @@ type Detection struct {
 }
 
 // PublicAddr returns the mapped public address as a host:port string.
+// applyPattern folds the allocator measurement into the detection result. Each
+// field stays zero when the samples could not support it, so a peer never acts on
+// a guess that was never measured.
+func (d *Detection) applyPattern(pat PortPattern) {
+	d.PortStep = pat.PortStep
+	d.PortPreserve = pat.PortPreserve
+	d.PortPreserveOffset = pat.PortPreserveOffset
+	if len(pat.SamplePorts) >= 2 && pat.BlockMin > 0 && pat.BlockMax >= pat.BlockMin {
+		d.PortBlockMin = pat.BlockMin
+		d.PortBlockMax = pat.BlockMax
+	}
+}
+
 func (d *Detection) PublicAddr() string {
 	if d.MappedAddr == nil {
 		return ""
@@ -379,7 +405,7 @@ func (c *Client) Detect() (*Detection, error) {
 		d.NATType = NatSymmetric
 		d.Secondary = firstSec
 		d.PortDelta = delta
-		d.PortStep = c.measureStep()
+		d.applyPattern(c.measurePattern())
 		return d, nil
 	}
 	if answered {
@@ -403,6 +429,6 @@ func (c *Client) Detect() (*Detection, error) {
 	// makes a symmetric NAT get the wrong punching plan: report the ambiguity
 	// and let the strategy probe for both.
 	d.NATType = NatUnmeasurable
-	d.PortStep = c.measureStep()
+	d.applyPattern(c.measurePattern())
 	return d, nil
 }

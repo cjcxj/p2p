@@ -576,3 +576,66 @@ func TestDistinctPortsUnique(t *testing.T) {
 		t.Fatalf("0 ports should be nil")
 	}
 }
+func TestAlignPBABoundsSnapsToBRASBlocks(t *testing.T) {
+	// Narrow sample near the top of a 256-port block [49408..49663] (193*256).
+	lo, hi := alignPBABounds(49640, 49660)
+	if lo > 49408 || hi < 49663 {
+		t.Fatalf("expected 256-block coverage [49408..49663], got %d..%d", lo, hi)
+	}
+	// Wider sample spanning into a 512-port block [49152..49663] (96*512).
+	lo2, hi2 := alignPBABounds(49200, 49660)
+	if lo2 > 49152 || hi2 < 49663 {
+		t.Fatalf("expected 512-block coverage [49152..49663], got %d..%d", lo2, hi2)
+	}
+}
+
+// A measured port-preserving offset turns the search into arithmetic: the plan
+// must contain the whole predicted pool, and a narrow allocation block must be
+// swept instead of left to the blind spray.
+func TestPlanTargetsUsesMeasuredAllocatorBehaviour(t *testing.T) {
+	peer := NATInfo{
+		Type:               stun.NatSymmetric,
+		PublicAddr:         addr("1.2.3.4", 45000),
+		PrivateAddr:        addr("10.0.0.9", 30000),
+		PortPreserve:       true,
+		PortPreserveOffset: 15000,
+		PortBlockMin:       44900,
+		PortBlockMax:       45200,
+	}
+	cfg := Config{PredictionSockets: 4, SymmetricSpray: 16}
+	eps := planTargets(NATInfo{Type: stun.NatPortRestrictedCone}, peer, cfg, 0)
+
+	preserve, pba := 0, 0
+	for _, e := range eps {
+		switch e.Kind {
+		case "preserve":
+			preserve++
+			// privatePort 30000 + offset 15000 + k == 45000 + k
+			want := 30000 + 15000 + (preserve - 1)
+			if e.Addr.Port != want {
+				t.Fatalf("preserve target %d aimed at %d, want %d", preserve-1, e.Addr.Port, want)
+			}
+		case "pba":
+			pba++
+			if e.Addr.Port < 44900-64 || e.Addr.Port > 45200+256 {
+				t.Fatalf("pba target %d outside the announced block", e.Addr.Port)
+			}
+		}
+	}
+	if preserve != 4 {
+		t.Fatalf("preserve targets = %d, want one per pool socket", preserve)
+	}
+	if pba == 0 {
+		t.Fatal("a narrow announced allocation block produced no dense sweep targets")
+	}
+
+	// Without a measured property the plan must not invent one.
+	quiet := peer
+	quiet.PortPreserve = false
+	quiet.PortBlockMin, quiet.PortBlockMax = 0, 0
+	for _, e := range planTargets(NATInfo{Type: stun.NatPortRestrictedCone}, quiet, cfg, 0) {
+		if e.Kind == "preserve" || e.Kind == "pba" {
+			t.Fatalf("unmeasured allocator behaviour produced a %s target", e.Kind)
+		}
+	}
+}

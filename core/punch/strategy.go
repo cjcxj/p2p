@@ -42,7 +42,7 @@ const plantStaggerDiv = 8
 // Endpoint is one address the punch engine will probe.
 type Endpoint struct {
 	Addr   *net.UDPAddr
-	Kind   string // "lan","public","upnp","predicted","block","plant","spray"
+	Kind   string // "lan","public","upnp","predicted","block","plant","preserve","pba","spray"
 	Order  int
 	Socket int // index into Punch.Conns; 0 = primary
 }
@@ -59,6 +59,18 @@ type NATInfo struct {
 	ExtraPrivateAddrs []*net.UDPAddr
 	PortDelta         int
 	PortStep          int
+	// PortPreserve says this peer's NAT keeps a constant offset between the local
+	// source port and the mapped port, and PortPreserveOffset is that offset. When
+	// it holds, every socket in the peer's pool lands on a port we can compute
+	// rather than search, which is the difference between a few hundred aimed
+	// probes and a blind spray.
+	PortPreserve       bool
+	PortPreserveOffset int
+	// PortBlockMin/PortBlockMax bound the block this peer's allocator hands ports
+	// from (port block allocation). Zero means not established. A narrow block
+	// turns a blind 1..65535 search into a dense sweep of a few hundred ports.
+	PortBlockMin int
+	PortBlockMax int
 	// PublicIPs are additional distinct public addresses this peer was seen at
 	// across multiple STUN observation points (a destination-rotating CGNAT).
 	// Empty for ordinary NATs; the spray leg aims at all of them plus
@@ -123,6 +135,32 @@ func (n NATInfo) CandidateIPs() []net.IP {
 // outside it stays unreachable no matter how many rounds run. Rotating the
 // window by one budget per round covers the whole block in total/budget rounds.
 // Observed addresses always come first and are never displaced by rotation.
+// safety margin inside [1024..65535].
+func alignPBABounds(minP, maxP int) (int, int) {
+	lo := minP - 32
+	hi := maxP + 128
+	for _, blockSize := range []int{256, 512, 1024} {
+		bLo := (minP / blockSize) * blockSize
+		bHi := bLo + blockSize - 1
+		if maxP <= bHi {
+			if bLo < lo {
+				lo = bLo
+			}
+			if bHi > hi {
+				hi = bHi
+			}
+			break
+		}
+	}
+	if lo < 1024 {
+		lo = 1024
+	}
+	if hi > 65535 {
+		hi = 65535
+	}
+	return lo, hi
+}
+
 func (n NATInfo) SprayIPs(max, round int) []net.IP {
 	out := n.CandidateIPs()
 	if n.PoolCIDR == nil {
@@ -354,6 +392,26 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config, round int) []Endpoint {
 					order++
 				}
 			}
+			// A measured port-preserving offset is the strongest bet available:
+			// the peer's pool socket k maps to privatePort+offset+k, so the whole
+			// pool is addressable by arithmetic instead of search. It is used only
+			// when STUN actually measured the property -- inventing an offset would
+			// spend the round budget on ports the peer is certainly not on.
+			if peer.PortPreserve && peer.PrivateAddr != nil && peer.PublicAddr != nil {
+				count := cfg.PredictionSockets
+				if count <= 0 {
+					count = 64
+				}
+				for k := 0; k < count; k++ {
+					port := peer.PrivateAddr.Port + peer.PortPreserveOffset + k
+					if port < 1 || port > 65535 {
+						continue
+					}
+					addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: port}
+					eps = append(eps, Endpoint{Addr: addr, Kind: "preserve", Order: order, Socket: 0})
+					order++
+				}
+			}
 			if hardMy && cfg.PredictionSockets > 1 {
 				for k := 1; k < cfg.PredictionSockets; k++ {
 					eps = append(eps, Endpoint{Addr: peer.PublicAddr, Kind: "plant", Order: order, Socket: k})
@@ -382,6 +440,33 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config, round int) []Endpoint {
 						eps = append(eps, Endpoint{Addr: addr, Kind: "block", Order: order, Socket: 0})
 						order++
 					}
+				}
+			}
+			// Port block allocation: when the allocator was measured to hand ports
+			// from a narrow block, sweep that block densely. The phase rotates per
+			// round so a stride-thinned sweep still covers everything within
+			// stride rounds, while each round stays inside the packet budget.
+			if peer.PublicAddr != nil && peer.PortBlockMax > peer.PortBlockMin &&
+				peer.PortBlockMax-peer.PortBlockMin <= 2048 {
+				lo, hi := alignPBABounds(peer.PortBlockMin, peer.PortBlockMax)
+				if lo < 1 {
+					lo = 1
+				}
+				if hi > 65535 {
+					hi = 65535
+				}
+				span := hi - lo + 1
+				stride := 1
+				if span > 384 {
+					stride = span / 256
+					if stride < 1 {
+						stride = 1
+					}
+				}
+				for p := lo + round%stride; p <= hi; p += stride {
+					addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: p}
+					eps = append(eps, Endpoint{Addr: addr, Kind: "pba", Order: order, Socket: 0})
+					order++
 				}
 			}
 			if hardPeer {

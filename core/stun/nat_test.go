@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -335,4 +336,82 @@ func TestCoveringPoolIPStableSymmetric(t *testing.T) {
 	if pool := d.CoveringPool(); pool != nil {
 		t.Fatalf("single egress IP must not announce a pool, got %s", pool)
 	}
+}
+
+func findFreePortBlock(t *testing.T, start, count int) int {
+	t.Helper()
+	for base := start; base < 32000-count; base += count {
+		var conns []*net.UDPConn
+		ok := true
+		for i := 0; i < count; i++ {
+			c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: base + i})
+			if err != nil {
+				ok = false
+				break
+			}
+			conns = append(conns, c)
+		}
+		for _, c := range conns {
+			c.Close()
+		}
+		if ok {
+			return base
+		}
+	}
+	return start
+}
+
+func TestAnalyzeAllocationPatterns(t *testing.T) {
+	startDynamicSTUN := func(t *testing.T, mapper func(srcPort int) int) *net.UDPAddr {
+		t.Helper()
+		conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		go func() {
+			buf := make([]byte, 2048)
+			for {
+				n, src, err := conn.ReadFromUDP(buf)
+				if err != nil {
+					return
+				}
+				msg, err := Decode(buf[:n])
+				if err != nil || msg.Type != BindingRequest {
+					continue
+				}
+				resp := NewBindingSuccess(msg.TID)
+				resp.SetXORMappedAddress(net.IPv4(127, 0, 0, 1), mapper(src.Port))
+				conn.WriteToUDP(resp.Encode(), src)
+			}
+		}()
+		return conn.LocalAddr().(*net.UDPAddr)
+	}
+
+	t.Run("port preserving with offset", func(t *testing.T) {
+		base := findFreePortBlock(t, 24000, 4)
+		srv := startDynamicSTUN(t, func(srcPort int) int { return srcPort + 1000 })
+		pat := AnalyzeAllocation(srv, base, 4, 300*time.Millisecond)
+		if !pat.PortPreserve || pat.PortPreserveOffset != 1000 {
+			t.Fatalf("expected PortPreserve offset +1000, got %+v", pat)
+		}
+	})
+
+	t.Run("linear port step and PBA block", func(t *testing.T) {
+		base := findFreePortBlock(t, 24100, 4)
+		var seq atomic.Int32
+		seq.Store(0)
+		// Note: concurrent goroutines might arrive out of order, so base on
+		// srcPort delta for deterministic step simulation.
+		srv := startDynamicSTUN(t, func(srcPort int) int {
+			return 45000 + (srcPort-base)*25
+		})
+		pat := AnalyzeAllocation(srv, base, 4, 300*time.Millisecond)
+		if pat.PortStep != 25 {
+			t.Fatalf("expected PortStep 25, got %+v", pat)
+		}
+		if pat.BlockMin != 45000 || pat.BlockMax != 45075 {
+			t.Fatalf("expected PBA block 45000..45075, got %d..%d", pat.BlockMin, pat.BlockMax)
+		}
+	})
 }
