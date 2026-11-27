@@ -1,7 +1,6 @@
-// RunServer runs the all-in-one P2P server on a single port: signaling
-// (TCP) plus STUN (UDP) share the same port number, with an optional
-// best-effort STUN secondary socket on port+1 for richer NAT detection.
-// Pure P2P: the server does signaling and STUN only, never relays data.
+// RunServer runs the pure-P2P single signaling server: TCP signaling plus
+// optional UDP STUN on the same port and configurable multi-STUN server list
+// pushed to every joining peer.
 package cli
 
 import (
@@ -23,15 +22,39 @@ func RunServer(args []string) int {
 	fs := flag.NewFlagSet("p2p server", flag.ExitOnError)
 	port := fs.Int("port", 8080, "single service port (TCP signaling + UDP STUN)")
 	verbose := fs.Bool("verbose", false, "log room membership and signaling events")
+	fs.BoolVar(verbose, "v", false, "shorthand for --verbose")
+	stunServers := fs.String("stun-servers", "", "comma-separated STUN server list pushed to clients")
 	stunIP2 := fs.String("stun-ip2", "", "optional secondary IP for full-cone detection")
-	stunSecondary := fs.Bool("stun-secondary", false, "also bind STUN on port+1 for richer NAT detection (firewall must open it)")
+	stunSecondary := fs.Bool("stun-secondary", false, "also bind STUN on port+1 for richer NAT detection")
 	network := fs.String("network", "10.9.0.0/24", "virtual subnet for per-room address allocation (0.0.0.0/0 disables)")
-	secret := fs.String("secret", "", "shared pre-shared key for mutual client/server authentication")
-	users := fs.String("users", "", "per-user credentials 'user:pass,user2:pass2' (enables per-user auth)")
+	secret := fs.String("secret", "", "shared pre-shared key for client/server authentication")
+	users := fs.String("users", "", "per-user credentials 'user:pass,user2:pass2'")
 	maxConnsPerIP := fs.Int("max-conns-per-ip", 0, "max concurrent signaling connections per source IP (0 = unlimited)")
 	maxRoomMembers := fs.Int("max-room-members", 0, "max members per room (0 = unlimited)")
-	tlsCert := fs.String("tls-cert", "", "TLS certificate file (PEM); enables TLS signaling")
-	tlsKey := fs.String("tls-key", "", "TLS private key file (PEM); requires --tls-cert")
+	tlsCert := fs.String("tls-cert", "", "TLS certificate file (PEM)")
+	tlsKey := fs.String("tls-key", "", "TLS private key file (PEM)")
+	fs.Usage = func() {
+		fmt.Println(`p2p server — run single signaling + STUN server (pure P2P)
+
+usage:
+  p2p server [options]
+
+common options:
+  --port <n>               service port for TCP signaling + UDP STUN (default 8080)
+  --stun-servers <a,b>     comma-separated extra STUN servers pushed to clients
+  --secret <s>             shared room/server pre-shared key
+  --network <cidr>         virtual subnet per room (default 10.9.0.0/24; 0.0.0.0/0 disables)
+  --verbose, -v            log membership and signaling events
+
+security & multi-stun options:
+  --users <u:p,...>        per-user credentials
+  --stun-secondary         also bind STUN on port+1
+  --stun-ip2 <ip>          optional secondary IP for full-cone detection
+  --tls-cert <file>        TLS certificate (PEM)
+  --tls-key <file>         TLS private key (PEM)
+  --max-conns-per-ip <n>   per-IP signaling limit (0 = unlimited)
+  --max-room-members <n>   per-room member limit (0 = unlimited)`)
+	}
 	fs.Parse(args)
 
 	logger := log.New(os.Stdout, "[p2p-server] ", log.LstdFlags)
@@ -49,19 +72,16 @@ func RunServer(args []string) int {
 		logger.Printf("signaling TLS enabled")
 	}
 
-	// ---- Shared UDP socket: STUN + relay ----
+	// ---- UDP STUN socket (pure P2P mode) ----
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{Port: *port})
 	if err != nil {
 		logger.Fatalf("udp: %v", err)
 	}
 	defer udpConn.Close()
-
-	logger.Printf("STUN UDP on :%d (ensure UDP %d is open on the firewall)", *port, *port)
+	logger.Printf("STUN UDP on :%d (pure P2P direct mode)", *port)
 
 	// Optional best-effort secondary STUN socket on port+1 (enables the
-	// change-port test and symmetric detection when reachable; not required
-	// for basic operation). Off by default so the service binds a single
-	// port.
+	// change-port test and symmetric detection when reachable).
 	var secondary *net.UDPConn
 	if *stunSecondary {
 		if sec, err := net.ListenUDP("udp", &net.UDPAddr{Port: *port + 1}); err == nil {
@@ -84,8 +104,14 @@ func RunServer(args []string) int {
 		}
 	}
 
-	// ---- Signaling (TCP) ----
+	advertisedSTUNs := parseSTUNServers(*stunServers)
+	if len(advertisedSTUNs) > 0 {
+		logger.Printf("advertising multi-STUN list: %s", strings.Join(advertisedSTUNs, ", "))
+	}
+
+	// ---- Single Signaling Server (TCP) ----
 	sigSrv, err := signaling.NewServer(fmt.Sprintf("0.0.0.0:%d", *port), signaling.Options{
+		STUNServers:    advertisedSTUNs,
 		Network:        *network,
 		Secret:         *secret,
 		Users:          parseUsers(*users),
@@ -102,9 +128,9 @@ func RunServer(args []string) int {
 	logger.Printf("signaling TCP on :%d", *port)
 	logger.Printf("virtual network: %s", sigSrv.Network())
 
-	// ---- Shared socket STUN loop ----
+	// ---- UDP STUN loop ----
 	go func() {
-		buf := make([]byte, 65536)
+		buf := make([]byte, 2048)
 		for {
 			n, src, err := udpConn.ReadFromUDP(buf)
 			if err != nil {
@@ -116,7 +142,6 @@ func RunServer(args []string) int {
 					stun.AnswerBinding(udpConn, secondary, ip2Conn, msg, src)
 				}
 			}
-			// else: drop unknown traffic (pure P2P: no relay to forward to)
 		}
 	}()
 
@@ -125,6 +150,20 @@ func RunServer(args []string) int {
 	<-quit
 	logger.Printf("shutting down")
 	return 0
+}
+
+func parseSTUNServers(spec string) []string {
+	if spec == "" {
+		return nil
+	}
+	var out []string
+	for _, entry := range strings.Split(spec, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry != "" {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 // parseUsers parses "user:pass,user2:pass2" into a map.
