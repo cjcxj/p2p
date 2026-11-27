@@ -313,8 +313,18 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 				}
 				port := peer.PublicAddr.Port + offset
 				if port >= 1 && port <= 65535 {
-					addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: port}
+					// The probes stay on socket 0 because that is the external the
+					// peer's plant mapping aimed at. But firing the SAME guess once per
+					// socket repeated one destination PredictionSockets times -- the
+					// first packet told us everything the rest did. Walk consecutive
+					// ports from the offset guess instead, so the same budget covers a
+					// window and the verbose log stops carrying N identical targets.
 					for k := 0; k < cfg.PredictionSockets; k++ {
+						p := port + k
+						if p < 1 || p > 65535 {
+							continue
+						}
+						addr := &net.UDPAddr{IP: peer.PublicAddr.IP, Port: p}
 						eps = append(eps, Endpoint{Addr: addr, Kind: "block", Order: order, Socket: 0})
 						order++
 					}

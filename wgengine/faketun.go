@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -22,10 +23,15 @@ type FakeTUN struct {
 	// raw hands Write's slice to the reader instead of a copy, so benchmarks
 	// count WireGuard's allocations rather than the test double's. Only safe for
 	// consumers that look at the packet before the device recycles the buffer.
-	raw bool
+	// Atomic because the device's read loop reads it on every Write while a test
+	// turns it on from its own goroutine.
+	raw atomic.Bool
 }
 
 var _ tun.Device = (*FakeTUN)(nil)
+
+// SetRaw switches Write to hand out the device's own buffer instead of a copy.
+func (f *FakeTUN) SetRaw(on bool) { f.raw.Store(on) }
 
 func NewFakeTUN(mtu int) *FakeTUN {
 	if mtu <= 0 {
@@ -75,7 +81,7 @@ func (f *FakeTUN) Write(bufs [][]byte, offset int) (int, error) {
 			continue
 		}
 		pkt := buf[offset:]
-		if !f.raw {
+		if !f.raw.Load() {
 			pkt = append([]byte(nil), pkt...)
 		}
 		select {

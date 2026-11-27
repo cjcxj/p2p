@@ -85,10 +85,12 @@ func TestPlanTargetsBlockSprayNoStep(t *testing.T) {
 	if len(block) != 5 {
 		t.Fatalf("want 5 block endpoints, got %d", len(block))
 	}
-	wantPort := 40000 + defaultPeerPortOffset
-	for _, e := range block {
-		if e.Addr.Port != wantPort || e.Addr.IP.String() != "1.2.3.4" {
-			t.Fatalf("block endpoint aimed at %s, want 1.2.3.4:%d", e.Addr, wantPort)
+	base := 40000 + defaultPeerPortOffset
+	for i, e := range block {
+		// The leg walks a window from the offset guess: N targets must cover N
+		// distinct ports, not one port N times.
+		if e.Addr.Port != base+i || e.Addr.IP.String() != "1.2.3.4" {
+			t.Fatalf("block endpoint %d aimed at %s, want 1.2.3.4:%d", i, e.Addr, base+i)
 		}
 		// Step 1 fix: a cone(easy)-side probe must come from socket 0, since the
 		// peer's plant mapping was aimed at socket-0's external; packets from
@@ -176,10 +178,10 @@ func TestPlanTargetsBlockFiresWhenLocalHard(t *testing.T) {
 	block := 0
 	for _, e := range eps {
 		if e.Kind == "block" {
-			block++
-			if e.Addr.Port != 40000+defaultPeerPortOffset {
-				t.Fatalf("block aim %s", e.Addr)
+			if e.Addr.Port != 40000+defaultPeerPortOffset+block {
+				t.Fatalf("block aim %s, want port %d", e.Addr, 40000+defaultPeerPortOffset+block)
 			}
+			block++
 		}
 	}
 	if block != 6 {

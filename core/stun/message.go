@@ -168,10 +168,17 @@ func Decode(b []byte) (*Message, error) {
 
 // encodeAddr builds a MAPPED-ADDRESS style value.
 func encodeAddr(family byte, ip net.IP, port uint16) []byte {
-	v := make([]byte, 4+ipLen(ip))
+	n := ipLen(ip)
+	v := make([]byte, 4+n)
 	v[1] = family
 	binary.BigEndian.PutUint16(v[2:4], port)
-	copy(v[4:], ip.To4())
+	// To4() is nil for an IPv6 address, so copying it there would silently emit
+	// sixteen zero bytes of address.
+	if n == 4 {
+		copy(v[4:], ip.To4())
+	} else {
+		copy(v[4:], ip.To16())
+	}
 	return v
 }
 
@@ -182,29 +189,48 @@ func ipLen(ip net.IP) int {
 	return 16
 }
 
+// addrFamily is the STUN address family byte for ip.
+func addrFamily(ip net.IP) byte {
+	if ip.To4() == nil {
+		return 0x02
+	}
+	return 0x01
+}
+
+// xorMask returns the XOR-MAPPED-ADDRESS mask: the 32-bit magic cookie for IPv4
+// (RFC 5389), and cookie || six zero bytes || transaction-id for IPv6
+// (RFC 6338). The two differ, and third-party STUN servers use the RFC form, so
+// a mask our own decoder happens to share is not enough.
+func xorMask(tid []byte) []byte {
+	key := make([]byte, 16)
+	binary.BigEndian.PutUint32(key[0:4], MagicCookie)
+	copy(key[8:], tid)
+	return key
+}
+
 // SetMappedAddress appends a MAPPED-ADDRESS attribute.
 func (m *Message) SetMappedAddress(ip net.IP, port int) *Message {
-	v := encodeAddr(0x01, ip, uint16(port))
+	v := encodeAddr(addrFamily(ip), ip, uint16(port))
 	return m.Add(AttrMappedAddress, v)
 }
 
 // SetXORMappedAddress appends an XOR-MAPPED-ADDRESS attribute.
 func (m *Message) SetXORMappedAddress(ip net.IP, port int) *Message {
-	ip = ip.To4()
-	if ip == nil {
-		ip = ip.To16()
+	n := ipLen(ip)
+	addr := ip.To4()
+	if n == 16 {
+		addr = ip.To16()
+	}
+	if len(addr) == 0 {
+		return m
 	}
 	p := uint16(port) ^ uint16(MagicCookie>>16)
-	family := byte(0x01)
-	if len(ip) == 16 {
-		family = 0x02
-	}
-	v := make([]byte, 4+len(ip))
-	v[1] = family
+	v := make([]byte, 4+n)
+	v[1] = addrFamily(ip)
 	binary.BigEndian.PutUint16(v[2:4], p)
-	xorKey := [4]byte{byte((MagicCookie >> 24) & 0xff), byte((MagicCookie >> 16) & 0xff), byte((MagicCookie >> 8) & 0xff), byte(MagicCookie & 0xff)}
-	for i := 0; i < len(ip); i++ {
-		v[4+i] = ip[i] ^ xorKey[i%4]
+	key := xorMask(m.TID[:])
+	for i := range addr {
+		v[4+i] = addr[i] ^ key[i]
 	}
 	return m.Add(AttrXORMappedAddress, v)
 }
@@ -248,9 +274,9 @@ func parseAddr(v []byte, xor bool, tid []byte) (*net.UDPAddr, error) {
 	ip := make(net.IP, alen)
 	copy(ip, v[4:4+alen])
 	if xor {
-		key := [4]byte{byte((MagicCookie >> 24) & 0xff), byte((MagicCookie >> 16) & 0xff), byte((MagicCookie >> 8) & 0xff), byte(MagicCookie & 0xff)}
-		for i := 0; i < len(ip); i++ {
-			ip[i] ^= key[i%4]
+		key := xorMask(tid)
+		for i := range ip {
+			ip[i] ^= key[i]
 		}
 	}
 	return &net.UDPAddr{IP: ip, Port: int(port)}, nil
