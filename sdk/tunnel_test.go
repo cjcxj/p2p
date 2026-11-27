@@ -235,7 +235,6 @@ func TestSDKTunnelAdoptsFreshKeyOnRejoin(t *testing.T) {
 	a, b, tunA, _ := punchedPair(t)
 
 	stalePub := b.buildCandidate().X25519Pub
-
 	// B comes back with a fresh key on the same socket, hence the same endpoint.
 	b.CloseTUN()
 	key, err := newDataKey()

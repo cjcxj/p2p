@@ -71,10 +71,10 @@ fun PeerDetailScreen(
                 InfoRow("传输", row.transport)
             }
 
-            if (!row.isDirect && row.connected) {
-                Hint("中继节点不进入 WireGuard 隧道：隧道只走打洞成功的直连链路。")
-            } else if (row.isDirect) {
+            if (row.isDirect) {
                 Hint("直连成功：流量在两端点对点加密传输，不经服务器。")
+            } else {
+                Hint("纯直连打洞中：打洞成功且连通后流量将自动进入点对点 WireGuard 隧道。")
             }
 
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {

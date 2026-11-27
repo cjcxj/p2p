@@ -1,13 +1,13 @@
 // Package p2p is the application-facing SDK. It hides NAT detection, hole
-// punching and signaling behind a small connect/send/event API that is also
-// bindable to Android via gomobile. Pure P2P: there is no relay fallback.
+// punching and signaling behind a simple connect/send/event API that is also
+// bindable to Android via gomobile.
 package p2p
 
 // Config controls a Session. All addresses are "host:port" strings.
 type Config struct {
-	// ServerAddr is the signaling server address.
+	// ServerAddr is the single signaling server address ("host:port").
 	ServerAddr string
-	// STUNAddr is the STUN server address used for NAT detection.
+	// STUNAddr is the primary STUN server address (defaults to ServerAddr).
 	STUNAddr string
 	// Token is an optional room secret required to join the room.
 	Token string
@@ -15,101 +15,76 @@ type Config struct {
 	// AuthUser is an optional username for per-user server authentication.
 	AuthUser string
 	// AuthSecret is the shared secret (or the user's password when AuthUser
-	// is set) used for mutual authentication with the server. When empty the
-	// client connects to an open server.
+	// is set) used for mutual authentication with the server.
 	AuthSecret string
 
 	// PortPrediction enables symmetric-NAT port prediction.
 	PortPrediction bool
-	// EnableLAN allows same-LAN direct connections.
+	// EnableLAN allows same-LAN direct connections across all local interfaces.
 	EnableLAN bool
-	// Debug enables verbose hole-punching flow logs (delivered as
-	// EventDebug).
+	// EnableIPv6 attempts dual-stack IPv6 STUN discovery and direct punching.
+	EnableIPv6 bool
+	// EnableUPnP attempts NAT-PMP / PCP / UPnP IGD port mapping when available.
+	EnableUPnP bool
+	// Debug enables verbose hole-punching flow logs (delivered as EventDebug).
 	Debug bool
 
-	// TLS enables TLS for the signaling connection. TLSServerName and
-	// TLSInsecureSkipVerify configure the client TLS handshake.
-	TLS bool
-	// TLSServerName overrides the TLS ServerName (usually the DNS name in
-	// the server certificate).
-	TLSServerName string
-	// TLSInsecureSkipVerify disables certificate verification. Intended for
-	// self-signed certificates in trusted/internal deployments only.
+	// TLS enables TLS for the signaling connection.
+	TLS                   bool
+	TLSServerName         string
 	TLSInsecureSkipVerify bool
 
-	// Plaintext disables data-plane encryption for performance testing. Both
-	// ends must set it; traffic will not be encrypted end-to-end.
+	// Plaintext disables data-plane encryption for performance testing.
 	Plaintext bool
 
 	// LegacyMesh keeps the retired mesh data plane for TUN traffic instead of
-	// the WireGuard tunnel. It exists only to A/B the two paths on real
-	// hardware and mobile; leave it false unless comparing.
+	// the WireGuard tunnel.
 	LegacyMesh bool
 
-	// TimeoutSec bounds the whole connection attempt (default 15).
+	// TimeoutSec bounds the initial connection attempt (default 15).
 	TimeoutSec int
-	// ProbeIntervalMs is the delay between probe bursts (default 200).
+	// ProbeIntervalMs is the delay between probe bursts (default 60).
 	ProbeIntervalMs int
-	// PunchTimeoutMs is how long to keep punching a peer before giving up
-	// (default 4000).
+	// PunchTimeoutMs is kept for compatibility (default 4000).
 	PunchTimeoutMs int
-	// PredictionSockets is the number of UDP source sockets used for the
-	// symmetric-NAT block spray (n4-style). 0 disables the socket pool;
-	// 1 = primary socket only. Values > 1 bind a contiguous local port block
-	// and, against a hard (symmetric/unmeasurable) peer, aim every socket at
-	// the peer's public port + PeerPortOffset, betting the NAT preserves the
-	// local port. This needs no peer PortStep, so it reaches a cellular
-	// CGNAT the step path cannot. Default (via Defaults): 25.
+	// PredictionSockets is the number of UDP source sockets in the pool for
+	// NAT4 plant/prediction legs (default 256).
 	PredictionSockets int
-	// PeerPortOffset shifts the block spray off the peer's reported public
-	// port (n4 "-o", default 20). Must be < PredictionSockets so the aim
-	// lands inside the local block.
+	// PeerPortOffset shifts the deterministic block spray off the peer's
+	// reported public port (default 20).
 	PeerPortOffset int
-	// SymmetricSpray is how many random ports the cone side fires per round at
-	// a hard peer's public IP (paired with the hard side's plant leg -- the
-	// birthday attack that connects a cellular CGNAT). 0 = SDK default (1024).
+	// SymmetricSpray is how many unique ports per round the easy side draws
+	// without replacement toward a hard peer (default 512).
 	SymmetricSpray int
-	// SprayIPMax bounds how many distinct public addresses the cone side sprays
-	// when a hard peer announces its CGNAT egress pool (a CIDR block inferred
-	// from its sampled STUN addresses). 0 = SDK default (64).
+	// SprayIPMax caps distinct public IPs sprayed per round when a peer
+	// announces an inferred CGNAT PoolCIDR (default 64).
 	SprayIPMax int
-	// PunchPPS caps probe packets sent per second per peer during punching. It
-	// is a safety limit: an unthrottled wide CGNAT spray saturates the host NIC
-	// and overflows the router's NAT conntrack table, taking the whole network
-	// down. 0 = SDK default (1500).
+	// PunchPPS caps probe packet rate per second (default 1500).
 	PunchPPS int
-	// EscalateAfterMs is how long a peer classified as cone may fail to connect
-	// before the engine re-plans it as hard (plant+spray). This recovers a
-	// symmetric CGNAT that was flakily misdetected as cone, which otherwise
-	// strands the link on a single public probe. 0 = engine default (3000).
+	// EscalateAfterMs is how long a soft/cone-classified peer may fail to
+	// connect before escalating to hard plant+spray (default 2000).
 	EscalateAfterMs int
-	// STUNSecondaries is a comma-separated list of extra observation addresses
-	// ("host:port,host:port") used to discover the destination-rotating CGNAT
-	// candidate public IPs. Empty uses the built-in DefaultSecondaries. Set this
-	// per deployment to STUN servers that are actually reachable from your
-	// network/region -- the hole-punch generalization depends on the candidate
-	// set covering the egress IP the peer direction uses, so region-appropriate
-	// observation points matter.
+	// STUNSecondaries is a comma-separated list of extra STUN observation
+	// points merged with any STUN list pushed by the signaling server.
 	STUNSecondaries string
 }
 
-// Defaults returns a Config with the recommended values filled in.
+// Defaults returns a Config tuned for pure-P2P NAT3<->NAT4 hole punching.
 func Defaults() *Config {
 	return &Config{
 		PortPrediction:    true,
 		EnableLAN:         true,
+		EnableIPv6:        true,
+		EnableUPnP:        true,
 		TimeoutSec:        15,
-		ProbeIntervalMs:   200,
+		ProbeIntervalMs:   60,
 		PunchTimeoutMs:    4000,
-		// 128 plant sockets: at 25 the cone peer only had ~25 mappings to collide
-		// with against a 256-port blind window (~9.4%/round), which left a ~17s
-		// tail on real cellular CGNATs. 128 raises per-round hit rate to ~40-53%,
-		// pulling the tail into 2-4s. PunchPPS caps the rate so the larger pool
-		// cannot flood the NIC/router.
-		PredictionSockets: 128,
+		PredictionSockets: 256,
 		PeerPortOffset:    20,
-		SymmetricSpray:    1024,
+		SymmetricSpray:    512,
+		SprayIPMax:        64,
 		PunchPPS:          1500,
+		EscalateAfterMs:   2000,
 	}
 }
 
@@ -122,9 +97,18 @@ func (c *Config) applyDefaults() {
 		c.TimeoutSec = 15
 	}
 	if c.ProbeIntervalMs <= 0 {
-		c.ProbeIntervalMs = 200
+		c.ProbeIntervalMs = 60
 	}
 	if c.PunchTimeoutMs <= 0 {
 		c.PunchTimeoutMs = 4000
+	}
+	if c.SprayIPMax <= 0 {
+		c.SprayIPMax = 64
+	}
+	if c.PunchPPS <= 0 {
+		c.PunchPPS = 1500
+	}
+	if c.EscalateAfterMs <= 0 {
+		c.EscalateAfterMs = 2000
 	}
 }

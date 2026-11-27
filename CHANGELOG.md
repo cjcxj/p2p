@@ -1,22 +1,16 @@
 # Changelog
 
-## v0.28 (2026-11-25)
-- **出口池通告：把「侥幸采样到正确 IP」变成确定命中**。按目的地换出口的运营商 CGNAT 只会把它出口块里的**少数几个**地址露给 STUN，而**它朝某个对端真正使用的那个地址往往不在采样集里**——现场样本里 STUN 探到 4 个地址，对端方向的第 5 个始终采不到；这不是观测点不够多能解决的（选哪个出口由运营商按目的地决定，单服务器没有足够落点，加 STUN 也只是继续采样到同一簇的几个）。改法：硬端把自己全部采样地址（含主映射）的**最长公共前缀**算成一个 CIDR 通告出去——`stun.Detection.CoveringPool()`，样本不足 2 个 IPv4、或 LCP 短于 `/20`（簇太散不像同一个运营商块）一律返回 nil **不通告**，绝不甩出荒谬的范围。token 拼在 `Candidate.PublicAddr` 的逗号串尾部，因此**旧服务器逐字转发、不需要重新部署**，旧 peer 按 IP 解析失败就自动忽略，属于纯增量。cone 侧 `punch.NATInfo.SprayIPs(cfg.SprayIPMax)` 先把采样地址照旧喷一遍（通告只**加宽**目标集，绝不替代），再把整块展开，块内地址数受 `Config.SprayIPMax`（默认 64）封顶，防止一个误通告的 `/24` 把生日攻击乘成洪水。放开目标数的代价是算得出来的：`64 × 1024` 就是六万多个目标一轮，所以这条改动必须和下面的 `PunchPPS` 一起看，而不是单独调大。
-- **`--punch-pps`（默认 1500）是安全底线，不是性能选项**：目标集变成「候选 IP 块 × 端口窗口」之后一轮就是几万个目标，不限速地猛灌会**打穿家用路由器的 NAT 会话表和网卡 TX**——实测发生过，代价是整网断连而不是本应用变慢。现在 `probeLoop` 按 `1/pps` 的时隙逐个下发（`nextSend` 递增调度，等待时同时监听 `done` 与 `stop`，所以限速不会变成「停不下来的发包循环」）。EasyTier 级的硬对称打洞也就几千 pps、几秒内命中，限速不损成功率；`scripts/nat34-check.sh` 默认带 `--pps 800`。
-- **误判自愈 `--escalate-ms`（默认 3000）**：蜂窝对称 NAT 的「第二个目的地」探测有时会重复返回同一映射，于是被判成 cone，而 cone 计划只给一个公网目标、**永不重掷**——一次误判就把链路永久困在中继上。现在软计划跑满 3 秒仍未连通就重新规划成 hard（plant + spray），并且**把本机自己也按对称对待**：本机自己误判成 cone 时从来不会 plant，对端就只有一个外部端口可撞，两侧都可能抽风所以两侧都要兜。真正是 cone 的网络此刻早就连上了，升级只多花一点受限速保护的流量，换来「分类偶发错误不再等于永久失败」。离线复现：`TestNat34EscalatesMisdetectedCone` 1.57s 命中。
-- **修掉一个反直觉的目标 socket**：`predicted` 与 `block` 两条腿原来按 socket 池轮转发送（`Socket: k`），可是对端 plant 的时候瞄准的是**主 socket 的公网端口**——从其它 socket 发出的探测会被对端那个映射的过滤器直接丢弃，发得越卖力越像在干活，实际一条都到不了。现在这两条腿固定走 `Socket: 0`，只有 plant 腿（本机自己是硬端、需要铺开自己的映射）才使用池。
-- `nat-check` 新增 `egress pool:` 一行，直接打印本机将要通告的出口块；配合 `candidates` 就能判断「对端有没有可能覆盖到它的真实出口」，不用等打洞失败再猜。`scripts/nat34-check.sh` 把这行收进诊断输出，排障建议也从「加更多 STUN」改成看 `egress pool` 是否出现。
-- 测试：现场样本（换出口的蜂窝 CGNAT 与只换端口的 IP-stable 对称 NAT）直接喂给**生产函数** `CoveringPool` 并断言前缀；补 `buildCandidate` → 线上字节 → `candidateToNAT` → `SprayIPs` 的完整往返（不手搓中间结构）。`core/punch/nat34_test.go` 里 NAT3↔NAT4 的「采样未覆盖 + 有通告」实测 0.26s 建立直连，8 IP 大池 2.36s；负向对照「未采样 + 无通告」8.01s 仍打不通（证明命中来自通告的块而不是过滤被绕过）。**NAT4↔NAT4 只按 best-effort 断言**（两端都是严格对称过滤＝双重生日碰撞，6 次里偶有 1 次不中），不声称必通；验收目标 NAT3↔NAT4 才是被严格保证的那条。
+## v0.28 (2026-11-27)
+- **彻底纯直连化（移除 `core/relay` 中继子系统）**：全面下线服务端与客户端中继代码、`MsgRelayGrant`、`RelayEnabled` 与 `TransportRelay`，单信令服务器仅承担房间信令与 STUN 探测并可下发多 STUN 列表。
+- **修复断线重连死锁（上游 `63b4f05`）**：对端重启/重入触发 `AddPeer` 时彻底清零旧连接/端点/tier 状态；`sdk` 改用完整 `wgApplied`（公钥+端点）判定并清理过期 WireGuard peer；`wgengine` 握手重试增加 `peerSpec` 校验防止回写旧路径；补充 `core/punch/rejoin_test.go` 与 `sdk`/`wgengine` 回归测试。
+- **修复多节点列表崩溃（上游 `d173698`）**：`Session.memberList()` 按 `PeerID` 确定性排序避免 `MemberAt(i)` 索引错乱，Android `MeshController` 增加 `distinctBy` 去重，修复 2 个以上节点时 `LazyColumn` key 冲突崩溃。
+- **Android Demo 3.1 升级（上游 `0827cea`）**：底部导航栏 + 横滑分页、新增 `PeerDetailScreen` 节点详情页、支持 `keystore.properties` 发布签名，同时保留多 STUN 扩展配置与 192/512/1500 调优。
 
-## v0.27 (2026-11-24)
-- **多候选 IP 宽喷不再被 socket 池开关顺带关掉**：`planTargets()` 的「硬对称」分支整体挂在 `PredictionSockets > 1` 上，而 `--punch-sockets 0`（关池）会把这个分支一起跳过——可宽喷那条腿**只用主 socket**，恰恰是打穿「按目的地轮换出口 IP」的 CGNAT 的唯一手段。现在 plant / block / step 对角线这三条池相关的腿各自按池大小门控，宽喷无条件规划。回归用例 `TestPlanTargetsSprayWithoutPool`。
-- **对端报了 PortStep 也照样宽喷**：step 对齐的前提是出口 IP 稳定，轮换型 CGNAT 不满足，所以对称对端即使测出 step，step 对角线也只能当**额外一份赌注**，不再作为独占分支把宽喷顶掉（原逻辑 `else if` 就是这个互斥）。反向保护 `TestPlanTargetsConeStepDiagonal`：双方都是 cone 且测出 step 时仍走廉价对角线，不做宽喷。
-- **认不出来的 NAT 一律按硬对称处理**：新增 `isHardNAT()`，把 `unknown` / `blocked` 与 `symmetric` / `unmeasurable` 同等对待。之前分类含糊会掉进 cone 快路径，等于**悄悄丢掉了对称 NAT 本来需要的遍历**，最后无声退回中继；现在是失败安全地走激进路径（plant+spray 是 cone 的超集， cone 对端仍会被普通公网目标打通，不亏）。同时删掉 `PortPrediction` 那条单 socket 的 PortDelta 老式扫描分支，池化的 plant+spray 已覆盖。
-- **一个 `--stun-list` 条目可以贡献多个观测点**：新增 `stun.ResolveAllUDPAddr()`，把主机名的每条 IPv4 A 记录都当成独立目的地去探测（多宿主 / 负载均衡的公共 STUN 一个条目就能多枚举几个出口），`secondaryAddrs()` 随之去重。IPv4 字面量原样返回、不依赖 DNS（`adb shell` 那类无解析器环境不受影响），解析失败回退单地址解析，只会更好不会更坏。运维含义：与其逼用户抄一堆 IP，不如给一个多 A 记录的域名。
-- **`nat-check` 补上同一套能力**：以前只有 `connect` / `mesh` 认 `-stun-list`，现在 `nat-check` 也认，并新增一行 `candidates: [...]` 打印本机在该组观测点下暴露的全部公网出口 IP。调网络时先看这个数字：**candidates 只有 1 个**要么是真 cone（没事），要么是轮换 CGNAT 没被现有 STUN 列表枚举到（需要加观测点）。
-- **对称对端只有一个候选 IP 时给可执行提示**：SDK debug 日志会明确说「该对端是 symmetric 但只暴露一个候选出口，若退回中继请为它所在网络加 `--stun-list` 观测点」，把「打不通是玄学」变成有指向性的下一步。
-- **真机验证工具**：新增 `scripts/nat34-check.sh`（两台机器各自跑同一个 `--server`/`--room`，逐轮报本机 NAT 类型、是否 `connected via punched`、建连耗时、命中并取胜的对端端点、候选 IP 数；把「某一次侥幸成功」变成 N/N 的成功率账）与 `scripts/cloud-symtest.sh`（在云服务器上用一个临时 netns + `MASQUERADE --random-fully` 造出**真·按目的地轮换端口**的对称 NAT，和另一个真实网络的 cone 客户端跨公网做 NAT3↔NAT4，不需要手机）。**前提：做 SNAT 的那台机器不能同时是信令/STUN 服务器**——命名空间里的客户端发往宿主机自身公网 IP 的包会被本地投递、不从 `eth0` 出，`MASQUERADE -o eth0` 永不触发，测到的是回环而不是端口轮换（Docker 同理），所以要么信令另起一台主机，要么这一侧仍得用真设备。后者会动共享主机的 netfilter：作用域限定在专用链和 veth 子网，并由 `trap cleanup EXIT` 必回滚，脚本头部写明「先读再跑」。**两个脚本都不落任何管理端点**——SSH 主机与端口只能从参数或 `P2P_SSH` / `P2P_SSH_PORT` 环境变量传入。
-- 测试：新增 `core/punch/nat34_test.go`（纯内存 NAT3↔NAT4 模型驱动**真实** Punch 引擎，带负向对照——对端出口 IP 不在候选集内时必须打不通，证明宽喷是真命中了轮换地址，而不是严格过滤被绕过）以及 `ResolveAllUDPAddr` / 候选枚举 / 上述三条策略门控的用例。
+## v0.27 (2026-11-26)
+- **纯直连架构 + 单信令多 STUN 下发**：`p2p server --stun-servers` 支持向加入客户端下发多 STUN 观测列表并与客户端 `--stun-list` 合并并发探测。
+- **ICE 路径分级与只升不降切换**：按 `LAN > IPv6 > UPnP > Public` 严格定级；低档直连确认后在 `upgradeProbeWindow`（3s）内继续探测更高档候选，命中即平滑升级 WireGuard 端点并触发 `EventPathChanged`，延迟到达的低档包永不覆盖高档路径；修复快速回环/Windows 时钟粒度下的 0ns RTT 边界与 `Seq=0` 保活污染。
+- **NAT3 ↔ NAT4 增强与稳态限流**：合并 BRAS PBA 端口块对齐、端口步长/保持预测、`256` 池错峰保活刷新（`round>=2` 每轮只刷批次，避免打爆 CGNAT 配额）、CGNAT `CoveringPool` 加权无放回喷射（热 IP 满 512 窗口优先，冷 IP 保底 128 端口/轮，不饿死未采样出口）、误判超时自动双端升级，并将默认探测速率收敛为 `1500 pps`。
+- **CLI 易用性重构**：新增 `p2p up <server[:port]> <room>` / `p2p join`（默认开启 WireGuard TUN，`--no-tun` 退回控制台）及 `p2p://` URL 支持；参数可置于位置参数之后；分层展示 `--help` 常用选项与 `--help-advanced` 底层参数，并保留 `connect`/`mesh`/`p2p-server`/`p2p-client` 100% 向后兼容；打洞/接入日志增加挂钟时间戳。
 
 ## v0.26 (2026-11-23)
 - **修复 NAT 类型误判**：对称判定要往「第二个目的地」发一次 STUN，代码写的是 `server 端口+1`；而实际部署的信令+STUN+中继只监听一个 UDP 端口（腾讯云安全组也只放行了 8080），那次探测必然无应答，于是**任何 NAT 都被记成 `port_restricted_cone`**——对称 NAT 拿不到 `PortDelta`、也永远不会触发对称策略。现在备选目的地列表为「服务端 port+1 + 公网 STUN（`stun.miwifi.com:3478`、`stun1.l.google.com:19302`）」逐个实测：同一个 socket 在两个目的地拿到不同映射即判 `symmetric` 并测出 delta，拿到同一映射才判 `port_restricted_cone`，全都无应答则新增 `unmeasurable`（不再当作 cone 蒙）。`Detection.Method()` 把判据本身暴露出来，`nat-check` 与 SDK debug 日志都会打印「第二个目的地 X 给出的映射不同/相同」。

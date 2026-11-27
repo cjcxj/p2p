@@ -1,27 +1,14 @@
 #!/usr/bin/env bash
-# nat34-check.sh — measure NAT3(port-restricted cone) <-> NAT4(symmetric) hole-punch
-# success across ANY two networks, on a SINGLE signaling server.
-#
-# Run this on BOTH machines at the same time, pointing at the same --server and
-# the same --room base. Each machine reports its own NAT type, whether it reached
-# a DIRECT punched link (vs relay), time-to-direct, and the peer address/ports
-# that actually won -- which shows whether the multi-STUN candidate set covered
-# the peer-direction egress IP.
-#
-# The whole point of the configurable multi-STUN: --stun-list lets you add public
-# observation points so the destination-rotating CGNAT candidate pool is
-# enumerated. More diverse, reachable STUNs -> better coverage -> higher success
-# on networks where a handful of IPs is not enough.
+# nat34-check.sh — measure pure-direct NAT3(port-restricted cone) <-> NAT4(symmetric)
+# hole-punch success across real networks using a single signaling server.
 #
 # Usage:
-#   ./nat34-check.sh -s 1.2.3.4:8080 -r demo -n 10 \
-#       -b ./bin/p2p \
-#       --stuns "74.125.250.129:19302,111.206.174.2:3478,stun.miwifi.com:3478"
-#
-# -n trials  -w max-seconds-per-trial  --spray <ports/ip>  --sockets <pool>
+#   ./scripts/nat34-check.sh -s 1.2.3.4:8080 -r demo -n 10 \
+#       -b ./bin/p2p-linux \
+#       --stuns "stun.miwifi.com:3478,stun.chat.bilibili.com:3478"
 set -u
 
-SERVER="" ROOM="demo" TRIALS=10 MAXW=25 BIN="./bin/p2p" STUNS="" SPRAY="" SOCKETS="" PPS="800"
+SERVER="" ROOM="demo" TRIALS=10 MAXW=25 BIN="./bin/p2p-linux" STUNS="" SPRAY="" SOCKETS="" PPS="1500"
 while [ $# -gt 0 ]; do
   case "$1" in
     -s) SERVER="$2"; shift 2;;
@@ -39,22 +26,20 @@ done
 
 if [ -z "$SERVER" ]; then echo "need -s <server:port>"; exit 2; fi
 if [ ! -x "$BIN" ] && ! command -v "$BIN" >/dev/null 2>&1; then
-  echo "p2p binary not found/executable: $BIN"; exit 2; fi
+  echo "p2p binary not found/executable: $BIN"; exit 2
+fi
 
 OUT="nat34-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT"
 
-# Diagnostic preamble: how many candidate egress IPs does THIS network expose to
-# the configured STUN observation points? A single candidate means either a cone
-# (fine) or a rotating CGNAT that the current STUN list did NOT enumerate -- the
-# latter is the #1 cause of NAT3<->NAT4 failing on a stubborn network; add more
-# diverse --stuns until candidates > 1 and the egress is covered.
 echo "=== local NAT + candidate enumeration (this network) ==="
-"$BIN" nat-check -server "$SERVER" ${STUNS:+-stun-list "$STUNS"} 2>&1 | tr -d '\000' | grep -aE "NAT type|public|candidates|egress pool|port step|evidence" | sed 's/^/  /'
+"$BIN" nat-check -server "$SERVER" ${STUNS:+-stun-list "$STUNS"} 2>&1 \
+  | tr -d '\000' \
+  | grep -aE "NAT type|public|egressIPs|egressPool|port step|port preserve|PBA block|IPv6|UPnP|evidence" \
+  | sed 's/^/  /'
 echo
 
 pass=0; times=""; hitips=""
-
 killbin() { pkill -f "$(basename "$BIN") connect" 2>/dev/null || true; }
 
 for i in $(seq 1 "$TRIALS"); do
@@ -68,7 +53,6 @@ for i in $(seq 1 "$TRIALS"); do
   [ -n "$PPS" ]     && args+=(-punch-pps "$PPS")
   "$BIN" "${args[@]}" >"$log" 2>&1 &
   pid=$!
-
   start=$(date +%s); status="timeout"; ttp=""
   while [ $(( $(date +%s) - start )) -le "$MAXW" ]; do
     if grep -q "connected via punched" "$log" 2>/dev/null; then
@@ -76,26 +60,17 @@ for i in $(seq 1 "$TRIALS"); do
     fi
     sleep 1
   done
-
   nat=$(grep -oE "NAT [a-z_]+" "$log" 2>/dev/null | head -1)
-  hit=$(grep -oE "from [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+ -> connected via punched" "$log" 2>/dev/null | head -1 | sed -E 's/ ->.*//')
-  ncan=$(grep -oE "candidate|candidates" "$log" 2>/dev/null | head -1)
+  hit=$(grep -oE "from [^ ]+ -> connected via punched" "$log" 2>/dev/null | head -1 | sed -E 's/ ->.*//')
   [ "$status" = punched ] && pass=$((pass+1))
   [ -n "$ttp" ] && times="$times $ttp"
   [ -n "$hit" ] && hitips="$hitips\"$hit\""
-
   echo "trial $i: room=$room | $status ${ttp:+(${ttp}s)} | local=$nat | win-hit=$hit"
   kill $pid 2>/dev/null; killbin; sleep 1
 done
 
 echo "======================================================"
-echo "NAT3<->NAT4 punch success: $pass/$TRIALS"
+echo "Pure-direct NAT3<->NAT4 punch success: $pass/$TRIALS"
 [ -n "$times" ] && echo "time-to-direct (s):$times"
 [ -n "$hitips" ] && echo "winning peer addresses:$hitips"
-echo "logs in $OUT/  -- attach this dir when reporting a network to me."
-echo "If success < N/N: the 'egress pool' line shows the block the peer announced"
-echo "(derived from its sampled STUN addresses). A symmetric peer with a SINGLE"
-echo "candidate and no pool means the STUN list did not enumerate its rotation --"
-echo "add more reachable, route-diverse --stuns so candidates > 1 and a /NN pool"
-echo "appears; the cone side then sprays the whole block, not just the sampled IPs."
-echo "PPS is capped at $PPS/s by default so a wide pool spray cannot flood the router."
+echo "logs saved in $OUT/"

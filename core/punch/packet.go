@@ -20,12 +20,10 @@ const Magic = 0x504E4348 // "PNCH"
 
 // Packet types.
 const (
-	PktProbe    uint8 = 1
-	PktAck      uint8 = 2
-	PktData     uint8 = 3
-	PktRegister uint8 = 4
-	PktRegAck   uint8 = 5
-	PktProbe2   uint8 = 6
+	PktProbe  uint8 = 1
+	PktAck    uint8 = 2
+	PktData   uint8 = 3
+	PktProbe2 uint8 = 6
 )
 
 // packetHeaderLen is the fixed part of every packet (magic,type,seq,src,dst,len).

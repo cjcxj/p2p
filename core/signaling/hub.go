@@ -19,9 +19,9 @@ type member struct {
 
 // Room tracks members sharing a coordination context.
 type Room struct {
-	id        string
-	token     string
-	network   *net.IPNet
+	id      string
+	token   string
+	network *net.IPNet
 	usedIP    map[string]bool
 	mu        sync.Mutex
 	members   map[string]*member
@@ -58,9 +58,9 @@ func (h *Hub) join(roomID, token string, m *member, network *net.IPNet) (vip str
 	r, ok := h.rooms[roomID]
 	if !ok {
 		r = &Room{
-			id:        roomID,
-			token:     token,
-			network:   network,
+			id:      roomID,
+			token:   token,
+			network: network,
 			usedIP:    make(map[string]bool),
 			members:   make(map[string]*member),
 		}

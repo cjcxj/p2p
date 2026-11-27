@@ -31,13 +31,11 @@ class MainActivity : AppCompatActivity() {
         cfg.token = token
         cfg.portPrediction = true
         cfg.enableLan = true
-        // Hard-symmetric birthday attack: as the CGNAT (hard) side the phone
-        // PLANTS one mapping per pool socket at the peer's advertised port so
-        // the cone peer's wide random SPRAY can collide with one; PeerPortOffset
-        // keeps n4's cheap bet for port-preserving NATs.
-        cfg.predictionSockets = 25L
+        cfg.enableIpv6 = true
+        cfg.enableUpnp = true
+        cfg.predictionSockets = 96L
         cfg.peerPortOffset = 20L
-        cfg.symmetricSpray = 1024L
+        cfg.symmetricSpray = 256L
 
         session = Session(cfg, object : Listener {
             override fun onEvent(event: Long, peerID: String, data: ByteArray) {
@@ -68,7 +66,7 @@ class MainActivity : AppCompatActivity() {
                 if (peerIP == peerID) peerIP = null
             }
             P2p.EventPeerConnected -> {
-                // data 为 "punched" 或 "relay"
+                // data 为 "punched"
                 statusText.text = "已连通 $peerID via ${String(data)}"
             }
             P2p.EventData -> {

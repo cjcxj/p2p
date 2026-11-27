@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
 )
@@ -70,11 +71,17 @@ type Bind struct {
 
 	pool sync.Pool
 
-	mu        sync.Mutex
-	open      bool
-	closeCh   chan struct{}
-	rx        chan ingress
-	localPort uint16
+	mu         sync.Mutex
+	open       bool
+	closeCh    chan struct{}
+	rx         chan ingress
+	localPort  uint16
+	recentInit map[netip.AddrPort]cachedInit
+}
+
+type cachedInit struct {
+	pkt []byte
+	at  time.Time
 }
 
 var _ conn.Bind = (*Bind)(nil)
@@ -111,14 +118,124 @@ func (b *Bind) Ingest(pkt []byte, from *net.UDPAddr) {
 	if from == nil || len(from.IP) == 0 {
 		return
 	}
-	addr, ok := netip.AddrFromSlice(from.IP.To4())
+	var addr netip.Addr
+	var ok bool
+	if ip4 := from.IP.To4(); ip4 != nil {
+		addr, ok = netip.AddrFromSlice(ip4)
+	} else {
+		addr, ok = netip.AddrFromSlice(from.IP.To16())
+	}
 	if !ok {
 		return
+	}
+	ap := netip.AddrPortFrom(addr, uint16(from.Port))
+	// Cache the latest WireGuard Handshake Initiation (type 1, 148 bytes) briefly
+	// so AddPeer can replay it if the initiation arrived just before the peer
+	// was configured. WireGuard's TAI64N anti-replay ignores duplicates if it
+	// already processed the initiation.
+	if len(pkt) == 148 && pkt[0] == 1 {
+		b.cacheInit(ap, pkt)
 	}
 	ptr := b.pool.Get().(*[]byte)
 	n := copy(*ptr, pkt)
 	select {
-	case b.rx <- ingress{buf: *ptr, n: n, from: netip.AddrPortFrom(addr, uint16(from.Port))}:
+	case b.rx <- ingress{buf: *ptr, n: n, from: ap}:
+	default:
+		b.pool.Put(ptr)
+	}
+}
+
+func (b *Bind) cacheInit(ap netip.AddrPort, pkt []byte) {
+	cp := append([]byte(nil), pkt...)
+	now := time.Now()
+	b.mu.Lock()
+	if b.recentInit == nil {
+		b.recentInit = make(map[netip.AddrPort]cachedInit)
+	}
+	if len(b.recentInit) >= 32 {
+		for k, v := range b.recentInit {
+			if now.Sub(v.at) > 5*time.Second {
+				delete(b.recentInit, k)
+			}
+		}
+		for len(b.recentInit) >= 32 {
+			var oldestK netip.AddrPort
+			var oldestAt time.Time
+			first := true
+			for k, v := range b.recentInit {
+				if first || v.at.Before(oldestAt) {
+					oldestK = k
+					oldestAt = v.at
+					first = false
+				}
+			}
+			delete(b.recentInit, oldestK)
+		}
+	}
+	b.recentInit[ap] = cachedInit{pkt: cp, at: now}
+	b.mu.Unlock()
+}
+
+// ForgetInitiation discards any cached handshake initiation for endpointStr so
+// a removed or superseded peer cannot be replayed an initiation its predecessor
+// already consumed.
+func (b *Bind) ForgetInitiation(endpointStr string) {
+	ap, err := netip.ParseAddrPort(endpointStr)
+	if err != nil {
+		return
+	}
+	ap = netip.AddrPortFrom(ap.Addr().WithZone(""), ap.Port())
+	b.mu.Lock()
+	if b.recentInit != nil {
+		delete(b.recentInit, ap)
+	}
+	b.mu.Unlock()
+}
+
+func (b *Bind) forgetInitAddr(from *net.UDPAddr) {
+	if from == nil || len(from.IP) == 0 {
+		return
+	}
+	var addr netip.Addr
+	var ok bool
+	if ip4 := from.IP.To4(); ip4 != nil {
+		addr, ok = netip.AddrFromSlice(ip4)
+	} else {
+		addr, ok = netip.AddrFromSlice(from.IP.To16())
+	}
+	if !ok {
+		return
+	}
+	ap := netip.AddrPortFrom(addr, uint16(from.Port))
+	b.mu.Lock()
+	if b.recentInit != nil {
+		delete(b.recentInit, ap)
+	}
+	b.mu.Unlock()
+}
+
+// ReplayInitiation re-injects a recently received WireGuard handshake initiation
+// from endpointStr, if any, so a peer configured slightly after the initiator
+// started handshaking can answer immediately.
+func (b *Bind) ReplayInitiation(endpointStr string) {
+	ap, err := netip.ParseAddrPort(endpointStr)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	b.mu.Lock()
+	c, ok := b.recentInit[ap]
+	if ok {
+		delete(b.recentInit, ap)
+	}
+	b.mu.Unlock()
+	if !ok || now.Sub(c.at) > 5*time.Second {
+		return
+	}
+	ptr := b.pool.Get().(*[]byte)
+	n := copy(*ptr, c.pkt)
+	select {
+	case b.rx <- ingress{buf: *ptr, n: n, from: ap}:
 	default:
 		b.pool.Put(ptr)
 	}
@@ -175,6 +292,12 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	sender := b.sender
 	b.mu.Unlock()
 	for _, buf := range bufs {
+		// Once wireguard-go emits a Handshake Response (type 2) to addr, the
+		// cached initiation has already been consumed and must not be replayed
+		// if the peer is later removed and re-added.
+		if len(buf) >= 4 && buf[0] == 2 && buf[1] == 0 && buf[2] == 0 && buf[3] == 0 {
+			b.forgetInitAddr(addr)
+		}
 		if sender != nil {
 			if err := sender(buf, addr); err != nil {
 				return err

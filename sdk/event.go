@@ -19,8 +19,8 @@ const (
 	// EventDebug: data carries a verbose hole-punching flow message (only
 	// when Config.Debug is enabled).
 	EventDebug = 7
-	// EventPathChanged: an already-connected peer switched transport; data
-	// carries the new transport ("punched").
+	// EventPathChanged: an already-connected peer switched endpoint/tier; data
+	// carries the transport ("punched").
 	EventPathChanged = 8
 )
 
@@ -33,7 +33,7 @@ const (
 )
 
 // Transports reported through EventPeerConnected. Pure P2P: a connected peer is
-// reached by a punched direct link only -- there is no relay transport.
+// reached by a punched direct link only.
 const (
 	TransportPunched = "punched"
 )

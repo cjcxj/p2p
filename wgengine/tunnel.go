@@ -102,6 +102,7 @@ func (t *Tunnel) AddPeer(pubHex, endpoint, vip string, initiator bool) error {
 	if err := t.addPeer(pubHex, endpoint, vip, initiator); err != nil {
 		return err
 	}
+	t.bind.ReplayInitiation(endpoint)
 	if initiator {
 		go t.recoverHandshake(pubHex, endpoint, vip)
 	}
@@ -184,11 +185,17 @@ func (t *Tunnel) handshook(pubHex string) bool {
 
 // RemovePeer drops a peer that has left the room.
 func (t *Tunnel) RemovePeer(pubHex string) error {
+	t.mu.Lock()
+	spec, hasSpec := t.specs[pubHex]
+	t.mu.Unlock()
 	err := t.dev.IpcSet("public_key=" + pubHex + "\nremove=true\n")
 	if err == nil {
 		t.mu.Lock()
 		delete(t.specs, pubHex)
 		t.mu.Unlock()
+		if hasSpec && spec.endpoint != "" {
+			t.bind.ForgetInitiation(spec.endpoint)
+		}
 	}
 	return err
 }

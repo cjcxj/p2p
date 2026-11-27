@@ -5,7 +5,9 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
@@ -25,12 +27,17 @@ func RunClient(args []string) int {
 		return 2
 	}
 	switch args[0] {
+	case "up", "join":
+		return runUp(args[1:])
 	case "nat-check":
 		return runNatCheck(args[1:])
 	case "connect":
 		return runConnect(args[1:])
 	case "mesh":
 		return runMesh(args[1:])
+	case "--help-advanced":
+		ClientAdvancedUsage()
+		return 0
 	case "-h", "--help", "help":
 		ClientUsage()
 		return 0
@@ -41,60 +48,359 @@ func RunClient(args []string) int {
 }
 
 func ClientUsage() {
-	fmt.Println(`p2p client
+	fmt.Println(`p2p client — pure-P2P direct mesh networking
 
-usage:
-  p2p client nat-check --server <host:port>
-  p2p client connect --server <host:port> --stun <host:port> --room <id> [options]
-  p2p client mesh --server <host:port> --stun <host:port> --room <id> [options]
+quickstart:
+  p2p up <server[:port]> <room> [options]
+  p2p up p2p://<server[:port]>/<room> [options]
+  p2p nat-check <server[:port]>
 
-compatibility (also accepted):
-  p2p nat-check --server <host:port>
-  p2p connect --server <host:port> --stun <host:port> --room <id> [options]
-  p2p mesh --server <host:port> --stun <host:port> --room <id> [options]
+commands:
+  up, join   join virtual network with WireGuard TUN enabled (default)
+  nat-check  diagnose local NAT type and carrier egress pool
+  mesh       virtual network console (--tun optional; legacy compatibility)
+  connect    raw probe/text mode (legacy compatibility)
 
-options:
-  --token <t>      room secret
-  --user <u>       username for server authentication
-  --secret <s>     shared secret / password for server authentication
-  --no-predict     disable symmetric-NAT port prediction
-  --no-lan         disable same-LAN shortcut
-  --no-encrypt     experimental: disable data-plane encryption (both ends)
-  --timeout <sec>  connect timeout
-  --verbose        show detailed hole-punching flow logs
-  --tls            enable TLS for the signaling connection
-  --tls-server-name <n>  TLS ServerName override
-  --tls-insecure   skip TLS certificate verification (self-signed only)
-  --tun            (mesh) create a TUN device and route OS traffic
-  --mtu <n>        (mesh) TUN MTU, default 1280
-  --userspace-stack (mesh) experimental: handle inbound TCP in userspace and forward to 127.0.0.1:same-port
-  --legacy-mesh    (mesh) experimental: route --tun traffic through the retired mesh bridge instead of the WireGuard tunnel`)
+common options:
+  --server <host:port>   signaling server (or pass positionally)
+  --room <id>            room name (or pass positionally)
+  --secret <s>           shared room/server password
+  --token <t>            room token (optional)
+  --user <u>             username for server authentication
+  --stun-list <a,b>      extra comma-separated STUN servers
+  --mtu <n>              TUN MTU (default 1280)
+  --no-tun               (up) disable OS TUN device and run text console
+  --tun                  (mesh) create WireGuard TUN device
+  --tls                  enable TLS for signaling
+  --timeout <sec>        connect timeout in seconds (default 15)
+  --verbose, -v          show detailed punching logs
+  --help-advanced        show low-level NAT4 tuning & experimental flags`)
+}
+
+func ClientAdvancedUsage() {
+	fmt.Println(`p2p client — advanced & experimental options
+
+NAT traversal & STUN tuning:
+  --stun <host:port>        primary STUN server (default: --server)
+  --punch-sockets <n>       socket pool size for symmetric NAT4 (default 256, 0=off)
+  --sym-spray <n>           unique ports sprayed per round by cone peer (default 512)
+  --spray-ip-max <n>        max public IPs sprayed per round across CGNAT pool (default 64)
+  --punch-pps <n>           outbound probe rate limit in packets/sec (default 1500)
+  --escalate-ms <ms>        ms before cone peer escalates to plant+spray (default 2000)
+  --peer-port-offset <n>    block spray offset from peer public port (default 20)
+  --no-predict              disable symmetric-NAT port prediction
+  --no-lan                  disable same-LAN shortcut
+  --no-ipv6                 disable dual-stack IPv6 probing
+  --no-upnp                 disable UPnP/NAT-PMP/PCP mapping
+
+TLS & experimental:
+  --tls-server-name <name>  TLS ServerName override
+  --tls-insecure            skip TLS certificate verification (self-signed only)
+  --no-encrypt              disable data-plane encryption (both ends must set)
+  --legacy-mesh             use retired per-packet mesh bridge instead of WireGuard
+  --userspace-stack         (legacy-mesh) forward inbound TCP to 127.0.0.1:same-port`)
+}
+
+// ensurePort appends defaultPort if hostPort does not already specify a port.
+func ensurePort(hostPort, defaultPort string) string {
+	hostPort = strings.TrimSpace(hostPort)
+	if hostPort == "" || defaultPort == "" {
+		return hostPort
+	}
+	if _, _, err := net.SplitHostPort(hostPort); err == nil {
+		return hostPort
+	}
+	if strings.Contains(hostPort, ":") && !strings.HasPrefix(hostPort, "[") {
+		return "[" + hostPort + "]:" + defaultPort
+	}
+	return hostPort + ":" + defaultPort
+}
+
+// splitFlagsAndPositional splits args into flag tokens (allowing flags after
+// positional arguments) and non-flag positional arguments without exiting on help.
+func splitFlagsAndPositional(fs *flag.FlagSet, args []string) (flagArgs, positional []string, helpKind string) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+		if strings.HasPrefix(a, "-") && len(a) > 1 {
+			name := strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-")
+			if name == "h" || name == "help" {
+				return nil, nil, "help"
+			}
+			if name == "help-advanced" {
+				return nil, nil, "help-advanced"
+			}
+			flagArgs = append(flagArgs, a)
+			if strings.Contains(name, "=") {
+				continue
+			}
+			if f := fs.Lookup(name); f != nil {
+				if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+					continue
+				}
+				if i+1 < len(args) {
+					i++
+					flagArgs = append(flagArgs, args[i])
+				}
+			}
+			continue
+		}
+		positional = append(positional, a)
+	}
+	return flagArgs, positional, ""
+}
+
+type clientOptions struct {
+	server         string
+	stunAddr       string
+	stunList       string
+	room           string
+	token          string
+	user           string
+	secret         string
+	noPredict      bool
+	noLAN          bool
+	noIPv6         bool
+	noUPnP         bool
+	punchSockets   int
+	peerPortOffset int
+	symSpray       int
+	sprayIPMax     int
+	punchPPS       int
+	escalateMs     int
+	noEncrypt      bool
+	timeout        int
+	useTun         bool
+	noTun          bool
+	mtu            int
+	userspaceStack bool
+	legacyMesh     bool
+	verbose        bool
+	tlsEnable      bool
+	tlsServerName  string
+	tlsInsecure    bool
+}
+
+func parseClientOptions(mode string, args []string) (*clientOptions, string, error) {
+	opts := &clientOptions{}
+	fs := flag.NewFlagSet(mode, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	fs.StringVar(&opts.server, "server", "127.0.0.1:8080", "")
+	fs.StringVar(&opts.stunAddr, "stun", "", "")
+	fs.StringVar(&opts.stunList, "stun-list", "", "")
+	fs.StringVar(&opts.room, "room", "", "")
+	fs.StringVar(&opts.token, "token", "", "")
+	fs.StringVar(&opts.user, "user", "", "")
+	fs.StringVar(&opts.secret, "secret", "", "")
+	fs.BoolVar(&opts.noPredict, "no-predict", false, "")
+	fs.BoolVar(&opts.noLAN, "no-lan", false, "")
+	fs.BoolVar(&opts.noIPv6, "no-ipv6", false, "")
+	fs.BoolVar(&opts.noUPnP, "no-upnp", false, "")
+	fs.IntVar(&opts.punchSockets, "punch-sockets", 256, "")
+	fs.IntVar(&opts.peerPortOffset, "peer-port-offset", 20, "")
+	fs.IntVar(&opts.symSpray, "sym-spray", 512, "")
+	fs.IntVar(&opts.sprayIPMax, "spray-ip-max", 64, "")
+	fs.IntVar(&opts.punchPPS, "punch-pps", 1500, "")
+	fs.IntVar(&opts.escalateMs, "escalate-ms", 2000, "")
+	fs.BoolVar(&opts.noEncrypt, "no-encrypt", false, "")
+	fs.IntVar(&opts.timeout, "timeout", 15, "")
+	fs.BoolVar(&opts.verbose, "verbose", false, "")
+	fs.BoolVar(&opts.verbose, "v", false, "")
+	fs.BoolVar(&opts.tlsEnable, "tls", false, "")
+	fs.StringVar(&opts.tlsServerName, "tls-server-name", "", "")
+	fs.BoolVar(&opts.tlsInsecure, "tls-insecure", false, "")
+	if mode == "up" || mode == "mesh" {
+		fs.BoolVar(&opts.useTun, "tun", mode == "up", "")
+		fs.BoolVar(&opts.noTun, "no-tun", false, "")
+		fs.IntVar(&opts.mtu, "mtu", 1280, "")
+		fs.BoolVar(&opts.userspaceStack, "userspace-stack", false, "")
+		fs.BoolVar(&opts.legacyMesh, "legacy-mesh", false, "")
+	}
+
+	flagArgs, pos, helpKind := splitFlagsAndPositional(fs, args)
+	if helpKind != "" {
+		return nil, helpKind, nil
+	}
+	if err := fs.Parse(flagArgs); err != nil {
+		return nil, "", err
+	}
+	setFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+
+	if mode == "up" && opts.noTun {
+		opts.useTun = false
+	}
+
+	if len(pos) > 0 {
+		if err := applyPositionalTarget(opts, setFlags, pos); err != nil {
+			return nil, "", err
+		}
+	}
+	if opts.room == "" {
+		return nil, "", fmt.Errorf("room is required (e.g. `p2p up <server:port> <room>` or `--room <id>`)")
+	}
+	return opts, "", nil
+}
+
+// applyPositionalTarget accepts either:
+//   - p2p://[user:secret@|secret@]host[:port]/room[?token=...&tls=1&stun=...]
+//   - <server[:port]> [<room>]
+func applyPositionalTarget(opts *clientOptions, setFlags map[string]bool, pos []string) error {
+	first := strings.TrimSpace(pos[0])
+	if strings.HasPrefix(first, "p2p://") {
+		u, err := url.Parse(first)
+		if err != nil {
+			return fmt.Errorf("invalid p2p URL %q: %w", first, err)
+		}
+		if u.Host == "" {
+			return fmt.Errorf("invalid p2p URL %q: missing server host", first)
+		}
+		if !setFlags["server"] {
+			opts.server = ensurePort(u.Host, "8080")
+		}
+		pathRoom := strings.Trim(u.Path, "/")
+		if pathRoom != "" && !setFlags["room"] {
+			opts.room = pathRoom
+		}
+		if u.User != nil {
+			uname := u.User.Username()
+			pass, hasPass := u.User.Password()
+			if hasPass {
+				if uname != "" && !setFlags["user"] {
+					opts.user = uname
+				}
+				if pass != "" && !setFlags["secret"] {
+					opts.secret = pass
+				}
+			} else if uname != "" {
+				if pathRoom == "" && !setFlags["room"] {
+					opts.room = uname
+				} else if !setFlags["secret"] {
+					opts.secret = uname
+				}
+			}
+		}
+		q := u.Query()
+		if tok := q.Get("token"); tok != "" && !setFlags["token"] {
+			opts.token = tok
+		}
+		if stun := q.Get("stun"); stun != "" && !setFlags["stun-list"] {
+			opts.stunList = stun
+		}
+		if tlsVal := q.Get("tls"); (tlsVal == "1" || strings.EqualFold(tlsVal, "true")) && !setFlags["tls"] {
+			opts.tlsEnable = true
+		}
+		if len(pos) > 1 && !setFlags["room"] && opts.room == "" {
+			opts.room = pos[1]
+		}
+		return nil
+	}
+
+	if !setFlags["server"] {
+		opts.server = ensurePort(first, "8080")
+	}
+	if len(pos) > 1 && !setFlags["room"] {
+		opts.room = pos[1]
+	}
+	return nil
+}
+
+func (o *clientOptions) toSDKConfig() *p2p.Config {
+	cfg := p2p.Defaults()
+	cfg.ServerAddr = o.server
+	if o.stunAddr == "" {
+		cfg.STUNAddr = o.server
+	} else {
+		cfg.STUNAddr = o.stunAddr
+	}
+	cfg.Token = o.token
+	cfg.AuthUser = o.user
+	cfg.AuthSecret = o.secret
+	cfg.TimeoutSec = o.timeout
+	cfg.Debug = o.verbose
+	cfg.TLS = o.tlsEnable
+	cfg.TLSServerName = o.tlsServerName
+	cfg.TLSInsecureSkipVerify = o.tlsInsecure
+	cfg.Plaintext = o.noEncrypt
+	if o.noPredict {
+		cfg.PortPrediction = false
+	}
+	if o.noLAN {
+		cfg.EnableLAN = false
+	}
+	if o.noIPv6 {
+		cfg.EnableIPv6 = false
+	}
+	if o.noUPnP {
+		cfg.EnableUPnP = false
+	}
+	cfg.PredictionSockets = o.punchSockets
+	cfg.PeerPortOffset = o.peerPortOffset
+	cfg.SymmetricSpray = o.symSpray
+	cfg.SprayIPMax = o.sprayIPMax
+	cfg.PunchPPS = o.punchPPS
+	cfg.EscalateAfterMs = o.escalateMs
+	cfg.STUNSecondaries = o.stunList
+	cfg.LegacyMesh = o.legacyMesh
+	return cfg
 }
 
 func runNatCheck(args []string) int {
-	fs := flag.NewFlagSet("nat-check", flag.ExitOnError)
+	fs := flag.NewFlagSet("nat-check", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	server := fs.String("server", "127.0.0.1:3478", "STUN server address")
 	stunList := fs.String("stun-list", "", "comma-separated extra STUN observation points")
-	fs.Parse(args)
 
-	conn, err := net.ListenUDP("udp", nil)
+	flagArgs, pos, helpKind := splitFlagsAndPositional(fs, args)
+	if helpKind == "help-advanced" {
+		ClientAdvancedUsage()
+		return 0
+	}
+	if helpKind == "help" {
+		fmt.Println("usage: p2p nat-check [<server[:port]>] [--server <host:port>] [--stun-list <a,b>]")
+		return 0
+	}
+	if err := fs.Parse(flagArgs); err != nil {
+		fmt.Println("error:", err)
+		return 2
+	}
+	serverExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "server" {
+			serverExplicit = true
+		}
+	})
+	if len(pos) > 0 && !serverExplicit {
+		*server = ensurePort(pos[0], "8080")
+	}
+
+	conn, err := net.ListenUDP("udp4", nil)
 	if err != nil {
 		fmt.Println("error:", err)
 		return 1
 	}
 	defer conn.Close()
-	addr, err := net.ResolveUDPAddr("udp", *server)
+	addr, err := net.ResolveUDPAddr("udp4", *server)
 	if err != nil {
 		fmt.Println("error:", err)
 		return 1
 	}
-	c := &stun.Client{Conn: conn, Server: addr, SecondaryTimeout: 800 * time.Millisecond, StepSamples: stun.DefaultStepSamples}
-	if *stunList != "" {
-		var list []string
-		for _, p := range splitTrim(*stunList) {
-			list = append(list, p)
+	var secs []string
+	for _, s := range strings.Split(*stunList, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			secs = append(secs, s)
 		}
-		c.Secondaries = list
+	}
+	c := &stun.Client{
+		Conn:             conn,
+		Server:           addr,
+		SecondaryTimeout: 800 * time.Millisecond,
+		StepSamples:      stun.DefaultStepSamples,
+		Secondaries:      secs,
 	}
 	det, err := c.Detect()
 	if err != nil {
@@ -104,18 +410,20 @@ func runNatCheck(args []string) int {
 	fmt.Printf("NAT type : %s\n", det.NATType)
 	fmt.Printf("local    : %s\n", conn.LocalAddr())
 	fmt.Printf("public   : %s\n", det.PublicAddr())
-	if len(det.ObservedIPs) > 0 {
-		ips := make([]string, 0, len(det.ObservedIPs))
-		for _, ip := range det.ObservedIPs {
-			ips = append(ips, ip.String())
-		}
-		fmt.Printf("candidates: %v\n", ips)
+	if det.PortPreserve {
+		fmt.Printf("preserve : true (offset %+d)\n", det.PortPreserveOffset)
+	}
+	if det.PortStep != 0 {
+		fmt.Printf("port step: %d\n", det.PortStep)
+	}
+	if det.PortBlockMin > 0 {
+		fmt.Printf("PBA block: %d..%d\n", det.PortBlockMin, det.PortBlockMax)
+	}
+	if len(det.ObservedIPs) > 1 {
+		fmt.Printf("egressIPs: %v\n", det.ObservedIPs)
 	}
 	if pool := det.CoveringPool(); pool != nil {
-		fmt.Printf("egress pool: %s (cone peers spray this whole block, not just the sampled IPs)\n", pool)
-	}
-	if det.PortStep > 0 {
-		fmt.Printf("port step: %d\n", det.PortStep)
+		fmt.Printf("egressPool: %s\n", pool)
 	}
 	if m := det.Method(); m != "" {
 		fmt.Printf("evidence : %s\n", m)
@@ -123,89 +431,34 @@ func runNatCheck(args []string) int {
 	return 0
 }
 
-// splitTrim splits a comma-separated list into trimmed non-empty tokens.
-func splitTrim(s string) []string {
-	var out []string
-	for _, p := range strings.Split(s, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
 func runConnect(args []string) int {
-	fs := flag.NewFlagSet("connect", flag.ExitOnError)
-	server := fs.String("server", "127.0.0.1:8080", "signaling server address")
-	stunAddr := fs.String("stun", "", "STUN server address (default: same host:port as --server)")
-	stunList := fs.String("stun-list", "", "comma-separated extra STUN observation points for CGNAT candidate discovery (default: built-in list)")
-	room := fs.String("room", "", "room id")
-	token := fs.String("token", "", "room token")
-	user := fs.String("user", "", "username for server authentication")
-	secret := fs.String("secret", "", "shared secret / password for server authentication")
-	noPredict := fs.Bool("no-predict", false, "disable symmetric-NAT port prediction")
-	noLAN := fs.Bool("no-lan", false, "disable same-LAN shortcut")
-	punchSockets := fs.Int("punch-sockets", 128, "socket pool size for symmetric plant/block legs (0=off)")
-	peerPortOffset := fs.Int("peer-port-offset", 20, "block spray aims at peer public port + this offset (must be < --punch-sockets)")
-	symSpray := fs.Int("sym-spray", 1024, "random ports the cone side sprays per round at each symmetric-peer public IP (birthday attack; 0=default)")
-	punchPPS := fs.Int("punch-pps", 1500, "max probe packets per second per peer during punching (safety cap so a wide spray cannot overflow the router/NIC; 0=default)")
-	escalateMs := fs.Int("escalate-ms", 3000, "ms a cone-classified peer may fail to connect before re-planning it as hard plant+spray (recovers a misdetected symmetric NAT; 0=default)")
-	noEncrypt := fs.Bool("no-encrypt", false, "experimental: disable data-plane encryption (both ends must set it)")
-	timeout := fs.Int("timeout", 15, "connect timeout in seconds")
-	verbose := fs.Bool("verbose", false, "show detailed hole-punching flow logs")
-	tlsEnable := fs.Bool("tls", false, "enable TLS for the signaling connection")
-	tlsServerName := fs.String("tls-server-name", "", "TLS ServerName override")
-	tlsInsecure := fs.Bool("tls-insecure", false, "skip TLS certificate verification")
-	fs.Parse(args)
-
-	if *room == "" {
-		fmt.Println("error: --room is required")
+	opts, helpKind, err := parseClientOptions("connect", args)
+	if helpKind == "help-advanced" {
+		ClientAdvancedUsage()
+		return 0
+	}
+	if helpKind == "help" {
+		ClientUsage()
+		return 0
+	}
+	if err != nil {
+		fmt.Println("error:", err)
 		return 2
 	}
 
-	cfg := p2p.Defaults()
-	cfg.ServerAddr = *server
-	if *stunAddr == "" {
-		// single-port server: STUN shares the signaling port
-		cfg.STUNAddr = *server
-	} else {
-		cfg.STUNAddr = *stunAddr
-	}
-	cfg.Token = *token
-	cfg.AuthUser = *user
-	cfg.AuthSecret = *secret
-	cfg.TimeoutSec = *timeout
-	cfg.Debug = *verbose
-	cfg.TLS = *tlsEnable
-	cfg.TLSServerName = *tlsServerName
-	cfg.TLSInsecureSkipVerify = *tlsInsecure
-	cfg.Plaintext = *noEncrypt
-	if *noPredict {
-		cfg.PortPrediction = false
-	}
-	if *noLAN {
-		cfg.EnableLAN = false
-	}
-	cfg.PredictionSockets = *punchSockets
-	cfg.PeerPortOffset = *peerPortOffset
-	cfg.SymmetricSpray = *symSpray
-	cfg.PunchPPS = *punchPPS
-	cfg.EscalateAfterMs = *escalateMs
-	cfg.STUNSecondaries = *stunList
-
 	cli := &cliListener{}
-	sess, err := p2p.NewSession(cfg, cli)
+	sess, err := p2p.NewSession(opts.toSDKConfig(), cli)
 	if err != nil {
 		fmt.Println("error:", err)
 		return 1
 	}
 	cli.sess = sess
 
-	if err := sess.Connect(*room); err != nil {
+	if err := sess.Connect(opts.room); err != nil {
 		fmt.Println("error:", err)
 		return 1
 	}
-	fmt.Printf("[client] joining room %q\n", *room)
+	fmt.Printf("[client] joining room %q (server=%s)\n", opts.room, opts.server)
 
 	// stdin -> peer data
 	go func() {
@@ -230,87 +483,47 @@ func runConnect(args []string) int {
 	return 0
 }
 
+func runUp(args []string) int {
+	return runMeshMode("up", args)
+}
+
 // runMesh joins a virtual network; with --tun it creates a TUN device and
 // routes OS traffic, otherwise it is an interactive mesh console.
 func runMesh(args []string) int {
-	fs := flag.NewFlagSet("mesh", flag.ExitOnError)
-	server := fs.String("server", "127.0.0.1:8080", "signaling server address")
-	stunAddr := fs.String("stun", "", "STUN server address (default: same host:port as --server)")
-	stunList := fs.String("stun-list", "", "comma-separated extra STUN observation points for CGNAT candidate discovery (default: built-in list)")
-	room := fs.String("room", "", "room id")
-	token := fs.String("token", "", "room token")
-	user := fs.String("user", "", "username for server authentication")
-	secret := fs.String("secret", "", "shared secret / password for server authentication")
-	noPredict := fs.Bool("no-predict", false, "disable symmetric-NAT port prediction")
-	noLAN := fs.Bool("no-lan", false, "disable same-LAN shortcut")
-	punchSockets := fs.Int("punch-sockets", 128, "socket pool size for symmetric plant/block legs (0=off)")
-	peerPortOffset := fs.Int("peer-port-offset", 20, "block spray aims at peer public port + this offset (must be < --punch-sockets)")
-	symSpray := fs.Int("sym-spray", 1024, "random ports the cone side sprays per round at each symmetric-peer public IP (birthday attack; 0=default)")
-	punchPPS := fs.Int("punch-pps", 1500, "max probe packets per second per peer during punching (safety cap so a wide spray cannot overflow the router/NIC; 0=default)")
-	escalateMs := fs.Int("escalate-ms", 3000, "ms a cone-classified peer may fail to connect before re-planning it as hard plant+spray (recovers a misdetected symmetric NAT; 0=default)")
-	noEncrypt := fs.Bool("no-encrypt", false, "experimental: disable data-plane encryption (both ends must set it)")
-	timeout := fs.Int("timeout", 15, "connect timeout in seconds")
-	useTun := fs.Bool("tun", false, "create a TUN device and route OS traffic")
-	mtu := fs.Int("mtu", 1280, "TUN MTU (1280 default: safe across most networks, avoids IP fragmentation)")
-	userspaceStack := fs.Bool("userspace-stack", false, "experimental (legacy mesh only): handle inbound TCP in userspace and forward to 127.0.0.1:same-port")
-	legacyMesh := fs.Bool("legacy-mesh", false, "experimental: route --tun traffic through the retired mesh bridge instead of the WireGuard tunnel")
-	verbose := fs.Bool("verbose", false, "show detailed hole-punching flow logs")
-	tlsEnable := fs.Bool("tls", false, "enable TLS for the signaling connection")
-	tlsServerName := fs.String("tls-server-name", "", "TLS ServerName override")
-	tlsInsecure := fs.Bool("tls-insecure", false, "skip TLS certificate verification")
-	fs.Parse(args)
+	return runMeshMode("mesh", args)
+}
 
-	if *room == "" {
-		fmt.Println("error: --room is required")
+func runMeshMode(mode string, args []string) int {
+	opts, helpKind, err := parseClientOptions(mode, args)
+	if helpKind == "help-advanced" {
+		ClientAdvancedUsage()
+		return 0
+	}
+	if helpKind == "help" {
+		ClientUsage()
+		return 0
+	}
+	if err != nil {
+		fmt.Println("error:", err)
 		return 2
 	}
 
-	cfg := p2p.Defaults()
-	cfg.ServerAddr = *server
-	if *stunAddr == "" {
-		cfg.STUNAddr = *server
-	} else {
-		cfg.STUNAddr = *stunAddr
-	}
-	cfg.Token = *token
-	cfg.AuthUser = *user
-	cfg.AuthSecret = *secret
-	cfg.TimeoutSec = *timeout
-	cfg.Debug = *verbose
-	cfg.TLS = *tlsEnable
-	cfg.TLSServerName = *tlsServerName
-	cfg.TLSInsecureSkipVerify = *tlsInsecure
-	cfg.Plaintext = *noEncrypt
-	if *noPredict {
-		cfg.PortPrediction = false
-	}
-	if *noLAN {
-		cfg.EnableLAN = false
-	}
-	cfg.PredictionSockets = *punchSockets
-	cfg.PeerPortOffset = *peerPortOffset
-	cfg.SymmetricSpray = *symSpray
-	cfg.PunchPPS = *punchPPS
-	cfg.EscalateAfterMs = *escalateMs
-	cfg.STUNSecondaries = *stunList
-	cfg.LegacyMesh = *legacyMesh
-
 	ml := &meshListener{}
 	ml.initData()
-	sess, err := p2p.NewSession(cfg, ml)
+	sess, err := p2p.NewSession(opts.toSDKConfig(), ml)
 	if err != nil {
 		fmt.Println("error:", err)
 		return 1
 	}
 	ml.sess = sess
-	if err := sess.Connect(*room); err != nil {
+	if err := sess.Connect(opts.room); err != nil {
 		fmt.Println("error:", err)
 		return 1
 	}
-	fmt.Printf("[mesh] joining room %q\n", *room)
+	fmt.Printf("[mesh] joining room %q (server=%s)\n", opts.room, opts.server)
 
-	if *useTun {
-		runTun(sess, ml, *mtu, *userspaceStack, *legacyMesh)
+	if opts.useTun {
+		runTun(sess, ml, opts.mtu, opts.userspaceStack, opts.legacyMesh)
 	} else {
 		runMeshConsole(sess, ml)
 	}
@@ -614,6 +827,21 @@ func (m *meshListener) OnEvent(event int, peerID string, data []byte) {
 		if m.tunMode {
 			fmt.Printf("[mesh] 现在可以 ping 该节点: ping %s\n", peerID)
 		}
+	case p2p.EventPathChanged:
+		endpoint := ""
+		if m.sess != nil {
+			for _, mem := range m.sess.Members() {
+				if mem.VirtualIP == peerID && mem.Endpoint != "" {
+					endpoint = mem.Endpoint
+					break
+				}
+			}
+		}
+		if endpoint != "" {
+			fmt.Printf("[mesh] %s path upgraded: %s -> %s (%s)\n", ts(), peerID, data, endpoint)
+		} else {
+			fmt.Printf("[mesh] %s path upgraded: %s -> %s\n", ts(), peerID, data)
+		}
 	case p2p.EventData:
 		if m.tunMode {
 			// TUN 模式：网卡就绪前到达的 IP 包静默丢弃（OS 会重发），
@@ -631,9 +859,8 @@ func (m *meshListener) OnEvent(event int, peerID string, data []byte) {
 	}
 }
 
-// ts stamps the pacing-sensitive lines with a wall clock. Without it the round
-// counter has no seconds attached, and reading "how long did punching take"
-// meant cross-referencing the WireGuard debug lines for time anchors.
+// ts stamps pacing-sensitive lines with a wall clock so round counters show
+// elapsed seconds directly in console logs.
 func ts() string { return time.Now().Format("15:04:05") }
 
 func (m *meshListener) waitIP() string {
@@ -699,6 +926,8 @@ func (c *cliListener) OnEvent(event int, peerID string, data []byte) {
 		if c.done == nil {
 			c.done = make(chan struct{})
 		}
+	case p2p.EventPathChanged:
+		fmt.Printf("[event] path upgraded: %s -> %s\n", peerID, data)
 	case p2p.EventData:
 		fmt.Printf("[data] %s: %s\n", peerID, data)
 	case p2p.EventError:

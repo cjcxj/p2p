@@ -23,13 +23,11 @@ func (c *recConn) WriteTo(_ []byte, a net.Addr) (int, error) {
 	c.dst = a
 	return 0, nil
 }
-func (c *recConn) Close() error { return nil }
-func (c *recConn) LocalAddr() net.Addr {
-	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 30000 + c.idx}
-}
-func (c *recConn) SetDeadline(time.Time) error      { return nil }
-func (c *recConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *recConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *recConn) Close() error                              { return nil }
+func (c *recConn) LocalAddr() net.Addr                        { return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 30000 + c.idx} }
+func (c *recConn) SetDeadline(time.Time) error               { return nil }
+func (c *recConn) SetReadDeadline(time.Time) error           { return nil }
+func (c *recConn) SetWriteDeadline(time.Time) error          { return nil }
 
 // The WireGuard data plane must leave through the socket that actually punched
 // the peer, not the primary socket, so it rides the same live NAT mapping.
@@ -56,7 +54,7 @@ func TestSendWireGuardUsesWinningSocket(t *testing.T) {
 	}
 }
 
-// An endpoint belonging to no punched peer (relay, or roaming) falls back to the
+// An endpoint belonging to no punched peer (e.g. roaming) falls back to the
 // primary socket rather than dropping the frame.
 func TestSendWireGuardFallsBackToPrimary(t *testing.T) {
 	c0 := &recConn{idx: 0}

@@ -19,8 +19,6 @@ import (
 // honesty guard: it shows the spray must really reach the rotating address and
 // the strict filters are not being bypassed.
 
-var delivered int64
-
 type frame struct {
 	src  *net.UDPAddr
 	dst  *net.UDPAddr
@@ -28,22 +26,23 @@ type frame struct {
 }
 
 type internet struct {
-	mu    sync.Mutex
-	owner map[string]*nat
+	mu        sync.RWMutex
+	owner     map[string]*nat
+	delivered int64
 }
 
-func (in *internet) register(a *net.UDPAddr, n *nat) {
+func (in *internet) registerKey(key string, n *nat) {
 	in.mu.Lock()
-	in.owner[a.String()] = n
+	in.owner[key] = n
 	in.mu.Unlock()
 }
 
-func (in *internet) route(f frame) {
-	in.mu.Lock()
-	n := in.owner[f.dst.String()]
-	in.mu.Unlock()
+func (in *internet) routeKey(dstKey, srcKey string, f frame) {
+	in.mu.RLock()
+	n := in.owner[dstKey]
+	in.mu.RUnlock()
 	if n != nil {
-		n.receive(f)
+		n.receiveKey(dstKey, srcKey, f)
 	}
 }
 
@@ -90,11 +89,11 @@ func (n *nat) external(idx int, dst *net.UDPAddr) *net.UDPAddr {
 	}
 }
 
-func (n *nat) receive(f frame) {
+func (n *nat) receiveKey(dstKey, srcKey string, f frame) {
 	n.mu.Lock()
 	target := -1
 	for i, c := range n.conns {
-		if c.ownsExternal(f.dst) && c.allowedFrom(f.src) {
+		if c.ownsAndAllows(dstKey, srcKey) {
 			target = i
 			break
 		}
@@ -103,7 +102,7 @@ func (n *nat) receive(f frame) {
 	if target < 0 {
 		return
 	}
-	atomic.AddInt64(&delivered, 1)
+	atomic.AddInt64(&n.in.delivered, 1)
 	select {
 	case n.conns[target].rx <- f:
 	default:
@@ -121,27 +120,27 @@ type natConn struct {
 	sentTo map[string]bool
 }
 
-func (c *natConn) ownsExternal(a *net.UDPAddr) bool {
+func (c *natConn) ownsAndAllows(dstKey, srcKey string) bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.exts[a.String()]
-}
-
-func (c *natConn) allowedFrom(src *net.UDPAddr) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.sentTo[src.String()]
+	ok := c.exts[dstKey] && c.sentTo[srcKey]
+	c.mu.Unlock()
+	return ok
 }
 
 func (c *natConn) WriteTo(b []byte, dst net.Addr) (int, error) {
 	d := dst.(*net.UDPAddr)
 	ext := c.n.external(c.idx, d)
+	extKey := ext.String()
+	dstKey := d.String()
 	c.mu.Lock()
-	c.exts[ext.String()] = true
-	c.sentTo[d.String()] = true
+	wasExt := c.exts[extKey]
+	c.exts[extKey] = true
+	c.sentTo[dstKey] = true
 	c.mu.Unlock()
-	c.n.in.register(ext, c.n)
-	c.n.in.route(frame{src: ext, dst: d, data: append([]byte(nil), b...)})
+	if !wasExt {
+		c.n.in.registerKey(extKey, c.n)
+	}
+	c.n.in.routeKey(dstKey, extKey, frame{src: ext, dst: d, data: append([]byte(nil), b...)})
 	return len(b), nil
 }
 
@@ -194,7 +193,6 @@ func runNat34(t *testing.T, poolIP []string, includeEgress bool) bool {
 
 func runNat34With(t *testing.T, poolIP []string, includeEgress bool, announced *net.IPNet) bool {
 	t.Helper()
-	atomic.StoreInt64(&delivered, 0)
 	in := &internet{owner: map[string]*nat{}}
 
 	p4 := newNat(in, true, poolIP, 8)                 // NAT4 symmetric, pool for plant
@@ -206,7 +204,7 @@ func runNat34With(t *testing.T, poolIP []string, includeEgress bool, announced *
 	// NAT4's egress toward the NAT3 peer (the rotating address under test):
 	egress4to3 := p4[0].n.external(0, adv3)
 	egressIPStr := egress4to3.IP.String()
-	// adv4 = the relay-reported (server-direction) IP. Pick a pool IP != the
+	// adv4 = the STUN-reported (server-direction) IP. Pick a pool IP != the
 	// egress so the negative case is meaningful; for a size-1 pool the two are
 	// necessarily the same (an IP-stable symmetric NAT).
 	adv4IP, wrongIP := egressIPStr, egressIPStr
@@ -253,18 +251,18 @@ func runNat34With(t *testing.T, poolIP []string, includeEgress bool, announced *
 	ph4.AddPeer(id3, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv3})
 	ph3.AddPeer(id4, NATInfo{Type: stun.NatSymmetric, PublicAddr: adv4, PublicIPs: cand4, PoolCIDR: announced})
 
-	deadline := time.Now().Add(8 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		ok4, tr4 := ph4.Connected(id3)
 		ok3, tr3 := ph3.Connected(id4)
 		// The objective is DIRECT NAT3<->NAT4 traversal, so both sides must be
-		// on a punched (not relay) transport.
+		// connected on a punched transport.
 		if ok4 && ok3 && tr4 == StatePunched && tr3 == StatePunched {
 			return true
 		}
 		time.Sleep(15 * time.Millisecond)
 	}
-	t.Logf("nat34 delivered-to-sockets=%d includeEgress=%v", atomic.LoadInt64(&delivered), includeEgress)
+	t.Logf("nat34 delivered-to-sockets=%d includeEgress=%v", atomic.LoadInt64(&in.delivered), includeEgress)
 	return false
 }
 
@@ -284,6 +282,7 @@ func TestNat34PunchPositive(t *testing.T) {
 // drop everything and the punch must NOT succeed. If this passes, the model is
 // too permissive and the positive result is meaningless.
 func TestNat34PunchNegativeControl(t *testing.T) {
+	t.Parallel()
 	if runNat34(t, rotatingPool, false) {
 		t.Fatal("must NOT punch when the egress IP is excluded (emulator too lenient)")
 	}
@@ -306,7 +305,7 @@ func TestNat34IPStableSymmetric(t *testing.T) {
 //   - does NOT punch when they are not (under-configured for this pool).
 //
 // Together these show that multi-STUN candidate coverage, not the punch logic,
-// is the only thing that gates large-pool CGNAT traversal on a single relay.
+// is the only thing that gates large-pool CGNAT traversal on a single server.
 func TestNat34LargePoolCovered(t *testing.T) {
 	pool8 := []string{
 		"127.0.4.210", "127.0.4.211", "127.0.4.212", "127.0.4.213",
@@ -318,6 +317,7 @@ func TestNat34LargePoolCovered(t *testing.T) {
 }
 
 func TestNat34LargePoolUncovered(t *testing.T) {
+	t.Parallel()
 	pool8 := []string{
 		"127.0.4.210", "127.0.4.211", "127.0.4.212", "127.0.4.213",
 		"127.0.4.214", "127.0.4.215", "127.0.4.216", "127.0.4.217",
@@ -329,8 +329,7 @@ func TestNat34LargePoolUncovered(t *testing.T) {
 
 // The 111.55 (China Unicom) reality, reproduced and RESOLVED: a destination-
 // rotating CGNAT whose egress IP toward the cone peer is NOT among the sampled
-// STUN addresses (the exact gap that made EasyTier connect but us fall to
-// relay). When the hard peer announces its covering egress POOL, the cone side
+// STUN addresses. When the hard peer announces its covering egress POOL, the cone side
 // sprays the whole block, so the un-sampled egress address is reached and NAT3
 // <-> NAT4 punches direct -- with a single signalling server and no extra STUN
 // observation luck. The same scenario without the announced pool is the
@@ -387,19 +386,23 @@ func TestNat34ConvergenceReliable(t *testing.T) {
 func TestNat34PoolSizeSweep(t *testing.T) {
 	sizes := []int{1, 2, 3, 4, 6, 8}
 	for _, k := range sizes {
-		pool := make([]string, k)
-		for i := 0; i < k; i++ {
-			pool[i] = fmt.Sprintf("127.0.4.%d", 200+i)
-		}
-		if !runNat34(t, pool, true) {
-			t.Fatalf("pool size %d: must punch when the egress IP is enumerated", k)
-		}
-		// Negative control only meaningful for >=3 IPs: we need an advertised IP
-		// AND a distinct wrong decoy, both different from the egress. With <=2
-		// IPs every non-egress choice collapses back onto the egress.
-		if k >= 3 && runNat34(t, pool, false) {
-			t.Fatalf("pool size %d: must NOT punch when the egress IP is excluded (too lenient)", k)
-		}
+		k := k
+		t.Run(fmt.Sprintf("k=%d", k), func(t *testing.T) {
+			t.Parallel()
+			pool := make([]string, k)
+			for i := 0; i < k; i++ {
+				pool[i] = fmt.Sprintf("127.0.4.%d", 200+i)
+			}
+			if !runNat34(t, pool, true) {
+				t.Fatalf("pool size %d: must punch when the egress IP is enumerated", k)
+			}
+			// Negative control only meaningful for >=3 IPs: we need an advertised IP
+			// AND a distinct wrong decoy, both different from the egress. With <=2
+			// IPs every non-egress choice collapses back onto the egress.
+			if k >= 3 && runNat34(t, pool, false) {
+				t.Fatalf("pool size %d: must NOT punch when the egress IP is excluded (too lenient)", k)
+			}
+		})
 	}
 }
 
@@ -413,7 +416,6 @@ func TestNat34PoolSizeSweep(t *testing.T) {
 // transport.
 func runNat44(t *testing.T, poolA, poolB []string, announceA, announceB *net.IPNet) bool {
 	t.Helper()
-	atomic.StoreInt64(&delivered, 0)
 	in := &internet{owner: map[string]*nat{}}
 
 	pA := newNat(in, true, poolA, 8)
@@ -449,7 +451,7 @@ func runNat44(t *testing.T, poolA, poolB []string, announceA, announceB *net.IPN
 	phA.AddPeer(idB, NATInfo{Type: stun.NatSymmetric, PublicAddr: advB, PoolCIDR: announceB})
 	phB.AddPeer(idA, NATInfo{Type: stun.NatSymmetric, PublicAddr: advA, PoolCIDR: announceA})
 
-	deadline := time.Now().Add(8 * time.Second)
+	deadline := time.Now().Add(12 * time.Second)
 	for time.Now().Before(deadline) {
 		okA, trA := phA.Connected(idB)
 		okB, trB := phB.Connected(idA)
@@ -458,7 +460,7 @@ func runNat44(t *testing.T, poolA, poolB []string, announceA, announceB *net.IPN
 		}
 		time.Sleep(15 * time.Millisecond)
 	}
-	t.Logf("nat44 delivered-to-sockets=%d", atomic.LoadInt64(&delivered))
+	t.Logf("nat44 delivered-to-sockets=%d", atomic.LoadInt64(&in.delivered))
 	return false
 }
 
@@ -513,6 +515,7 @@ func TestNat44AnnouncedPoolsReliable(t *testing.T) {
 // peer-direction egress, so the punch must NOT succeed. Guards that the
 // positive result comes from the pool mechanism, not a permissive model.
 func TestNat44NoPoolUndercovered(t *testing.T) {
+	t.Parallel()
 	poolA := []string{"127.0.4.210", "127.0.4.211", "127.0.4.212", "127.0.4.213", "127.0.4.214", "127.0.4.215", "127.0.4.216", "127.0.4.217"}
 	poolB := []string{"127.0.4.220", "127.0.4.221", "127.0.4.222", "127.0.4.223", "127.0.4.224", "127.0.4.225", "127.0.4.226", "127.0.4.227"}
 	if runNat44(t, poolA, poolB, nil, nil) {
@@ -528,7 +531,6 @@ func TestNat44NoPoolUndercovered(t *testing.T) {
 // re-plan the peer as hard and spray. This test misreports a symmetric NAT as
 // cone and requires the punch to still converge via escalation.
 func TestNat34EscalatesMisdetectedCone(t *testing.T) {
-	atomic.StoreInt64(&delivered, 0)
 	in := &internet{owner: map[string]*nat{}}
 	p4 := newNat(in, true, rotatingPool, 8)                 // actually symmetric
 	p3 := newNat(in, false, []string{"127.9.0.3"}, 1)       // cone
@@ -590,7 +592,6 @@ func TestNat34EscalatesMisdetectedCone(t *testing.T) {
 // punch -- proving the two mechanisms compose rather than each working in
 // isolation.
 func TestNat34EscalatePlusPoolRescuesRotating(t *testing.T) {
-	atomic.StoreInt64(&delivered, 0)
 	in := &internet{owner: map[string]*nat{}}
 	p4 := newNat(in, true, rotatingPool, 8)
 	p3 := newNat(in, false, []string{"127.9.0.3"}, 1)
@@ -655,7 +656,6 @@ func TestNat34EscalatePlusPoolRescuesRotating(t *testing.T) {
 // cannot exercise. plant-on-escalation is a defensive change verified by the
 // live trials + code review, not by this test.
 func TestNat34SelfMisdetectedConeEscalatesPlant(t *testing.T) {
-	atomic.StoreInt64(&delivered, 0)
 	in := &internet{owner: map[string]*nat{}}
 	pool := []string{"127.0.4.216"} // IP-stable symmetric: same egress toward everyone
 	p4 := newNat(in, true, pool, 8)

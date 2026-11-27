@@ -15,192 +15,6 @@ func peerInfo(t stun.NATType, pub *net.UDPAddr, step int) NATInfo {
 	return NATInfo{Type: t, PublicAddr: pub, PortStep: step}
 }
 
-// The block leg fires for a hard peer with an active pool but no PortStep,
-// aiming every socket at peer_port+default offset.
-// A destination-rotating CGNAT only shows STUN a few of its egress IPs; the
-// address it actually uses toward a given peer can be absent from that sample.
-// When the peer announces its covering pool, the spray leg must widen to the
-// whole block so the missing egress IP is targeted -- here the sampled set
-// {114,98,110,106} collapses to 111.55.212.96/27, which also contains .102.
-func TestPlanTargetsSprayCoversAnnouncedPool(t *testing.T) {
-	cfg := Config{SymmetricSpray: 16, PredictionSockets: 1}
-	peer := NATInfo{
-		Type:       stun.NatSymmetric,
-		PublicAddr: addr("111.55.212.114", 7857),
-		PublicIPs:  []net.IP{net.ParseIP("111.55.212.98"), net.ParseIP("111.55.212.110"), net.ParseIP("111.55.212.106")},
-		PoolCIDR:   &net.IPNet{IP: net.ParseIP("111.55.212.96").To4(), Mask: net.CIDRMask(27, 32)},
-	}
-	eps := planTargets(NATInfo{Type: stun.NatPortRestrictedCone}, peer, cfg)
-
-	seen := map[string]bool{}
-	for _, e := range eps {
-		if e.Kind == "spray" {
-			seen[e.Addr.IP.String()] = true
-		}
-	}
-	if !seen["111.55.212.102"] {
-		t.Fatalf("spray must cover the un-sampled pool address .102, got IPs %v", keys(seen))
-	}
-	// Sampled addresses must still be sprayed (pool widens, never replaces).
-	for _, ip := range []string{"111.55.212.114", "111.55.212.98", "111.55.212.110", "111.55.212.106"} {
-		if !seen[ip] {
-			t.Fatalf("spray lost sampled address %s", ip)
-		}
-	}
-}
-
-// Without an announced pool the spray must NOT invent extra addresses: a plain
-// symmetric peer with a single egress IP is sprayed only at that IP, so a
-// non-rotating NAT never triggers a wide flood.
-func TestPlanTargetsSprayWithoutPoolSingleIP(t *testing.T) {
-	cfg := Config{SymmetricSpray: 8, PredictionSockets: 1}
-	peer := NATInfo{Type: stun.NatSymmetric, PublicAddr: addr("111.55.212.114", 7857)}
-	eps := planTargets(NATInfo{Type: stun.NatPortRestrictedCone}, peer, cfg)
-	for _, e := range eps {
-		if e.Kind == "spray" && e.Addr.IP.String() != "111.55.212.114" {
-			t.Fatalf("no pool announced but spray aimed at %s", e.Addr.IP)
-		}
-	}
-}
-
-func keys(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
-}
-
-func TestPlanTargetsBlockSprayNoStep(t *testing.T) {
-	cfg := Config{PredictionSockets: 5}
-	peer := peerInfo(stun.NatSymmetric, addr("1.2.3.4", 40000), 0)
-	eps := planTargets(NATInfo{Type: stun.NatPortRestrictedCone}, peer, cfg)
-
-	var block []Endpoint
-	for _, e := range eps {
-		if e.Kind == "block" {
-			block = append(block, e)
-		}
-	}
-	if len(block) != 5 {
-		t.Fatalf("want 5 block endpoints, got %d", len(block))
-	}
-	base := 40000 + defaultPeerPortOffset
-	for i, e := range block {
-		// The leg walks a window from the offset guess: N targets must cover N
-		// distinct ports, not one port N times.
-		if e.Addr.Port != base+i || e.Addr.IP.String() != "1.2.3.4" {
-			t.Fatalf("block endpoint %d aimed at %s, want 1.2.3.4:%d", i, e.Addr, base+i)
-		}
-		// Step 1 fix: a cone(easy)-side probe must come from socket 0, since the
-		// peer's plant mapping was aimed at socket-0's external; packets from
-		// other sockets get dropped by the symmetric peer.
-		if e.Socket != 0 {
-			t.Fatalf("block probe must use socket 0, got socket %d", e.Socket)
-		}
-	}
-}
-
-// A hard (symmetric) peer that ALSO reports a PortStep must still get the
-// plant+block+spray handling -- the step diagonal is an extra bet, not a
-// replacement, because the diagonal assumes a stable base IP that a
-// destination-rotating CGNAT does not provide. Regression guard for the gap
-// where step-alignment used to be an exclusive branch and skipped the spray.
-func TestPlanTargetsStepAlignedPreferred(t *testing.T) {
-	cfg := Config{PredictionSockets: 4, SymmetricSpray: 12}
-	peer := peerInfo(stun.NatSymmetric, addr("1.2.3.4", 40000), 118)
-	eps := planTargets(NATInfo{}, peer, cfg)
-
-	var predicted, block, spray int
-	for _, e := range eps {
-		switch e.Kind {
-		case "predicted":
-			predicted++
-		case "block":
-			block++
-		case "spray":
-			spray++
-		}
-	}
-	if predicted != 4 {
-		t.Fatalf("step diagonal want 4, got %d", predicted)
-	}
-	if block == 0 || spray == 0 {
-		t.Fatalf("hard peer with a step must STILL spray (block=%d spray=%d)", block, spray)
-	}
-}
-
-// A cone-class peer with a measured step uses the step-aligned diagonal and
-// does NOT trigger the hard-symmetric spray.
-func TestPlanTargetsConeStepDiagonal(t *testing.T) {
-	cfg := Config{PredictionSockets: 5, SymmetricSpray: 10}
-	peer := peerInfo(stun.NatPortRestrictedCone, addr("1.2.3.4", 40000), 7)
-	eps := planTargets(NATInfo{Type: stun.NatFullCone}, peer, cfg)
-	var predicted, spray, block int
-	for _, e := range eps {
-		switch e.Kind {
-		case "predicted":
-			predicted++
-		case "spray":
-			spray++
-		case "block":
-			block++
-		}
-	}
-	if predicted != 5 {
-		t.Fatalf("cone+step want 5 diagonal, got %d", predicted)
-	}
-	if spray != 0 || block != 0 {
-		t.Fatalf("cone peer must not trigger hard spray/block (spray=%d block=%d)", spray, block)
-	}
-}
-
-// A cone peer is not sprayed by the block leg when this side is also cone;
-// only the plain public address is probed.
-func TestPlanTargetsConePeerNoBlock(t *testing.T) {
-	cfg := Config{PredictionSockets: 5}
-	peer := peerInfo(stun.NatPortRestrictedCone, addr("1.2.3.4", 40000), 0)
-	eps := planTargets(NATInfo{Type: stun.NatPortRestrictedCone}, peer, cfg)
-	for _, e := range eps {
-		if e.Kind == "block" {
-			t.Fatalf("cone-cone must not trigger block spray")
-		}
-	}
-}
-
-// The phone case: this side is symmetric but the peer is cone. The local
-// block must still be planted, or the cone peer's aim finds no mapping.
-func TestPlanTargetsBlockFiresWhenLocalHard(t *testing.T) {
-	cfg := Config{PredictionSockets: 6}
-	peer := peerInfo(stun.NatPortRestrictedCone, addr("1.2.3.4", 40000), 0)
-	my := NATInfo{Type: stun.NatSymmetric}
-	eps := planTargets(my, peer, cfg)
-	block := 0
-	for _, e := range eps {
-		if e.Kind == "block" {
-			if e.Addr.Port != 40000+defaultPeerPortOffset+block {
-				t.Fatalf("block aim %s, want port %d", e.Addr, 40000+defaultPeerPortOffset+block)
-			}
-			block++
-		}
-	}
-	if block != 6 {
-		t.Fatalf("symmetric local side must plant 6 block endpoints, got %d", block)
-	}
-}
-
-// Out-of-range offset port is skipped rather than emitting a wrapped endpoint.
-func TestPlanTargetsBlockPortOutOfRange(t *testing.T) {
-	cfg := Config{PredictionSockets: 5, PeerPortOffset: 65530}
-	peer := peerInfo(stun.NatSymmetric, addr("1.2.3.4", 40000), 0)
-	eps := planTargets(NATInfo{}, peer, cfg)
-	for _, e := range eps {
-		if e.Kind == "block" {
-			t.Fatalf("block endpoint should be dropped when port overflows")
-		}
-	}
-}
-
 func countKind(eps []Endpoint, kind string) []Endpoint {
 	var out []Endpoint
 	for _, e := range eps {
@@ -211,155 +25,306 @@ func countKind(eps []Endpoint, kind string) []Endpoint {
 	return out
 }
 
-// The cone side facing a hard peer (the Windows case): a wide spray window is
-// emitted at the peer's public IP from the primary socket only. This is the
-// birthday leg that connects a cellular CGNAT, which the block offset cannot.
-func TestPlanTargetsConeSpraysHardPeer(t *testing.T) {
-	cfg := Config{PredictionSockets: 5, SymmetricSpray: 64}
-	peer := peerInfo(stun.NatSymmetric, addr("1.2.3.4", 40000), 0)
+// NAT3 (Cone) facing NAT4 (Symmetric) must send ALL probes on Socket 0 (whose
+// public port NAT4 learned), never Socket 1..N which NAT4 drops.
+func TestPlanTargetsEasyFacingHardUsesSocketZeroOnly(t *testing.T) {
+	cfg := Config{PredictionSockets: 128, SymmetricSpray: 256}
+	peer := peerInfo(stun.NatSymmetric, addr("198.51.100.2", 40000), 118)
+	peer.PortBlockMin = 40000
+	peer.PortBlockMax = 40400
+	peer.PortPreserve = true
+	peer.PortPreserveOffset = 0
+	peer.PrivateAddr = addr("10.0.0.5", 30000)
+
 	eps := planTargets(NATInfo{Type: stun.NatPortRestrictedCone}, peer, cfg)
 
-	spray := countKind(eps, "spray")
-	if len(spray) != 64 {
-		t.Fatalf("want 64 spray endpoints, got %d", len(spray))
-	}
-	seen := map[int]bool{}
-	for _, e := range spray {
-		if e.Addr.IP.String() != "1.2.3.4" {
-			t.Fatalf("spray endpoint off the peer IP: %s", e.Addr)
+	for _, e := range eps {
+		if e.Kind == "plant" {
+			t.Fatalf("easy NAT3 side must not emit plant endpoints")
 		}
 		if e.Socket != 0 {
-			t.Fatalf("spray must use the primary socket, got %d", e.Socket)
+			t.Fatalf("easy NAT3 side probe kind=%s used socket %d, MUST be socket 0", e.Kind, e.Socket)
 		}
-		if seen[e.Addr.Port] {
-			t.Fatalf("duplicate spray port %d", e.Addr.Port)
-		}
-		seen[e.Addr.Port] = true
 	}
-	// Cone local side must not plant (it has no random port to hide).
-	if p := countKind(eps, "plant"); len(p) != 0 {
-		t.Fatalf("cone side should not plant, got %d", len(p))
+	if len(countKind(eps, "predicted")) == 0 {
+		t.Fatal("expected predicted step targets")
+	}
+	if len(countKind(eps, "preserve")) == 0 {
+		t.Fatal("expected port-preserve targets alongside predicted")
+	}
+	if len(countKind(eps, "pba")) == 0 {
+		t.Fatal("expected PBA block targets alongside predicted (no mutual exclusion)")
+	}
+	if len(countKind(eps, "spray")) == 0 {
+		t.Fatal("expected birthday-attack spray alongside step/pba (no mutual exclusion)")
 	}
 }
 
-// The hard side (the phone case) facing a cone peer plants every pool socket at
-// the peer's advertised public address -- NOT the offset port -- so the peer's
-// blind spray has mappings to collide with.
-func TestPlanTargetsHardSidePlants(t *testing.T) {
-	cfg := Config{PredictionSockets: 6, SymmetricSpray: 32}
-	peer := peerInfo(stun.NatPortRestrictedCone, addr("1.2.3.4", 40000), 0)
+// NAT4 (Symmetric) facing NAT3 (Cone) plants its pool sockets toward NAT3's
+// advertised public address so NAT3's spray/predicted probes can hit them.
+func TestPlanTargetsHardSidePlantsTowardCone(t *testing.T) {
+	cfg := Config{PredictionSockets: 16, SymmetricSpray: 64}
+	peer := peerInfo(stun.NatPortRestrictedCone, addr("203.0.113.10", 50000), 0)
 	my := NATInfo{Type: stun.NatSymmetric}
 	eps := planTargets(my, peer, cfg)
 
 	plant := countKind(eps, "plant")
-	if len(plant) != 5 { // sockets 1..5; socket 0 is covered by the public target
-		t.Fatalf("want 5 plant endpoints, got %d", len(plant))
+	if len(plant) != 15 { // sockets 1..15 (socket 0 covered by public)
+		t.Fatalf("want 15 plant endpoints, got %d", len(plant))
 	}
+	seenSock := map[int]bool{}
 	for _, e := range plant {
-		if e.Addr.String() != "1.2.3.4:40000" {
-			t.Fatalf("plant must aim at advertised public addr, got %s", e.Addr)
+		if e.Addr.String() != "203.0.113.10:50000" {
+			t.Fatalf("plant must aim at peer public addr, got %s", e.Addr)
+		}
+		seenSock[e.Socket] = true
+	}
+	for k := 1; k < 16; k++ {
+		if !seenSock[k] {
+			t.Fatalf("missing plant socket %d", k)
 		}
 	}
-	// Cone peer means this hard side does not spray.
-	if s := countKind(eps, "spray"); len(s) != 0 {
-		t.Fatalf("cone peer should not trigger local spray, got %d", len(s))
+	if len(countKind(eps, "spray")) != 0 {
+		t.Fatalf("hard peer toward cone should not spray")
 	}
 }
 
-// Both sides hard: plant our own mappings and still spray the peer, since each
-// side is blind to the other's random public ports.
+// Both sides hard (NAT4<->NAT4): local side plants pool sockets AND sprays peer.
 func TestPlanTargetsBothHardPlantAndSpray(t *testing.T) {
-	cfg := Config{PredictionSockets: 4, SymmetricSpray: 40}
-	peer := peerInfo(stun.NatSymmetric, addr("1.2.3.4", 40000), 0)
+	cfg := Config{PredictionSockets: 8, SymmetricSpray: 40}
+	peer := peerInfo(stun.NatSymmetric, addr("198.51.100.2", 40000), 0)
 	my := NATInfo{Type: stun.NatSymmetric}
 	eps := planTargets(my, peer, cfg)
-	if len(countKind(eps, "plant")) != 3 {
-		t.Fatalf("hard side should plant 3 extra sockets")
+
+	if len(countKind(eps, "plant")) != 7 {
+		t.Fatalf("hard side should plant 7 extra sockets, got %d", len(countKind(eps, "plant")))
 	}
 	if len(countKind(eps, "spray")) != 40 {
-		t.Fatalf("hard peer should be sprayed with 40 ports")
+		t.Fatalf("hard peer should be sprayed with 40 ports, got %d", len(countKind(eps, "spray")))
 	}
 }
 
-// The Windows↔phone reality: the hard peer rotates its public IP per
-// destination, so the cone side must spray the whole candidate set, not just
-// the single server-reported address.
+// Destination-rotating CGNAT: spray covers all distinct candidate IPs.
 func TestPlanTargetsSprayCoversCandidateIPs(t *testing.T) {
-	cfg := Config{PredictionSockets: 5, SymmetricSpray: 50}
+	cfg := Config{PredictionSockets: 16, SymmetricSpray: 50}
 	peer := peerInfo(stun.NatSymmetric, addr("223.104.77.212", 2501), 0)
-	peer.PublicIPs = []net.IP{net.ParseIP("223.104.77.220"), net.ParseIP("223.104.77.212")} // dup included
+	peer.PublicIPs = []net.IP{net.ParseIP("223.104.77.220"), net.ParseIP("223.104.77.212")}
+	peer.ObservedMappings = []*net.UDPAddr{addr("223.104.77.224", 2600)}
 	eps := planTargets(NATInfo{Type: stun.NatPortRestrictedCone}, peer, cfg)
 
 	perIP := map[string]int{}
 	for _, e := range countKind(eps, "spray") {
+		if e.Socket != 0 {
+			t.Fatalf("spray must use socket 0, got %d", e.Socket)
+		}
 		perIP[e.Addr.IP.String()]++
 	}
-	// Two distinct candidate IPs (dup dropped), each with the full 50-port window.
-	if len(perIP) != 2 {
-		t.Fatalf("spray should cover 2 distinct candidate IPs, got %v", perIP)
+	if len(perIP) != 3 {
+		t.Fatalf("spray should cover 3 distinct candidate IPs, got %v", perIP)
 	}
 	for ip, c := range perIP {
 		if c != 50 {
 			t.Fatalf("ip %s got %d spray ports, want 50", ip, c)
 		}
 	}
-	if perIP["223.104.77.212"] != 50 || perIP["223.104.77.220"] != 50 {
-		t.Fatalf("expected spray at both advertised + observed IPs, got %v", perIP)
-	}
 }
 
-// The multi-IP spray (the leg that cracks a destination-rotating CGNAT) must
-// fire even with the socket pool disabled -- it only uses the primary socket.
-// Regression guard: previously the whole hard branch was gated on
-// PredictionSockets > 1, so a single-socket config silently lost the spray.
-func TestPlanTargetsSprayWithoutPool(t *testing.T) {
-	cfg := Config{PredictionSockets: 1, SymmetricSpray: 30}
-	peer := peerInfo(stun.NatSymmetric, addr("1.2.3.4", 40000), 0)
-	eps := planTargets(NATInfo{Type: stun.NatPortRestrictedCone}, peer, cfg)
-	spray := countKind(eps, "spray")
-	if len(spray) != 30 {
-		t.Fatalf("spray must run without a pool: got %d, want 30", len(spray))
-	}
-	if len(countKind(eps, "block")) != 0 || len(countKind(eps, "plant")) != 0 {
-		t.Fatal("pool legs (block/plant) must be empty when PredictionSockets <= 1")
-	}
-}
-
-// A peer we could not classify must fail safe into the aggressive hard path --
-// an unknown/blocked peer gets the multi-IP spray, not the cone fast path that
-// silently drops the traversal a symmetric NAT would need. Regression guard for
-// "any network" where STUN classification can be ambiguous.
-func TestPlanTargetsUnknownFailsafeHard(t *testing.T) {
-	cfg := Config{PredictionSockets: 5, SymmetricSpray: 40}
-	for _, ty := range []stun.NATType{stun.NatUnknown, stun.NatBlocked, stun.NatUnmeasurable} {
-		peer := peerInfo(ty, addr("1.2.3.4", 40000), 0)
-		eps := planTargets(NATInfo{Type: stun.NatPortRestrictedCone}, peer, cfg)
-		if len(countKind(eps, "spray")) == 0 {
-			t.Fatalf("peer %s must trigger spray (fail-safe hard), got none", ty)
-		}
-	}
-}
-
-// distinctPorts yields unique, in-range ports and is capped at the range size.
-func TestDistinctPortsUnique(t *testing.T) {
-	ports := distinctPorts(1000)
-	if len(ports) != 1000 {
-		t.Fatalf("want 1000 ports, got %d", len(ports))
-	}
+// PortDeck draws without replacement across rounds until all unprivileged ports
+// are exhausted.
+func TestPortDeckWithoutReplacement(t *testing.T) {
+	deck := newPortDeck(nil)
 	seen := map[int]bool{}
-	for _, p := range ports {
-		if p < 1024 || p > 65535 {
-			t.Fatalf("port %d out of spray range", p)
+	for round := 0; round < 20; round++ {
+		batch := deck.next(256)
+		if len(batch) != 256 {
+			t.Fatalf("batch len = %d, want 256", len(batch))
 		}
-		if seen[p] {
-			t.Fatalf("duplicate port %d", p)
+		for _, p := range batch {
+			if p < 1024 || p > 65535 {
+				t.Fatalf("out-of-range port %d", p)
+			}
+			if seen[p] {
+				t.Fatalf("duplicate port %d drawn before deck exhausted (round %d)", p, round)
+			}
+			seen[p] = true
 		}
-		seen[p] = true
-	}
-	if got := len(distinctPorts(70000)); got != 64512 {
-		t.Fatalf("spray count should cap at range size, got %d", got)
-	}
-	if distinctPorts(0) != nil {
-		t.Fatalf("0 ports should be nil")
 	}
 }
+
+// Subnet-aware sameLAN matches custom /22 subnets as well as default /24.
+func TestSameLANSubnetAware(t *testing.T) {
+	_, cidr, _ := net.ParseCIDR("10.10.0.0/22")
+	a := net.ParseIP("10.10.1.5").To4()
+	b := net.ParseIP("10.10.2.8").To4()
+	if sameLAN(a, b, nil, nil) {
+		t.Fatal("without CIDR, /24 should not match different third octet")
+	}
+	if !sameLAN(a, b, []*net.IPNet{cidr}, nil) {
+		t.Fatal("with /22 CIDR, 10.10.1.5 and 10.10.2.8 should be same LAN")
+	}
+}
+
+func TestPlanTargetsFailSafeOnUnknownAndSinglePool(t *testing.T) {
+	for _, natType := range []stun.NATType{stun.NatUnknown, stun.NatBlocked} {
+		peer := peerInfo(natType, addr("198.51.100.2", 40000), 0)
+		// Even with PredictionSockets=1 (pool disabled), easy side still sprays on Socket 0.
+		eps := planTargets(NATInfo{Type: stun.NatPortRestrictedCone}, peer, Config{
+			PredictionSockets: 1,
+			SymmetricSpray:    32,
+		})
+		spray := countKind(eps, "spray")
+		if len(spray) != 32 {
+			t.Fatalf("nat=%s with pool=1: expected 32 spray endpoints, got %d", natType, len(spray))
+		}
+		for _, e := range spray {
+			if e.Socket != 0 {
+				t.Fatalf("spray must use socket 0, got %d", e.Socket)
+			}
+		}
+	}
+}
+
+func TestSprayIPsWholePoolAndRotation(t *testing.T) {
+	_, pool27, _ := net.ParseCIDR("111.55.212.96/27")
+	info := NATInfo{
+		Type:       stun.NatSymmetric,
+		PublicAddr: addr("111.55.212.114", 7857),
+		PublicIPs:  []net.IP{net.ParseIP("111.55.212.98")},
+		PoolCIDR:   pool27,
+	}
+	ips := info.SprayIPs(64, 0)
+	got := map[string]bool{}
+	for _, ip := range ips {
+		got[ip.String()] = true
+	}
+	if !got["111.55.212.102"] || !got["111.55.212.114"] {
+		t.Fatalf("expected un-sampled .102 and primary .114 in /27 expansion, got %d IPs", len(got))
+	}
+
+	// Larger /24 pool (256 IPs) with max=64 rotates cleanly across 4 rounds to cover all 256 IPs.
+	_, pool24, _ := net.ParseCIDR("198.51.100.0/24")
+	wide := NATInfo{
+		Type:       stun.NatSymmetric,
+		PublicAddr: addr("198.51.100.1", 5000),
+		PoolCIDR:   pool24,
+	}
+	covered := map[string]bool{}
+	for round := 0; round < 4; round++ {
+		for _, ip := range wide.SprayIPs(64, round) {
+			covered[ip.String()] = true
+		}
+	}
+	if len(covered) != 256 {
+		t.Fatalf("expected 4 rounds of 64 to cover all 256 hosts in /24, covered %d", len(covered))
+	}
+}
+
+func TestWeightedSprayDoesNotDiluteObservedIPs(t *testing.T) {
+	_, pool26, _ := net.ParseCIDR("198.51.100.0/26")
+	peer := NATInfo{
+		Type:       stun.NatSymmetric,
+		PublicAddr: addr("198.51.100.5", 40000),
+		PoolCIDR:   pool26,
+	}
+	eps := planTargetsWithDeck(NATInfo{Type: stun.NatPortRestrictedCone}, peer, Config{
+		PredictionSockets: 128,
+		SymmetricSpray:    256,
+		SprayIPMax:        64,
+	}, newPortDeck(nil), 0)
+
+	spray := countKind(eps, "spray")
+	perIP := map[string]int{}
+	for _, e := range spray {
+		perIP[e.Addr.IP.String()]++
+	}
+	if perIP["198.51.100.5"] != 256 {
+		t.Fatalf("primary observed IP got %d spray ports, want full 256", perIP["198.51.100.5"])
+	}
+	if len(perIP) != 64 {
+		t.Fatalf("expected all 64 /26 IPs to receive probes, got %d", len(perIP))
+	}
+	for ip, cnt := range perIP {
+		if ip != "198.51.100.5" && cnt < 128 {
+			t.Fatalf("cold pool IP %s got only %d ports, want >= 128 floor for unsampled rescue", ip, cnt)
+		}
+	}
+	// First 256 spray endpoints must target the hot observed IP before cold pool IPs.
+	for i := 0; i < 256; i++ {
+		if spray[i].Addr.IP.String() != "198.51.100.5" {
+			t.Fatalf("spray[%d] = %s, expected hot observed IP prioritized first", i, spray[i].Addr.IP)
+		}
+	}
+	if len(spray) >= 10000 {
+		t.Fatalf("weighted spray should substantially reduce packet load vs 16384 equal-256 (got %d)", len(spray))
+	}
+}
+
+func TestStaggeredPlantRefresh(t *testing.T) {
+	cfg := Config{PredictionSockets: 128, SymmetricSpray: 64}
+	my := NATInfo{Type: stun.NatSymmetric, PublicAddr: addr("198.51.100.2", 40000)}
+	peer := peerInfo(stun.NatPortRestrictedCone, addr("203.0.113.10", 50000), 0)
+
+	// Round 0 and 1 plant the full pool.
+	for r := 0; r < 2; r++ {
+		p := countKind(planTargetsWithDeck(my, peer, cfg, nil, r), "plant")
+		if len(p) != 127 {
+			t.Fatalf("round %d: want full 127 plant sockets, got %d", r, len(p))
+		}
+	}
+
+	// Round 2+ refreshes only a small rotating batch per round and covers all 127 across rounds.
+	seen := map[int]bool{}
+	for r := 2; r < 20; r++ {
+		p := countKind(planTargetsWithDeck(my, peer, cfg, nil, r), "plant")
+		if len(p) == 0 || len(p) > 32 {
+			t.Fatalf("round %d: want staggered batch in [1..32], got %d", r, len(p))
+		}
+		for _, e := range p {
+			seen[e.Socket] = true
+		}
+	}
+	if len(seen) != 127 {
+		t.Fatalf("expected staggered rotation to cover all 127 sockets, covered %d", len(seen))
+	}
+}
+
+func TestAlignPBABoundsSnapsToBRASBlocks(t *testing.T) {
+	// Narrow sample near the top of a 256-port block [49408..49663] (193*256).
+	lo, hi := alignPBABounds(49640, 49660)
+	if lo > 49408 || hi < 49663 {
+		t.Fatalf("expected 256-block coverage [49408..49663], got %d..%d", lo, hi)
+	}
+	// Wider sample spanning into a 512-port block [49152..49663] (96*512).
+	lo2, hi2 := alignPBABounds(49200, 49660)
+	if lo2 > 49152 || hi2 < 49663 {
+		t.Fatalf("expected 512-block coverage [49152..49663], got %d..%d", lo2, hi2)
+	}
+}
+
+func TestClassifyPacketTierOrdering(t *testing.T) {
+	my := NATInfo{
+		PrivateAddr: addr("192.168.1.10", 5000),
+		IPv6Addr:    &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 6000},
+	}
+	peer := NATInfo{
+		PublicAddr:  addr("203.0.113.5", 40000),
+		PrivateAddr: addr("192.168.1.20", 5001),
+		UPnPAddr:    addr("203.0.113.5", 35000),
+		IPv6Addr:    &net.UDPAddr{IP: net.ParseIP("2001:db8::2"), Port: 6001},
+	}
+	cfg := Config{EnableLAN: true}
+
+	tLAN := classifyPacketTier(my, peer, cfg, addr("192.168.1.20", 5001), 0)
+	tIPv6 := classifyPacketTier(my, peer, cfg, peer.IPv6Addr, -1)
+	tUPnP := classifyPacketTier(my, peer, cfg, peer.UPnPAddr, 0)
+	tPub := classifyPacketTier(my, peer, cfg, peer.PublicAddr, 0)
+
+	if !(tLAN > tIPv6 && tIPv6 > tUPnP && tUPnP > tPub) {
+		t.Fatalf("unexpected tier ordering: lan=%d ipv6=%d upnp=%d public=%d", tLAN, tIPv6, tUPnP, tPub)
+	}
+	// When EnableLAN is false, private LAN addresses must not win as LAN.
+	if got := classifyPacketTier(my, peer, Config{EnableLAN: false}, addr("192.168.1.20", 5001), 0); got != tierPublic {
+		t.Fatalf("expected tierPublic when EnableLAN=false, got %s", got)
+	}
+}
+

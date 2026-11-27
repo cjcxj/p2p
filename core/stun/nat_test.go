@@ -4,13 +4,12 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 // fakeResponder answers plain binding requests with a fixed mapped address.
-// That is what a client sees through a NAT: the address the server reports has
-// nothing to do with the socket the request came from.
 type fakeResponder struct {
 	conn       *net.UDPConn
 	mappedPort int
@@ -26,10 +25,6 @@ func newFakeResponder(t *testing.T, mappedPort int, plainOnly bool) *fakeRespond
 	return newFakeResponderOn(t, conn, mappedPort, plainOnly)
 }
 
-// newFakeResponderOn serves an already bound socket, so a test can pin a
-// responder to an exact port -- which the cone subtype needs, because the
-// question "did the server answer from port+1?" is only well defined when the
-// test controls what lives at port+1.
 func newFakeResponderOn(t *testing.T, conn *net.UDPConn, mappedPort int, plainOnly bool) *fakeResponder {
 	t.Helper()
 	f := &fakeResponder{conn: conn, mappedPort: mappedPort, plainOnly: plainOnly}
@@ -47,7 +42,7 @@ func newFakeResponderOn(t *testing.T, conn *net.UDPConn, mappedPort int, plainOn
 			}
 			changeIP, changePort, ok := msg.ChangeRequest()
 			if f.plainOnly && ok && (changeIP || changePort) {
-				continue // a single-port deployment stays silent
+				continue
 			}
 			resp := NewBindingSuccess(msg.TID)
 			resp.SetXORMappedAddress(net.IPv4(127, 0, 0, 1), f.mappedPort)
@@ -63,9 +58,6 @@ func (f *fakeResponder) addr() *net.UDPAddr {
 	return f.conn.LocalAddr().(*net.UDPAddr)
 }
 
-// newFakeResponderMapped is a responder that reports a chosen public IP (not
-// just 127.0.0.1) so a test can emulate a destination-rotating CGNAT: the same
-// client is seen at a different address by each observation point.
 func newFakeResponderMapped(t *testing.T, mappedIP string, mappedPort int) *fakeResponder {
 	t.Helper()
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
@@ -86,7 +78,7 @@ func newFakeResponderMapped(t *testing.T, mappedIP string, mappedPort int) *fake
 				continue
 			}
 			if _, _, ok := msg.ChangeRequest(); ok {
-				continue // single-port, change-request stays silent
+				continue
 			}
 			resp := NewBindingSuccess(msg.TID)
 			resp.SetXORMappedAddress(ip, mappedPort)
@@ -113,9 +105,9 @@ func detectAgainst(t *testing.T, primary *fakeResponder, secondaries []string) *
 		Conn:             conn,
 		Server:           primary.addr(),
 		Retries:          0,
-		Timeout:          400 * time.Millisecond,
+		Timeout:          300 * time.Millisecond,
 		Secondaries:      secondaries,
-		SecondaryTimeout: 400 * time.Millisecond,
+		SecondaryTimeout: 300 * time.Millisecond,
 	}
 	det, err := c.Detect()
 	if err != nil {
@@ -124,13 +116,6 @@ func detectAgainst(t *testing.T, primary *fakeResponder, secondaries []string) *
 	return det
 }
 
-// A STUN server that listens on one UDP port -- which is how a combined
-// signaling+STUN+relay deployment normally runs -- cannot tell a symmetric NAT
-// from a cone one by itself. Before the alternate-destination list existed,
-// that case silently fell through to "port_restricted_cone" and every
-// symmetric peer got the wrong punching plan.
-// consecutiveResponders binds two responders on two adjacent UDP ports, which
-// is how a test emulates "the server also answers from port+1".
 func consecutiveResponders(t *testing.T, mappedA, mappedB int) (*fakeResponder, *fakeResponder) {
 	t.Helper()
 	stride := int(time.Now().UnixNano()%900) * 2
@@ -159,8 +144,6 @@ func TestDetectUsesAlternateDestinations(t *testing.T) {
 	t.Run("same mapping from a second destination is cone", func(t *testing.T) {
 		alt := newFakeResponder(t, 41000, true)
 		det := detectAgainst(t, primary, []string{alt.hostPort()})
-		// The grade depends only on whether the server's own second port was
-		// reachable, and here it was not: an unrelated host answered.
 		if det.NATType != NatCone && det.NATType != NatPortRestrictedCone {
 			t.Fatalf("NAT type = %s, want a cone result (%s)", det.NATType, det.Method())
 		}
@@ -208,15 +191,13 @@ func TestDetectUsesAlternateDestinations(t *testing.T) {
 	})
 }
 
-// Grading full vs address vs port restricted rests on the change-port test,
-// and that test is only evidence when something can answer from the server's
-// second port. A single-port deployment used to report every cone network as
-// "port_restricted_cone", which is what made a home router look stricter than
-// it is and hid whether a symmetric peer's first probe can reach it at all.
 func TestConeSubtypeNeedsSecondServerPort(t *testing.T) {
 	t.Run("second server port answers, subtype is graded", func(t *testing.T) {
 		primary, altPort := consecutiveResponders(t, 42000, 42000)
-		det := detectAgainst(t, primary, nil)
+		// Pass an empty non-nil list or local alt responder so sandbox does not
+		// block waiting on unreachable public STUNs. Note secondaryAddrs uses
+		// DefaultSecondaries when Secondaries is nil/empty, so pass altPort itself.
+		det := detectAgainst(t, primary, []string{altPort.hostPort()})
 		if det.NATType != NatPortRestrictedCone {
 			t.Fatalf("NAT type = %s, want %s (%s)", det.NATType, NatPortRestrictedCone, det.Method())
 		}
@@ -230,7 +211,7 @@ func TestConeSubtypeNeedsSecondServerPort(t *testing.T) {
 
 	t.Run("no second server port, subtype stays unmeasured", func(t *testing.T) {
 		primary, dead := consecutiveResponders(t, 42000, 42000)
-		dead.conn.Close() // leave primary.port+1 unanswered
+		dead.conn.Close()
 		alt := newFakeResponder(t, 42000, true)
 		det := detectAgainst(t, primary, []string{alt.hostPort()})
 		if det.NATType != NatCone {
@@ -245,30 +226,13 @@ func TestConeSubtypeNeedsSecondServerPort(t *testing.T) {
 	})
 }
 
-// The generalization the deployment relies on: with several configured STUN
-// observation points, a destination-rotating CGNAT is seen at a DIFFERENT public
-// IP by each, and Detect must collect the whole candidate set (not just the
-// primary). The easy peer sprays at every one of them, which is what turns a
-// "we happened to sample the right IP" case into a configurable mechanism.
-// ResolveAllUDPAddr must be safe with no DNS: an IPv4 literal resolves to
-// itself (so adb-shell and offline paths are unaffected), and empty is nil.
-func TestResolveAllUDPAddrLiteralSafe(t *testing.T) {
-	got := ResolveAllUDPAddr("203.0.113.7:3478")
-	if len(got) != 1 || got[0].IP.String() != "203.0.113.7" || got[0].Port != 3478 {
-		t.Fatalf("literal IPv4 must resolve to itself, got %v", got)
-	}
-	if len(ResolveAllUDPAddr("")) != 0 {
-		t.Fatal("empty must yield no addresses")
-	}
-}
-
-func TestDetectCollectsMultiSTUNCandidateIPs(t *testing.T) {
+func TestDetectCollectsMultiSTUNCandidateIPsAndMappings(t *testing.T) {
 	primary := newFakeResponderMapped(t, "203.0.113.212", 43000)
-	s1 := newFakeResponderMapped(t, "203.0.113.216", 43000)
-	s2 := newFakeResponderMapped(t, "203.0.113.220", 43000)
-	dead := newFakeResponderMapped(t, "203.0.113.224", 43000)
+	s1 := newFakeResponderMapped(t, "203.0.113.216", 43008)
+	s2 := newFakeResponderMapped(t, "203.0.113.220", 43016)
+	dead := newFakeResponderMapped(t, "203.0.113.224", 43024)
 	deadPort := dead.addr().Port
-	dead.conn.Close() // an unreachable observation point must be skipped, not fatal
+	dead.conn.Close()
 
 	det := detectAgainst(t, primary, []string{
 		s1.hostPort(),
@@ -291,14 +255,123 @@ func TestDetectCollectsMultiSTUNCandidateIPs(t *testing.T) {
 	if seen["203.0.113.224"] {
 		t.Fatal("unreachable observation point must not contribute a candidate")
 	}
+	if len(det.ObservedMappings) < 3 {
+		t.Fatalf("expected >= 3 full observed mappings, got %v", det.ObservedMappings)
+	}
 }
 
-// The exact China Unicom 111.55 field sample, run through the PRODUCTION
-// CoveringPool (the function buildCandidate advertises and nat-check prints).
-// STUN saw .114/.98/.110/.106 but never the .102 the carrier uses toward a
-// given peer; the covering prefix must still contain .102 so the cone peer's
-// whole-block spray reaches it. This pins the real-world numbers that the
-// 111.55 NAT3<->NAT4 rescue depends on.
+func TestXORMappedIPv6RoundTrip(t *testing.T) {
+	req := NewBindingRequest()
+	resp := NewBindingSuccess(req.TID)
+	ip6 := net.ParseIP("2001:db8:85a3::8a2e:370:7334")
+	resp.SetXORMappedAddress(ip6, 51820)
+	raw := resp.Encode()
+
+	dec, err := Decode(raw)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got, err := dec.MappedAddress()
+	if err != nil {
+		t.Fatalf("MappedAddress: %v", err)
+	}
+	if !got.IP.Equal(ip6) || got.Port != 51820 {
+		t.Fatalf("got %s, want [%s]:51820", got, ip6)
+	}
+}
+
+func findFreePortBlock(t *testing.T, start, count int) int {
+	t.Helper()
+	for base := start; base < 32000-count; base += count {
+		var conns []*net.UDPConn
+		ok := true
+		for i := 0; i < count; i++ {
+			c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: base + i})
+			if err != nil {
+				ok = false
+				break
+			}
+			conns = append(conns, c)
+		}
+		for _, c := range conns {
+			c.Close()
+		}
+		if ok {
+			return base
+		}
+	}
+	return start
+}
+
+func TestAnalyzeAllocationPatterns(t *testing.T) {
+	startDynamicSTUN := func(t *testing.T, mapper func(srcPort int) int) *net.UDPAddr {
+		t.Helper()
+		conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		go func() {
+			buf := make([]byte, 2048)
+			for {
+				n, src, err := conn.ReadFromUDP(buf)
+				if err != nil {
+					return
+				}
+				msg, err := Decode(buf[:n])
+				if err != nil || msg.Type != BindingRequest {
+					continue
+				}
+				resp := NewBindingSuccess(msg.TID)
+				resp.SetXORMappedAddress(net.IPv4(127, 0, 0, 1), mapper(src.Port))
+				conn.WriteToUDP(resp.Encode(), src)
+			}
+		}()
+		return conn.LocalAddr().(*net.UDPAddr)
+	}
+
+	t.Run("port preserving with offset", func(t *testing.T) {
+		base := findFreePortBlock(t, 24000, 4)
+		srv := startDynamicSTUN(t, func(srcPort int) int { return srcPort + 1000 })
+		pat := AnalyzeAllocation(srv, base, 4, 300*time.Millisecond)
+		if !pat.PortPreserve || pat.PortPreserveOffset != 1000 {
+			t.Fatalf("expected PortPreserve offset +1000, got %+v", pat)
+		}
+	})
+
+	t.Run("linear port step and PBA block", func(t *testing.T) {
+		base := findFreePortBlock(t, 24100, 4)
+		var seq atomic.Int32
+		seq.Store(0)
+		// Note: concurrent goroutines might arrive out of order, so base on
+		// srcPort delta for deterministic step simulation.
+		srv := startDynamicSTUN(t, func(srcPort int) int {
+			return 45000 + (srcPort-base)*25
+		})
+		pat := AnalyzeAllocation(srv, base, 4, 300*time.Millisecond)
+		if pat.PortStep != 25 {
+			t.Fatalf("expected PortStep 25, got %+v", pat)
+		}
+		if pat.BlockMin != 45000 || pat.BlockMax != 45075 {
+			t.Fatalf("expected PBA block 45000..45075, got %d..%d", pat.BlockMin, pat.BlockMax)
+		}
+	})
+}
+
+func TestResolveAllUDPAddr(t *testing.T) {
+	addrs := ResolveAllUDPAddr("127.0.0.1:3478")
+	if len(addrs) != 1 || addrs[0].String() != "127.0.0.1:3478" {
+		t.Fatalf("literal IPv4 failed: %+v", addrs)
+	}
+	if got := ResolveAllUDPAddr(""); len(got) != 0 {
+		t.Fatalf("empty input should return nil, got %+v", got)
+	}
+	local := ResolveAllUDPAddr("localhost:3478")
+	if len(local) == 0 {
+		t.Fatal("expected at least one resolved address for localhost:3478")
+	}
+}
+
 func TestCoveringPoolRealUnicomSample(t *testing.T) {
 	d := &Detection{
 		MappedAddr: &net.UDPAddr{IP: net.ParseIP("111.55.212.114"), Port: 7857},
@@ -318,15 +391,11 @@ func TestCoveringPoolRealUnicomSample(t *testing.T) {
 	}
 	for _, ip := range []string{"111.55.212.102", "111.55.212.114", "111.55.212.98"} {
 		if !pool.Contains(net.ParseIP(ip)) {
-			t.Fatalf("pool %s must contain %s (the un-sampled .102 is the whole point)", pool, ip)
+			t.Fatalf("pool %s must contain %s", pool, ip)
 		}
 	}
 }
 
-// The China Mobile 223.104 field sample: a symmetric NAT that keeps ONE egress
-// IP across all destinations (only the port rotates). CoveringPool must return
-// nil -- there is nothing to expand, and a single candidate already reaches the
-// peer, so no wide spray is triggered.
 func TestCoveringPoolIPStableSymmetric(t *testing.T) {
 	d := &Detection{
 		MappedAddr:  &net.UDPAddr{IP: net.ParseIP("223.104.80.77"), Port: 15684},
@@ -336,3 +405,17 @@ func TestCoveringPoolIPStableSymmetric(t *testing.T) {
 		t.Fatalf("single egress IP must not announce a pool, got %s", pool)
 	}
 }
+
+func TestCoveringPoolWideSpreadRejected(t *testing.T) {
+	d := &Detection{
+		MappedAddr: &net.UDPAddr{IP: net.ParseIP("111.55.0.10"), Port: 12000},
+		ObservedIPs: []net.IP{
+			net.ParseIP("111.55.0.10"),
+			net.ParseIP("111.55.16.10"), // spans /19, wider than /20 limit
+		},
+	}
+	if pool := d.CoveringPool(); pool != nil {
+		t.Fatalf("spread wider than /20 must return nil, got %s", pool)
+	}
+}
+

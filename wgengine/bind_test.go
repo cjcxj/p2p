@@ -58,3 +58,81 @@ func TestBindSendFallsBackToConn(t *testing.T) {
 		t.Fatalf("send through conn: %v", err)
 	}
 }
+
+func TestBindForgetInitiationOnResponse(t *testing.T) {
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer pc.Close()
+
+	b := NewBind(pc)
+	from := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 41234}
+	initPkt := make([]byte, 148)
+	initPkt[0] = 1
+	b.Ingest(initPkt, from)
+	// Drain the live receive queued by Ingest.
+	select {
+	case in := <-b.rx:
+		b.pool.Put(&in.buf)
+	default:
+		t.Fatal("expected initial packet queued")
+	}
+
+	// Emitting a Handshake Response (type 2) to the peer consumes the cached
+	// initiation so a later RemovePeer+AddPeer does not replay a stale one.
+	ep, err := b.ParseEndpoint(from.String())
+	if err != nil {
+		t.Fatalf("parse endpoint: %v", err)
+	}
+	resp := make([]byte, 92)
+	resp[0] = 2
+	b.SetSender(func([]byte, *net.UDPAddr) error { return nil })
+	if err := b.Send([][]byte{resp}, ep); err != nil {
+		t.Fatalf("send response: %v", err)
+	}
+	b.ReplayInitiation(from.String())
+	select {
+	case <-b.rx:
+		t.Fatal("answered initiation was replayed")
+	default:
+	}
+
+	// ForgetInitiation also drops un-answered cached initiations on peer removal.
+	b.Ingest(initPkt, from)
+	in := <-b.rx
+	b.pool.Put(&in.buf)
+	b.ForgetInitiation(from.String())
+	b.ReplayInitiation(from.String())
+	select {
+	case <-b.rx:
+		t.Fatal("forgotten initiation was replayed")
+	default:
+	}
+}
+
+func TestBindCacheInitEvictsOldest(t *testing.T) {
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer pc.Close()
+
+	b := NewBind(pc)
+	initPkt := make([]byte, 148)
+	initPkt[0] = 1
+	for i := 0; i < 40; i++ {
+		addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50000 + i}
+		b.Ingest(initPkt, addr)
+		in := <-b.rx
+		b.pool.Put(&in.buf)
+	}
+
+	b.mu.Lock()
+	count := len(b.recentInit)
+	b.mu.Unlock()
+	if count != 32 {
+		t.Fatalf("recentInit len = %d, want 32 (only excess oldest evicted)", count)
+	}
+}
+

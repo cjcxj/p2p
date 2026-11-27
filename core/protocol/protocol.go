@@ -55,7 +55,8 @@ const (
 	MsgAuthOK     = "auth_ok"
 	MsgWelcome    = "welcome"
 	MsgMembers    = "members"
-	MsgCandidate  = "candidate"
+	MsgCandidate = "candidate"
+	MsgPunchSync = "punch_sync"
 	MsgPing       = "ping"
 	MsgError      = "error"
 	MsgLeave      = "leave"
@@ -67,34 +68,47 @@ type MemberInfo struct {
 	VirtualIP string `json:"virtual_ip"`
 }
 
-// Candidate carries everything a peer needs to attempt hole punching
-// against another peer.
+// Candidate carries everything a peer needs to attempt direct hole punching
+// against another peer across NAT3/NAT4 environments.
 type Candidate struct {
-	PeerID      string `json:"peer_id"`
-	VirtualIP   string `json:"virtual_ip"`
-	NATType     string `json:"nat_type"`
-	PublicAddr  string `json:"public_addr"`
-	PrivateAddr string `json:"private_addr"`
-	PortDelta   int    `json:"port_delta"`
-	PortStep    int    `json:"port_step,omitempty"`
+	PeerID             string   `json:"peer_id"`
+	VirtualIP          string   `json:"virtual_ip"`
+	NATType            string   `json:"nat_type"`
+	PublicAddr         string   `json:"public_addr"`
+	PrivateAddr        string   `json:"private_addr"`
+	ExtraPrivateAddrs  []string `json:"extra_private_addrs,omitempty"`
+	PrivateCIDRs       []string `json:"private_cidrs,omitempty"`
+	PortDelta          int      `json:"port_delta"`
+	PortStep           int      `json:"port_step,omitempty"`
+	PortPreserve       bool     `json:"port_preserve,omitempty"`
+	PortPreserveOffset int      `json:"port_preserve_offset,omitempty"`
+	PortBlockMin       int      `json:"port_block_min,omitempty"`
+	PortBlockMax       int      `json:"port_block_max,omitempty"`
+	ObservedMappings   []string `json:"observed_mappings,omitempty"`
+	PoolSize           int      `json:"pool_size,omitempty"`
+	PoolPorts          []int    `json:"pool_ports,omitempty"`
+	IPv6Addr           string   `json:"ipv6_addr,omitempty"`
+	UPnPAddr           string   `json:"upnp_addr,omitempty"`
 	// X25519Pub is the sender's X25519 public key (hex, 32 bytes) used to
-	// derive a per-pair data-plane AEAD key. Older peers omit it and the
-	// session falls back to plaintext data.
+	// derive a per-pair data-plane AEAD key and WireGuard peer identity.
 	X25519Pub string `json:"x25519_pub,omitempty"`
 }
 
 // Message is the JSON-over-TCP wire frame exchanged over signaling.
 type Message struct {
-	Type       string       `json:"type"`
-	Room       string       `json:"room,omitempty"`
-	Token      string       `json:"token,omitempty"`
-	PeerID     string       `json:"peer_id,omitempty"`
-	VirtualIP  string       `json:"virtual_ip,omitempty"`
-	Network    string       `json:"network,omitempty"`
-	Members    []MemberInfo `json:"members,omitempty"`
-	Candidate  *Candidate   `json:"candidate,omitempty"`
-	User       string       `json:"user,omitempty"`
-	Nonce      string       `json:"nonce,omitempty"`
-	Proof      string       `json:"proof,omitempty"`
-	Error      string       `json:"error,omitempty"`
+	Type        string       `json:"type"`
+	Room        string       `json:"room,omitempty"`
+	Token       string       `json:"token,omitempty"`
+	PeerID      string       `json:"peer_id,omitempty"`
+	TargetID    string       `json:"target_id,omitempty"`
+	VirtualIP   string       `json:"virtual_ip,omitempty"`
+	Network     string       `json:"network,omitempty"`
+	STUNServers []string     `json:"stun_servers,omitempty"`
+	Members     []MemberInfo `json:"members,omitempty"`
+	Candidate   *Candidate   `json:"candidate,omitempty"`
+	AnchorAddr  string       `json:"anchor_addr,omitempty"`
+	User        string       `json:"user,omitempty"`
+	Nonce       string       `json:"nonce,omitempty"`
+	Proof       string       `json:"proof,omitempty"`
+	Error       string       `json:"error,omitempty"`
 }

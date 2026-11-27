@@ -25,7 +25,7 @@ func (f *FakeTUN) inject(pkt []byte) bool {
 func benchTunnel(b *testing.B, size int) {
 	b.ReportAllocs()
 	p := established(b)
-	p.tunB.SetRaw(true)
+	p.tunB.raw.Store(true)
 	pkt := echoRequest(vipA, vipB, size)
 
 	b.SetBytes(int64(size))
@@ -49,7 +49,7 @@ func benchTunnel(b *testing.B, size int) {
 func benchPipeline(b *testing.B, size int) {
 	b.ReportAllocs()
 	p := established(b)
-	p.tunB.SetRaw(true)
+	p.tunB.raw.Store(true)
 	pkt := echoRequest(vipA, vipB, size)
 
 	var got atomic.Int64
@@ -97,7 +97,7 @@ func TestTunnelSustained(t *testing.T) {
 	const window = 3 * time.Second
 	for _, size := range []int{1420, 512} {
 		p := established(t)
-		p.tunB.SetRaw(true)
+		p.tunB.raw.Store(true)
 		pkt := echoRequest(vipA, vipB, size)
 
 		var got atomic.Int64

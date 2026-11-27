@@ -57,6 +57,9 @@ func (s *Session) wgPrivateHex() (string, error) {
 // to the executable. On Android the interface comes from VpnService, so use
 // AttachTUN with its file descriptor instead.
 func (s *Session) OpenTUN(mtu int) error {
+	s.tunMu.Lock()
+	defer s.tunMu.Unlock()
+
 	s.mu.Lock()
 	if s.cfg.LegacyMesh {
 		s.mu.Unlock()
@@ -75,7 +78,7 @@ func (s *Session) OpenTUN(mtu int) error {
 	if err != nil {
 		return err
 	}
-	return s.startTunnel(dev.TUN(), dev.Name())
+	return s.startTunnelLocked(dev.TUN(), dev.Name())
 }
 
 // TUNName returns the OS name of the interface OpenTUN created, or the name of
@@ -91,6 +94,12 @@ func (s *Session) TUNName() string {
 // IP packets now travel as WireGuard frames on the socket the punch engine
 // reads, separated from punch frames by their leading byte.
 func (s *Session) startTunnel(dev tun.Device, name string) error {
+	s.tunMu.Lock()
+	defer s.tunMu.Unlock()
+	return s.startTunnelLocked(dev, name)
+}
+
+func (s *Session) startTunnelLocked(dev tun.Device, name string) error {
 	priv, err := s.wgPrivateHex()
 	if err != nil {
 		dev.Close()
@@ -107,6 +116,11 @@ func (s *Session) startTunnel(dev tun.Device, name string) error {
 		t.Stop()
 		return net.ErrClosed
 	}
+	if s.tunnel != nil || s.tunFile != nil {
+		s.mu.Unlock()
+		t.Stop()
+		return errors.New("p2p: tun already attached")
+	}
 	s.tunnel = t
 	s.tunnelName = name
 	ph := s.ph
@@ -114,7 +128,7 @@ func (s *Session) startTunnel(dev tun.Device, name string) error {
 	if ph != nil {
 		wireTunnel(t, ph)
 	}
-	s.applyTunnelPeers(s.pendingTunnelPeers())
+	s.applyTunnelPeersLocked(s.pendingTunnelPeers())
 	if s.cfg.Debug {
 		// Handshake state is the first thing to look at when an interface is up
 		// but carries nothing, and on a phone the log is the only way to see it.
@@ -123,9 +137,7 @@ func (s *Session) startTunnel(dev tun.Device, name string) error {
 	return nil
 }
 
-// pendingTunnelPeers lists the peers the tunnel can carry right now. Relay
-// links are excluded: WireGuard writes its frames straight to the endpoint,
-// and a relay only forwards its own framing.
+// pendingTunnelPeers lists the peers the tunnel can carry right now.
 func (s *Session) pendingTunnelPeers() []tunnelPeer {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -172,9 +184,9 @@ func (s *Session) tunnelPeer(id string, r *remote) (tp tunnelPeer, stale string,
 	return tp, stale, true
 }
 
-// applyTunnelPeers installs peer entries and remembers the exact entry each one
-// got, so a later change of key or endpoint is noticed.
-func (s *Session) applyTunnelPeers(list []tunnelPeer) {
+// applyTunnelPeersLocked installs peer entries and remembers the exact entry each
+// one got, so a later change of key or endpoint is noticed. Caller holds s.tunMu.
+func (s *Session) applyTunnelPeersLocked(list []tunnelPeer) {
 	if len(list) == 0 {
 		return
 	}
@@ -190,18 +202,18 @@ func (s *Session) applyTunnelPeers(list []tunnelPeer) {
 			continue
 		}
 		s.mu.Lock()
-		if r := s.peers[tp.id]; r != nil && r.wgPub == tp.pub {
+		if r := s.peers[tp.id]; r != nil && r.wgPub == tp.pub && r.connected && r.endpoint == tp.endpoint {
 			r.wgApplied = tp
 		}
 		s.mu.Unlock()
 	}
 }
 
-// dropTunnelPeer removes the entry a peer left behind in the tunnel. Removal is
-// keyed by the public key that was installed, which is the only thing RemovePeer
-// needs -- requiring an endpoint as well would leak the entry of a peer that was
-// installed and then lost its path.
-func (s *Session) dropTunnelPeer(pub string) {
+// dropTunnelPeerLocked removes the entry a peer left behind in the tunnel.
+// Caller holds s.tunMu. Removal is keyed by the public key that was installed,
+// which is the only thing RemovePeer needs -- requiring an endpoint as well
+// would leak the entry of a peer that was installed and then lost its path.
+func (s *Session) dropTunnelPeerLocked(pub string) {
 	if pub == "" {
 		return
 	}
@@ -221,9 +233,11 @@ func (s *Session) dropTunnelPeer(pub string) {
 // a phone's VPN interface off does not mean having to re-punch to turn it back
 // on. Calling it with no tunnel attached does nothing.
 func (s *Session) CloseTUN() {
+	s.tunMu.Lock()
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		s.tunMu.Unlock()
 		return
 	}
 	tun := s.tunnel
@@ -250,6 +264,7 @@ func (s *Session) CloseTUN() {
 	if tun != nil {
 		tun.Stop()
 	}
+	s.tunMu.Unlock()
 	if stop != nil {
 		close(stop)
 	}

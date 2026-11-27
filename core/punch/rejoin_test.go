@@ -57,7 +57,6 @@ func TestNat34RejoinRepunchesAfterPeerRestart(t *testing.T) {
 		ProbeIntervalMs: 1, PunchTimeoutMs: 9000, PunchPPS: 1000000}
 	soft := Config{PredictionSockets: 1, SymmetricSpray: 512,
 		ProbeIntervalMs: 1, PunchTimeoutMs: 9000, PunchPPS: 1000000}
-
 	id4, id3 := protocol.NewPeerID(), protocol.NewPeerID()
 	adv3 := &net.UDPAddr{IP: net.ParseIP("127.9.0.3").To4(), Port: 40000}
 
@@ -70,7 +69,6 @@ func TestNat34RejoinRepunchesAfterPeerRestart(t *testing.T) {
 	egress := first[0].n.external(0, adv3)
 	advIP, candIPs := otherPoolIP(rotatingPool, egress.IP)
 	adv := &net.UDPAddr{IP: advIP, Port: 6000}
-
 	ph4 := New(first[0], id4, NATInfo{Type: stun.NatSymmetric, PublicAddr: adv}, hard)
 	ph4.Conns = asPC(first)
 	ph3 := New(second[0], id3, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv3}, soft)
@@ -107,11 +105,9 @@ func TestNat34RejoinRepunchesAfterPeerRestart(t *testing.T) {
 		ph4b.Stop()
 	}()
 	ph4b.AddPeer(id3, NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: adv3})
-
 	// Signaling carries the restarted peer's new candidate to the survivor. This
 	// AddPeer is the whole difference between recovering and staying dead.
 	ph3.AddPeer(id4, NATInfo{Type: stun.NatSymmetric, PublicAddr: adv2, PublicIPs: candIPs2})
-
 	if !waitBoth(ph4b, id3, ph3, id4, 12*time.Second) {
 		t.Fatalf("the link never came back: ph3 still reports %s, ph4b connected=%v",
 			endpointOf(ph3, id4), func() bool { ok, _ := ph4b.Connected(id3); return ok }())
@@ -167,19 +163,16 @@ func TestRejoinClearsStaleLink(t *testing.T) {
 	sockA, infoA := openSocket(t)
 	sockB, infoB := openSocket(t)
 	idA, idB := protocol.NewPeerID(), protocol.NewPeerID()
-
 	quick := Config{EnableLAN: true, ProbeIntervalMs: 20, PunchTimeoutMs: 4000}
 	a := New(sockA, idA, infoA, quick)
 	b := New(sockB, idB, infoB, quick)
 	// Stop waits for the read loop, which only unblocks once its socket is gone.
 	t.Cleanup(func() { _ = sockA.Close(); a.Stop() })
 	t.Cleanup(func() { _ = sockB.Close(); b.Stop() })
-
 	a.AddPeer(idB, infoB)
 	b.AddPeer(idA, infoA)
 	a.Start()
 	b.Start()
-
 	if !waitConnected(a, idB, 5*time.Second) {
 		t.Fatal("the first session never punched")
 	}
@@ -195,7 +188,6 @@ func TestRejoinClearsStaleLink(t *testing.T) {
 	t.Cleanup(func() { _ = sockB2.Close(); b2.Stop() })
 	b2.AddPeer(idA, infoA)
 	b2.Start()
-
 	a.AddPeer(idB, infoB2)
 	if ok, transport := a.Connected(idB); ok {
 		t.Fatalf("AddPeer kept the restarted peer marked connected (%s at %s)", transport, dead)

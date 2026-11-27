@@ -39,9 +39,7 @@ func run(argv0 string, args []string) int {
 		return cli.RunServer(args[1:])
 	case "client":
 		return cli.RunClient(args[1:])
-	case "nat-check", "connect", "mesh":
-		// Legacy p2p-client style: keep the top-level client subcommands
-		// working directly on the unified binary.
+	case "up", "join", "nat-check", "connect", "mesh":
 		return cli.RunClient(args)
 	case "-h", "--help", "help":
 		usage()
@@ -53,24 +51,28 @@ func run(argv0 string, args []string) int {
 }
 
 func usage() {
-	fmt.Println(`p2p — unified P2P client/server CLI
+	fmt.Println(`p2p — pure-P2P WireGuard mesh networking
 
-usage:
-  p2p server [options]                  run signaling + STUN server
-  p2p client <nat-check|connect|mesh>   run the client
-  p2p <nat-check|connect|mesh>          compatibility form of the client
+quickstart:
+  p2p server [--stun-servers stun1:3478,stun2:3478]
+  p2p up <server[:port]> <room> [--secret <s>]
+  p2p nat-check <server[:port]>
+
+commands:
+  server     run single signaling + STUN server
+  up, join   join a virtual network with WireGuard TUN enabled (recommended)
+  nat-check  diagnose local NAT type and carrier egress pool
+  mesh       virtual network console (accepts --tun; legacy compatible)
+  connect    raw probe/text mode (legacy compatible)
 
 examples:
-  p2p server --public <public-ip> --port 8080
-  p2p client mesh --server <server-ip>:8080 --room demo
-  p2p client nat-check --server <server-ip>:8080
+  p2p server --port 8080 --stun-servers stun.miwifi.com:3478,stun.chat.bilibili.com:3478
+  p2p up 1.2.3.4:8080 demo
+  p2p up p2p://1.2.3.4:8080/demo
+  p2p nat-check 1.2.3.4:8080
 
 help:
   p2p server --help
-  p2p client --help
-  p2p client mesh --help
-
-compatibility:
-  The executable may also be renamed to p2p-server or p2p-client; the
-  invoked name selects the role automatically.`)
+  p2p up --help
+  p2p up --help-advanced`)
 }

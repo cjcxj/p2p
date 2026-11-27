@@ -17,51 +17,60 @@ const (
 	NatRestrictedCone     NATType = "restricted_cone"
 	NatPortRestrictedCone NATType = "port_restricted_cone"
 	NatSymmetric          NATType = "symmetric"
-	// NatCone means the NAT repeats one mapping for every destination (so it is
-	// cone, which is all hole punching needs to know) but the inbound filter
-	// level was never measured: grading full vs address vs port restricted
-	// requires the server to answer from a second port and a second IP, and a
-	// combined server normally has neither. Reporting a guessed subtype is what
-	// made a single-port deployment claim "port restricted" everywhere.
+	// NatCone means the NAT repeats one mapping for every destination (cone),
+	// while the exact inbound filter level was not testable on a single-port STUN.
 	NatCone NATType = "cone"
 	// NatUnmeasurable means filtering was at least port-dependent, but no
 	// alternate destination answered, so cone and symmetric were never told
-	// apart. Treat it as "may well be symmetric", not as cone.
+	// apart. Treat it as potentially symmetric.
 	NatUnmeasurable NATType = "unmeasurable"
 	NatUnknown      NATType = "unknown"
 	NatBlocked      NATType = "blocked"
 )
 
-// Detection holds the result of a NAT classification.
+// Detection holds the result of a NAT classification and rich allocation hints
+// used to drive pure-P2P NAT3<->NAT4 hole punching.
 type Detection struct {
 	NATType NATType
 	// MappedAddr is the public mapping observed for the primary STUN server.
 	MappedAddr *net.UDPAddr
-	// LocalAddr is the address of the client socket.
+	// LocalAddr is the primary local address of the client socket.
 	LocalAddr *net.UDPAddr
-	// PortDelta is the per-mapping port increment observed for a symmetric
-	// NAT (0 when not symmetric or not measurable).
+	// LocalAddrs lists all private/LAN IPv4 socket addresses on active host
+	// interfaces so multi-homed/VPN/VMware/Wi-Fi peers can establish same-LAN paths.
+	LocalAddrs []*net.UDPAddr
+	// LocalCIDRs are the interface subnet strings (e.g. "192.168.10.5/24")
+	// paired with LocalAddrs for accurate subnet matching.
+	LocalCIDRs []string
+	// PortDelta is the per-mapping port increment observed between primary and
+	// alternate STUN destinations.
 	PortDelta int
-	// Secondary records which alternate destination produced the comparison
-	// that decided a symmetric/port-restricted classification. Empty means no
-	// alternate destination was usable.
+	// Secondary records which alternate destination produced the comparison.
 	Secondary string
-	// PortStep is how far this NAT's public port moves per new binding
-	// (0 = not measured or not predictable). It is the number symmetric NAT
-	// port prediction needs: the increment is per binding, not per destination,
-	// so it can only be learned by creating several sockets.
+	// PortStep is how far this NAT's public port moves per new binding (0 = random).
 	PortStep int
-	// ObservedIPs is the set of distinct public IPv4 addresses this host was
-	// seen at across the primary and every alternate destination that answered
-	// (index 0 is the primary mapping). A CGNAT that rotates its egress address
-	// per destination yields several; the easy peer sprays at all of them so a
-	// destination-dependent mapping can still be collided with.
+	// PortPreserve is true when the NAT allocates public ports at a fixed offset
+	// from the client's local source port.
+	PortPreserve bool
+	// PortPreserveOffset is mapped_port - local_port when PortPreserve is true.
+	PortPreserveOffset int
+	// PortBlockMin and PortBlockMax bracket the NAT's Port Block Allocation (PBA)
+	// range when consecutive or multi-STUN probes cluster within 2048 ports.
+	PortBlockMin int
+	PortBlockMax int
+	// ObservedIPs is the deduplicated list of distinct public IPv4 addresses seen
+	// across the primary and all responding STUN observation points.
 	ObservedIPs []net.IP
-	// FilterMeasured reports whether the cone subtype (full / address / port
-	// restricted) was actually observed rather than assumed.
+	// ObservedMappings holds every distinct public ip:port seen across STUN
+	// observation points (first is MappedAddr).
+	ObservedMappings []*net.UDPAddr
+	// IPv6Addr is the globally routable IPv6 UDP address when available.
+	IPv6Addr *net.UDPAddr
+	// UPnPAddr is an explicit router-mapped external UDP address via UPnP/NAT-PMP/PCP.
+	UPnPAddr *net.UDPAddr
+	// FilterMeasured reports whether the cone subtype was directly observed.
 	FilterMeasured bool
-	// Note carries the caveat for what could not be tested, so a reader of the
-	// log knows how far to trust NATType.
+	// Note carries diagnostic context about the NAT classification.
 	Note string
 }
 
@@ -73,22 +82,21 @@ func (d *Detection) PublicAddr() string {
 	return d.MappedAddr.String()
 }
 
-// CoveringPool returns the smallest IPv4 prefix that contains the mapped
-// address and every observed egress address. A destination-rotating CGNAT only
-// shows STUN a few of the public IPs in its contiguous block, so the address it
-// uses toward a particular peer is often absent from the sample -- but the
-// block is inferable from the clustered samples. Advertising this prefix lets
-// the easy peer spray the whole block instead of guessing the one egress IP.
-// Returns nil when there is nothing to expand (fewer than two distinct IPv4
-// addresses) or when the samples are too far apart to be one carrier block
-// (covering prefix shorter than /20), so an absurd range is never announced.
+// CoveringPool returns the smallest IPv4 prefix containing the primary mapped
+// address and all STUN-observed egress IPv4 addresses. A destination-rotating
+// CGNAT often rotates across a contiguous carrier block (e.g. /27 or /26) and
+// only exposes a subset of those IPs to STUN probes. Returns nil when fewer
+// than two distinct public IPv4s were seen or when they span wider than /20.
 func (d *Detection) CoveringPool() *net.IPNet {
-	if d.MappedAddr == nil {
+	if d == nil || d.MappedAddr == nil {
 		return nil
 	}
-	ips := make([]net.IP, 0, len(d.ObservedIPs)+1)
+	var ips []net.IP
 	seen := map[string]bool{}
 	add := func(ip net.IP) {
+		if ip == nil {
+			return
+		}
 		ip4 := ip.To4()
 		if ip4 == nil || seen[ip4.String()] {
 			return
@@ -96,19 +104,22 @@ func (d *Detection) CoveringPool() *net.IPNet {
 		seen[ip4.String()] = true
 		ips = append(ips, ip4)
 	}
-	if d.MappedAddr != nil {
-		add(d.MappedAddr.IP)
-	}
+	add(d.MappedAddr.IP)
 	for _, ip := range d.ObservedIPs {
 		add(ip)
+	}
+	for _, m := range d.ObservedMappings {
+		if m != nil {
+			add(m.IP)
+		}
 	}
 	if len(ips) < 2 {
 		return nil
 	}
-	first := u32(ips[0])
+	first := ipv4ToU32(ips[0])
 	var diff uint32
 	for _, ip := range ips[1:] {
-		diff |= first ^ u32(ip)
+		diff |= first ^ ipv4ToU32(ip)
 	}
 	ones := 32
 	for ones > 0 && diff != 0 {
@@ -119,11 +130,11 @@ func (d *Detection) CoveringPool() *net.IPNet {
 		return nil
 	}
 	mask := net.CIDRMask(ones, 32)
-	base := net.IPv4(byte(first>>24), byte(first>>16), byte(first>>8), byte(first)).Mask(mask)
+	base := ips[0].Mask(mask)
 	return &net.IPNet{IP: base, Mask: mask}
 }
 
-func u32(ip net.IP) uint32 {
+func ipv4ToU32(ip net.IP) uint32 {
 	ip4 := ip.To4()
 	if ip4 == nil {
 		return 0
@@ -131,9 +142,7 @@ func u32(ip net.IP) uint32 {
 	return uint32(ip4[0])<<24 | uint32(ip4[1])<<16 | uint32(ip4[2])<<8 | uint32(ip4[3])
 }
 
-// Method explains what the classification actually rested on, which is the
-// first thing to look at when a peer's punching plan seems wrong: a symmetric
-// NAT only ever shows up if an alternate destination answered.
+// Method explains what the classification rested on.
 func (d *Detection) Method() string {
 	var s string
 	switch {
@@ -150,8 +159,23 @@ func (d *Detection) Method() string {
 	case d.NATType == NatUnmeasurable:
 		s = "no alternate destination answered"
 	}
+	if d.PortPreserve {
+		s += fmt.Sprintf("; port-preserving (offset %+d)", d.PortPreserveOffset)
+	}
 	if d.PortStep != 0 {
 		s += fmt.Sprintf("; port step %+d per new binding", d.PortStep)
+	}
+	if d.PortBlockMin > 0 && d.PortBlockMax >= d.PortBlockMin {
+		s += fmt.Sprintf("; PBA block %d..%d", d.PortBlockMin, d.PortBlockMax)
+	}
+	if len(d.ObservedIPs) > 1 {
+		s += fmt.Sprintf("; %d egress IPs", len(d.ObservedIPs))
+	}
+	if d.IPv6Addr != nil {
+		s += fmt.Sprintf("; ipv6=%s", d.IPv6Addr)
+	}
+	if d.UPnPAddr != nil {
+		s += fmt.Sprintf("; upnp=%s", d.UPnPAddr)
 	}
 	if d.Note != "" {
 		s += "; " + d.Note
@@ -175,14 +199,55 @@ func localIPFor(server *net.UDPAddr) net.IP {
 	return nil
 }
 
-// Detect runs the RFC 3489 style test sequence and classifies the NAT.
-//
-// With a single-IP STUN server the change-IP test is never answered, so
-// full-cone is conservatively reported as port-restricted cone (the two behave
-// the same for hole punching). The cone/symmetric distinction does not depend
-// on the server having a second port: an alternate destination from
-// DefaultSecondaries is enough, and if none of them answers the result is
-// NatUnmeasurable rather than a guess.
+// enumerateLocalAddrs returns all non-loopback IPv4 interface addresses paired
+// with the socket port, plus their interface CIDR strings.
+func enumerateLocalAddrs(port int, primary *net.UDPAddr) ([]*net.UDPAddr, []string) {
+	if port <= 0 {
+		return nil, nil
+	}
+	var addrs []*net.UDPAddr
+	var cidrs []string
+	seenIP := map[string]bool{}
+	if primary != nil && primary.IP != nil && !primary.IP.IsUnspecified() {
+		if ip4 := primary.IP.To4(); ip4 != nil {
+			seenIP[ip4.String()] = true
+			addrs = append(addrs, &net.UDPAddr{IP: ip4, Port: port})
+		}
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return addrs, cidrs
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		ifAddrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range ifAddrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok || ipNet.IP == nil {
+				continue
+			}
+			ip4 := ipNet.IP.To4()
+			if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+				continue
+			}
+			cidrs = append(cidrs, (&net.IPNet{IP: ip4, Mask: ipNet.Mask}).String())
+			if !seenIP[ip4.String()] {
+				seenIP[ip4.String()] = true
+				addrs = append(addrs, &net.UDPAddr{IP: ip4, Port: port})
+			}
+		}
+	}
+	return addrs, cidrs
+}
+
+// Detect classifies the NAT over c.Conn, concurrently probing all configured
+// STUN servers in ~1 RTT and measuring symmetric allocation patterns (step,
+// port preservation, PBA port block) and rotating CGNAT egress IPs.
 func (c *Client) Detect() (*Detection, error) {
 	// Test I: plain binding to primary.
 	t1, _, err := c.BindRequest(false, false)
@@ -195,18 +260,27 @@ func (c *Client) Detect() (*Detection, error) {
 	}
 	local := c.Conn.LocalAddr()
 	localUDP, _ := local.(*net.UDPAddr)
-	// A socket bound to 0.0.0.0 reports a wildcard local IP. Resolve the
-	// concrete source IP used to reach the STUN server so same-LAN peers can
-	// find each other via the private-network shortcut.
 	if localUDP != nil && (localUDP.IP == nil || localUDP.IP.IsUnspecified()) {
 		if ip := localIPFor(c.Server); ip != nil {
 			localUDP = &net.UDPAddr{IP: ip, Port: localUDP.Port}
 		}
 	}
+	localPort := 0
+	if localUDP != nil {
+		localPort = localUDP.Port
+	}
+	localAddrs, localCIDRs := enumerateLocalAddrs(localPort, localUDP)
+
 	d := &Detection{
 		NATType:    NatUnknown,
 		MappedAddr: mapped1,
 		LocalAddr:  localUDP,
+		LocalAddrs: localAddrs,
+		LocalCIDRs: localCIDRs,
+	}
+	if mapped1.IP != nil {
+		d.ObservedIPs = []net.IP{mapped1.IP}
+		d.ObservedMappings = []*net.UDPAddr{mapped1}
 	}
 
 	// Not behind a NAT: public mapping equals local socket address.
@@ -215,18 +289,17 @@ func (c *Client) Detect() (*Detection, error) {
 		return d, nil
 	}
 
-	// Test III: ask the server to answer from its port+1. A reply proves the
-	// NAT does not filter by source port. Silence proves nothing on its own:
-	// a combined signaling+STUN+relay server usually listens on one UDP port
-	// only, so there may be nobody to answer from port+1 even on a full-cone
-	// network. The alternate loop below records whether server:port+1 ever
-	// answered and grades the cone subtype from that instead of guessing.
-	t3, _, _ := c.BindRequest(false, true)
+	// Test III: ask the server to answer from port+1 with a single quick probe
+	// so single-port deployments do not stall waiting on retries.
+	t3Client := *c
+	t3Client.Retries = 0
+	if t3Client.Timeout <= 0 || t3Client.Timeout > 350*time.Millisecond {
+		t3Client.Timeout = 350 * time.Millisecond
+	}
+	t3, _, _ := t3Client.BindRequest(false, true)
 	if t3 != nil {
-		// Not port-filtered. Telling full cone from address-restricted cone
-		// needs a reply from a *second server address*, which a single-address
-		// deployment cannot produce.
-		t2, _, _ := c.BindRequest(true, false)
+		t2Client := t3Client
+		t2, _, _ := t2Client.BindRequest(true, false)
 		if t2 != nil {
 			d.NATType = NatFullCone
 			d.FilterMeasured = true
@@ -237,87 +310,82 @@ func (c *Client) Detect() (*Detection, error) {
 		return d, nil
 	}
 
-	// Filtering is port-dependent: either port-restricted cone or symmetric.
-	// Ask the alternate destinations what they see. A cone NAT repeats the
-	// mapping it already made, a symmetric / CGNAT allocates a new one per
-	// destination. That per-destination address is exactly what the easy peer
-	// must aim at, so keep probing every alternate (within a budget) to publish
-	// the whole candidate set, not only the first one that answers. Any answer
-	// that differs from the primary mapping proves the NAT is destination-
-	// dependent, which is the correct trigger for the plant/spray strategy.
-	until := time.Now().Add(6 * time.Second)
+	// Filtering is port-dependent (NAT3 or NAT4). Probe every alternate STUN
+	// destination concurrently over the same socket AND launch ephemeral
+	// multi-STUN egress discovery in parallel.
+	altAddrs := c.secondaryAddrs()
+	secTimeout := c.SecondaryTimeout
+	if secTimeout <= 0 {
+		secTimeout = 800 * time.Millisecond
+	}
+
+	obsCh := make(chan []*net.UDPAddr, 1)
+	go func() {
+		obsCh <- c.ObserveEgress(altAddrs, secTimeout, secTimeout+200*time.Millisecond)
+	}()
+
+	results := c.ConcurrentBindAll(altAddrs, secTimeout)
+
 	altAnswered := false
 	answered := false
 	differs := false
 	delta := 0
 	firstSec := ""
-	observed := []net.IP{}
-	seen := map[string]bool{}
+
+	seenIP := map[string]bool{}
+	seenMap := map[string]bool{}
 	if mapped1.IP != nil {
-		seen[mapped1.IP.String()] = true
-		observed = append(observed, mapped1.IP)
+		seenIP[mapped1.IP.String()] = true
+		seenMap[mapped1.String()] = true
 	}
-	// Enumerate the whole configured STUN list in parallel (from ephemeral
-	// sockets) while the shared-socket classification runs below. This is what
-	// makes "configure many STUN servers" actually sample them all instead of
-	// the first few the sequential budget reaches.
-	altAddrs := c.secondaryAddrs()
-	obsDone := make(chan []net.IP, 1)
-	go func() { obsDone <- c.observeEgressIPs(altAddrs, 1200*time.Millisecond, 4*time.Second) }()
-	for _, sec := range altAddrs {
-		if time.Now().After(until) {
-			break
+
+	addObserved := func(m *net.UDPAddr) {
+		if m == nil || m.IP == nil {
+			return
 		}
-		fromServerAltPort := c.Server != nil && sec.IP != nil &&
-			sec.IP.Equal(c.Server.IP) && sec.Port == c.Server.Port+1
-		t4, err4 := c.secondaryProbe(sec, until)
-		if err4 != nil {
-			continue
+		if !seenIP[m.IP.String()] {
+			seenIP[m.IP.String()] = true
+			d.ObservedIPs = append(d.ObservedIPs, m.IP)
 		}
-		m4, errM := t4.MappedAddress()
-		if errM != nil {
-			continue
+		k := m.String()
+		if !seenMap[k] {
+			seenMap[k] = true
+			d.ObservedMappings = append(d.ObservedMappings, m)
 		}
+	}
+
+	for _, r := range results {
 		answered = true
+		fromServerAltPort := c.Server != nil && r.Server != nil && r.Server.IP != nil &&
+			r.Server.IP.Equal(c.Server.IP) && r.Server.Port == c.Server.Port+1
 		if fromServerAltPort {
 			altAnswered = true
 		}
-		if firstSec == "" {
-			firstSec = sec.String()
+		if firstSec == "" && r.Server != nil {
+			firstSec = r.Server.String()
 		}
-		if m4.IP != nil && !seen[m4.IP.String()] {
-			seen[m4.IP.String()] = true
-			observed = append(observed, m4.IP)
-		}
-		if m4.Port != mapped1.Port || !m4.IP.Equal(mapped1.IP) {
+		addObserved(r.Mapped)
+		if r.Mapped.Port != mapped1.Port || !r.Mapped.IP.Equal(mapped1.IP) {
 			if !differs {
-				delta = m4.Port - mapped1.Port
+				delta = r.Mapped.Port - mapped1.Port
 			}
 			differs = true
 		}
 	}
-	// Fold in every egress IP the parallel multi-STUN sweep found, so the
-	// published candidate set covers the full configured observation list.
-	for _, ip := range <-obsDone {
-		if ip != nil && !seen[ip.String()] {
-			seen[ip.String()] = true
-			observed = append(observed, ip)
-		}
+
+	for _, m := range <-obsCh {
+		addObserved(m)
 	}
-	d.ObservedIPs = observed
+
 	if differs {
 		d.NATType = NatSymmetric
 		d.Secondary = firstSec
 		d.PortDelta = delta
-		d.PortStep = c.measureStep()
+		d.applyPattern(c.measurePattern())
 		return d, nil
 	}
 	if answered {
 		d.Secondary = firstSec
-		// Cone: every alternate that answered repeated the primary mapping.
-		// Grading the inbound filter needs the change-port test to have been
-		// possible, and the only evidence that it was is the server's second
-		// port answering.
 		if altAnswered {
 			d.NATType = NatPortRestrictedCone
 			d.FilterMeasured = true
@@ -328,11 +396,33 @@ func (c *Client) Detect() (*Detection, error) {
 		return d, nil
 	}
 
-	// No alternate destination answered, so the mapping was never observed
-	// against a second destination. Guessing "port restricted" here is what
-	// makes a symmetric NAT get the wrong punching plan: report the ambiguity
-	// and let the strategy probe for both.
 	d.NATType = NatUnmeasurable
-	d.PortStep = c.measureStep()
+	d.applyPattern(c.measurePattern())
 	return d, nil
+}
+
+func (d *Detection) applyPattern(pat PortPattern) {
+	d.PortStep = pat.PortStep
+	d.PortPreserve = pat.PortPreserve
+	d.PortPreserveOffset = pat.PortPreserveOffset
+
+	// Combine allocation sample ports with observed STUN ports to tighten or
+	// detect PBA port block boundaries when multiple samples were observed.
+	sampleCount := len(pat.SamplePorts) + len(d.ObservedMappings)
+	minP, maxP := pat.BlockMin, pat.BlockMax
+	for _, m := range d.ObservedMappings {
+		if m == nil || m.Port <= 0 {
+			continue
+		}
+		if minP == 0 || m.Port < minP {
+			minP = m.Port
+		}
+		if m.Port > maxP {
+			maxP = m.Port
+		}
+	}
+	if sampleCount >= 2 && minP > 0 && maxP >= minP && maxP-minP <= 2048 {
+		d.PortBlockMin = minP
+		d.PortBlockMax = maxP
+	}
 }

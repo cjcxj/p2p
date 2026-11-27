@@ -20,32 +20,38 @@ type Client struct {
 	// Secondaries overrides the alternate destinations used to test whether
 	// this NAT maps each destination separately. Empty means DefaultSecondaries.
 	Secondaries []string
-	// SecondaryTimeout bounds one alternate-destination probe (default 800ms).
-	// A public STUN may be blocked on this network, so this must stay small
-	// even though it lengthens classification.
+	// SecondaryTimeout bounds one alternate-destination sweep (default 800ms).
 	SecondaryTimeout time.Duration
 	// StepSamples is how many extra bindings Detect opens to learn the NAT's
-	// port increment per new binding. Zero (the default) skips the measurement:
-	// it costs one round trip per sample and only matters for symmetric NATs,
-	// so callers that care opt in.
+	// port allocation behaviour (step, port-preserving offset, PBA block).
 	StepSamples int
 }
 
 // DefaultSecondaries are public STUN servers used when the operator's own
-// server answers on a single UDP port. Detecting a per-destination mapping
-// needs a second destination; without one, a symmetric NAT is indistinguishable
-// from a port-restricted cone and gets the wrong hole-punching plan.
-// Both entries are reachable from Chinese carrier networks, where Google's
-// STUN is normally dropped. The literal addresses are the A records those
-// hostnames resolve to: inside a sandbox with no resolver (adb shell, some
-// k8s pods) a hostname is useless, and a missing second destination silently
-// turns a symmetric NAT into "unmeasurable".
+// server answers on a single UDP port. Multiple observation points allow
+// concurrent symmetric NAT detection and discovery of rotating CGNAT egress IPs.
 var DefaultSecondaries = []string{
 	"stun.miwifi.com:3478",
 	"111.206.174.2:3478",
 	"111.206.174.3:3478",
+	"stun.qq.com:3478",
 	"stun1.l.google.com:19302",
 	"74.125.250.129:19302",
+}
+
+// DefaultIPv6Secondaries are dual-stack / IPv6 public STUN servers used when
+// probing IPv6 public reachability.
+var DefaultIPv6Secondaries = []string{
+	"stun1.l.google.com:19302",
+	"stun.l.google.com:19302",
+}
+
+// STUNResult captures one valid STUN BindingResponse from a destination.
+type STUNResult struct {
+	Server  *net.UDPAddr
+	Mapped  *net.UDPAddr
+	From    *net.UDPAddr
+	Latency time.Duration
 }
 
 // BindRequest sends a binding request (optionally with a CHANGE-REQUEST) and
@@ -59,12 +65,16 @@ func (c *Client) BindRequest(changeIP, changePort bool) (*Message, *net.UDPAddr,
 	req.AddSoftware("p2p")
 
 	retries := c.Retries
-	if retries <= 0 {
-		retries = 2
+	if retries < 0 {
+		retries = 0
 	}
 	timeout := c.Timeout
 	if timeout <= 0 {
 		timeout = 2 * time.Second
+	}
+
+	if dc, ok := c.Conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+		defer dc.SetReadDeadline(time.Time{})
 	}
 
 	for attempt := 0; attempt <= retries; attempt++ {
@@ -73,7 +83,7 @@ func (c *Client) BindRequest(changeIP, changePort bool) (*Message, *net.UDPAddr,
 		}
 		deadline := time.Now().Add(timeout)
 		if dc, ok := c.Conn.(interface{ SetReadDeadline(time.Time) error }); ok {
-			dc.SetReadDeadline(deadline)
+			_ = dc.SetReadDeadline(deadline)
 		}
 		for {
 			buf := make([]byte, 2048)
@@ -91,10 +101,7 @@ func (c *Client) BindRequest(changeIP, changePort bool) (*Message, *net.UDPAddr,
 			if err != nil || msg.TID != req.TID {
 				continue
 			}
-			ua, ok := src.(*net.UDPAddr)
-			if !ok {
-				ua = nil
-			}
+			ua, _ := src.(*net.UDPAddr)
 			return msg, ua, nil
 		}
 	}
@@ -113,97 +120,179 @@ func (c *Client) BindOnce() (*Message, *net.UDPAddr, error) {
 	return c.BindRequest(false, false)
 }
 
-// secondaryProbe sends one plain binding request to an alternate destination.
-// These probes are what separates a symmetric NAT from a cone one, and an
-// alternate STUN is usually farther away than the operator's own server, so
-// they get their own deadline rather than the tight one the primary
-// classification uses. Worst case is SecondaryTimeout per candidate.
-var errSecondaryBudget = errors.New("stun: alternate-probe budget exhausted")
+// ConcurrentBindAll sends STUN BindingRequests concurrently to all destinations
+// in addrs over c.Conn, demultiplexing responses by Transaction ID. It returns
+// early as soon as every destination has answered, or when timeout elapses.
+func (c *Client) ConcurrentBindAll(addrs []*net.UDPAddr, timeout time.Duration) []STUNResult {
+	if c.Conn == nil || len(addrs) == 0 {
+		return nil
+	}
+	if timeout <= 0 {
+		timeout = 800 * time.Millisecond
+	}
 
-func (c *Client) secondaryProbe(addr *net.UDPAddr, until time.Time) (*Message, error) {
-	probe := *c
-	probe.Server = addr
-	// One resend: the first datagram still has the NAT binding to create and a
-	// cellular path to a distant STUN server is slower than 800ms often enough
-	// that a single-shot probe reports a reachable NAT as unmeasurable.
-	probe.Retries = 1
-	probe.Timeout = c.SecondaryTimeout
-	if probe.Timeout <= 0 {
-		probe.Timeout = 800 * time.Millisecond
+	type pendingReq struct {
+		dst    *net.UDPAddr
+		packet []byte
+		sentAt time.Time
+		done   bool
 	}
-	if left := time.Until(until); left < probe.Timeout {
-		if left <= 0 {
-			return nil, errSecondaryBudget
+
+	pending := make(map[[12]byte]*pendingReq, len(addrs))
+	order := make([][12]byte, 0, len(addrs))
+	for _, dst := range addrs {
+		if dst == nil {
+			continue
 		}
-		probe.Timeout = left
+		req := NewBindingRequest()
+		req.AddSoftware("p2p")
+		raw := req.Encode()
+		pending[req.TID] = &pendingReq{
+			dst:    dst,
+			packet: raw,
+			sentAt: time.Now(),
+		}
+		order = append(order, req.TID)
+		_, _ = c.Conn.WriteTo(raw, dst)
 	}
-	msg, _, err := probe.BindRequest(false, false)
-	return msg, err
+	if len(pending) == 0 {
+		return nil
+	}
+
+	if dc, ok := c.Conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+		defer dc.SetReadDeadline(time.Time{})
+	}
+
+	results := make([]STUNResult, 0, len(pending))
+	answered := 0
+	start := time.Now()
+	overallDeadline := start.Add(timeout)
+	retryAt := start.Add(timeout / 2)
+	retried := false
+
+	buf := make([]byte, 2048)
+	for answered < len(pending) {
+		now := time.Now()
+		if !now.Before(overallDeadline) {
+			break
+		}
+		nextDeadline := overallDeadline
+		if !retried && retryAt.Before(nextDeadline) {
+			nextDeadline = retryAt
+		}
+		if dc, ok := c.Conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = dc.SetReadDeadline(nextDeadline)
+		}
+
+		n, src, err := c.Conn.ReadFrom(buf)
+		if err != nil {
+			if isTimeout(err) {
+				if !retried && !time.Now().Before(retryAt) {
+					retried = true
+					for _, tid := range order {
+						pr := pending[tid]
+						if !pr.done {
+							pr.sentAt = time.Now()
+							_, _ = c.Conn.WriteTo(pr.packet, pr.dst)
+						}
+					}
+					continue
+				}
+				break
+			}
+			break
+		}
+		if n < HeaderLength {
+			continue
+		}
+		msg, err := Decode(buf[:n])
+		if err != nil {
+			continue
+		}
+		pr, ok := pending[msg.TID]
+		if !ok || pr.done {
+			continue
+		}
+		mapped, err := msg.MappedAddress()
+		if err != nil {
+			continue
+		}
+		pr.done = true
+		answered++
+		ua, _ := src.(*net.UDPAddr)
+		results = append(results, STUNResult{
+			Server:  pr.dst,
+			Mapped:  mapped,
+			From:    ua,
+			Latency: time.Since(pr.sentAt),
+		})
+	}
+	return results
 }
 
 // secondaryAddrs lists the alternate destinations to probe: the operator's own
-// server one port above the primary, then the configured or built-in public
-// STUN servers. A single-port deployment -- which is what a combined
-// signaling+STUN+relay server normally is -- answers on the primary port only,
-// so the public ones are what make symmetric detection work at all.
+// server one port above the primary, then the configured or built-in STUN
+// servers.
 func (c *Client) secondaryAddrs() []*net.UDPAddr {
 	list := c.Secondaries
 	if len(list) == 0 {
 		list = DefaultSecondaries
 	}
+	seen := make(map[string]bool, len(list)+2)
 	out := make([]*net.UDPAddr, 0, len(list)+1)
-	seen := map[string]bool{}
-	if c.Server != nil && c.Server.IP != nil {
-		out = append(out, &net.UDPAddr{IP: c.Server.IP, Port: c.Server.Port + 1})
-		seen[c.Server.String()] = true
+
+	addUnique := func(a *net.UDPAddr) {
+		if a == nil || a.IP == nil {
+			return
+		}
+		if c.Server != nil && a.IP.Equal(c.Server.IP) && a.Port == c.Server.Port {
+			return
+		}
+		k := a.String()
+		if seen[k] {
+			return
+		}
+		seen[k] = true
+		out = append(out, a)
+	}
+
+	if c.Server != nil && c.Server.IP != nil && c.Server.Port > 0 && c.Server.Port < 65535 {
+		addUnique(&net.UDPAddr{IP: c.Server.IP, Port: c.Server.Port + 1})
 	}
 	for _, s := range list {
-		// A hostname may carry several A records; probe each so one configured
-		// multi-homed STUN contributes several observation destinations, widening
-		// the enumerable egress pool on a rotating CGNAT.
 		for _, addr := range ResolveAllUDPAddr(s) {
 			if addr == nil {
 				continue
 			}
-			k := addr.String()
-			if k == seenKey(c.Server) || seen[k] {
-				continue
+			// Keep IPv4 probes on the IPv4 detection path; IPv6 is probed separately.
+			if c.Server != nil && c.Server.IP != nil {
+				isV4Server := c.Server.IP.To4() != nil
+				isV4Addr := addr.IP.To4() != nil
+				if isV4Server != isV4Addr {
+					continue
+				}
 			}
-			seen[k] = true
-			out = append(out, addr)
+			addUnique(addr)
 		}
 	}
 	return out
 }
 
-func seenKey(a *net.UDPAddr) string {
-	if a == nil {
-		return ""
+// ObserveEgress concurrently probes each alternate destination from its own
+// ephemeral socket and returns every distinct public UDP address (IP+Port)
+// reported. Collecting both IP and Port captures both rotating CGNAT egress IPs
+// and Port Block Allocation (PBA) clustering across destinations.
+func (c *Client) ObserveEgress(addrs []*net.UDPAddr, per, budget time.Duration) []*net.UDPAddr {
+	if len(addrs) == 0 {
+		return nil
 	}
-	return a.String()
-}
-
-// observeEgressIPs concurrently probes each alternate destination from its own
-// ephemeral socket and returns every distinct public IP reported. This is the
-// "configurable multi-STUN public probing" of the design: an operator can list
-// many observation points and ALL of them are sampled in parallel (a sequential
-// loop over a long list would be truncated by the detection budget). Each probe
-// uses a separate socket so the whole sweep finishes in roughly one round trip,
-// not one per server.
-//
-// It is used ONLY to widen the candidate IP set. NAT classification must still
-// compare mappings for the SAME source socket (a symmetric NAT differs per
-// destination; a fresh socket changes the mapping even on a cone NAT), so this
-// never feeds the symmetric/cone decision -- only the spray target list.
-func (c *Client) observeEgressIPs(addrs []*net.UDPAddr, per, budget time.Duration) []net.IP {
 	if per <= 0 {
-		per = 1200 * time.Millisecond
+		per = 700 * time.Millisecond
 	}
 	if budget <= 0 {
-		budget = 4 * time.Second
+		budget = 900 * time.Millisecond
 	}
-	type ev struct{ ip net.IP }
-	ch := make(chan ev, len(addrs))
+	ch := make(chan *net.UDPAddr, len(addrs))
 	var wg sync.WaitGroup
 	deadline := time.Now().Add(budget)
 	for _, a := range addrs {
@@ -211,12 +300,12 @@ func (c *Client) observeEgressIPs(addrs []*net.UDPAddr, per, budget time.Duratio
 			continue
 		}
 		if c.Server != nil && a.IP != nil && a.IP.Equal(c.Server.IP) && a.Port == c.Server.Port {
-			continue // primary is already represented by MappedAddr
+			continue
 		}
 		wg.Add(1)
 		go func(dst *net.UDPAddr) {
 			defer wg.Done()
-			uc, err := net.ListenUDP("udp", nil)
+			uc, err := net.ListenUDP("udp4", nil)
 			if err != nil {
 				return
 			}
@@ -231,27 +320,91 @@ func (c *Client) observeEgressIPs(addrs []*net.UDPAddr, per, budget time.Duratio
 				return
 			}
 			select {
-			case ch <- ev{ip: m.IP}:
+			case ch <- m:
 			default:
 			}
 		}(a)
 	}
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
-	var out []net.IP
+	var out []*net.UDPAddr
 	seen := map[string]bool{}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	for len(out) < len(addrs) {
 		select {
-		case e := <-ch:
-			if !seen[e.ip.String()] {
-				seen[e.ip.String()] = true
-				out = append(out, e.ip)
+		case m := <-ch:
+			k := m.String()
+			if !seen[k] {
+				seen[k] = true
+				out = append(out, m)
 			}
 		case <-done:
-			return out
-		case <-time.After(time.Until(deadline)):
+			for {
+				select {
+				case m := <-ch:
+					k := m.String()
+					if !seen[k] {
+						seen[k] = true
+						out = append(out, m)
+					}
+				default:
+					return out
+				}
+			}
+		case <-timer.C:
 			return out
 		}
 	}
 	return out
+}
+
+// observeEgressIPs is kept for callers that only need distinct egress IPs.
+func (c *Client) observeEgressIPs(addrs []*net.UDPAddr, per, budget time.Duration) []net.IP {
+	mappings := c.ObserveEgress(addrs, per, budget)
+	var out []net.IP
+	seen := map[string]bool{}
+	for _, m := range mappings {
+		if m != nil && m.IP != nil && !seen[m.IP.String()] {
+			seen[m.IP.String()] = true
+			out = append(out, m.IP)
+		}
+	}
+	return out
+}
+
+// ProbeIPv6 attempts a fast STUN probe over IPv6 to learn if this host has a
+// globally reachable IPv6 UDP address. Non-fatal and bounded by timeout.
+func ProbeIPv6(servers []string, timeout time.Duration) *net.UDPAddr {
+	if len(servers) == 0 {
+		servers = DefaultIPv6Secondaries
+	}
+	if timeout <= 0 {
+		timeout = 600 * time.Millisecond
+	}
+	conn, err := net.ListenUDP("udp6", &net.UDPAddr{Port: 0})
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+
+	var addrs []*net.UDPAddr
+	for _, s := range servers {
+		a, err := net.ResolveUDPAddr("udp6", s)
+		if err != nil || a.IP == nil || a.IP.To4() != nil {
+			continue
+		}
+		addrs = append(addrs, a)
+	}
+	if len(addrs) == 0 {
+		return nil
+	}
+	c := &Client{Conn: conn}
+	res := c.ConcurrentBindAll(addrs, timeout)
+	for _, r := range res {
+		if r.Mapped != nil && r.Mapped.IP != nil && r.Mapped.IP.IsGlobalUnicast() {
+			return r.Mapped
+		}
+	}
+	return nil
 }

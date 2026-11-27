@@ -22,11 +22,12 @@ type Auth struct {
 type Client struct {
 	conn net.Conn
 
-	mu      sync.Mutex
-	peerID  protocol.PeerID
-	vip     string
-	network string
-	closed  bool
+	mu          sync.Mutex
+	peerID      protocol.PeerID
+	vip         string
+	network     string
+	stunServers []string
+	closed      bool
 
 	// OnMessage is invoked from the read goroutine for each inbound frame.
 	OnMessage func(protocol.Message) error
@@ -126,6 +127,9 @@ func handshake(conn net.Conn, room, token string, a *Auth) (*Client, error) {
 			c.peerID = id
 			c.vip = m.VirtualIP
 			c.network = m.Network
+			if len(m.STUNServers) > 0 {
+				c.stunServers = append([]string(nil), m.STUNServers...)
+			}
 			return c, nil
 		case protocol.MsgError:
 			conn.Close()
@@ -159,6 +163,16 @@ func (c *Client) Network() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.network
+}
+
+// STUNServers returns the STUN server list advertised by the signaling server.
+func (c *Client) STUNServers() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.stunServers) == 0 {
+		return nil
+	}
+	return append([]string(nil), c.stunServers...)
 }
 
 // Send writes a message.

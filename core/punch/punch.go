@@ -1,5 +1,6 @@
-// Package punch implements UDP hole punching with a strategy matrix that
-// handles every NAT combination. Pure P2P: there is no relay fallback.
+// Package punch implements pure UDP hole punching with a strategy matrix
+// engineered for NAT3 (Port-Restricted Cone) to NAT4 (Symmetric / CGNAT)
+// direct traversal.
 package punch
 
 import (
@@ -15,8 +16,7 @@ import (
 	"p2p/core/stun"
 )
 
-// States reported through OnState. Pure P2P: a link is either still punching or
-// punched -- there is no relay state.
+// States reported through OnState.
 const (
 	StatePunching = "punching"
 	StatePunched  = "punched"
@@ -36,32 +36,34 @@ func (p *Punch) SetWireGuardSink(sink WireGuardSink) {
 	p.wgHook.Store(&sink)
 }
 
-// keepaliveInterval keeps established NAT mappings alive. It is shorter than
-// common NAT mapping timeouts (30s–120s) while staying low-overhead.
-const keepaliveInterval = 15 * time.Second
-
-// peerIdleTimeout is how long a connected peer may stay silent before the
-// link is considered stale and hole punching is restarted.
-const peerIdleTimeout = 45 * time.Second
+const (
+	keepaliveInterval    = 15 * time.Second
+	symKeepaliveInterval = 5 * time.Second
+	peerIdleTimeout      = 45 * time.Second
+	defaultPunchPPS      = 1500
+	refreshAnchorEvery   = 10 * time.Second
+	upgradeProbeWindow   = 3 * time.Second
+	upgradeProbeInterval = 80 * time.Millisecond
+)
 
 // Punch drives hole punching for a set of remote peers over one or more shared
-// UDP sockets.
+// UDP sockets (plus optional IPv6 dual-stack socket).
 type Punch struct {
-	Conn   net.PacketConn
-	Conns  []net.PacketConn // socket pool; Conns[0] == Conn after Start
-	MyID   protocol.PeerID
-	My     NATInfo
-	Config Config
+	Conn     net.PacketConn
+	Conns    []net.PacketConn // socket pool; Conns[0] == Conn after Start
+	IPv6Conn net.PacketConn   // optional dual-stack IPv6 UDP socket (sockIdx = -1)
+	MyID     protocol.PeerID
+	My       NATInfo
+	Config   Config
 
-	// OnData is called for inbound data packets (from the read goroutine).
 	OnData func(src protocol.PeerID, pkt *Packet) error
-	// OnState reports per-peer punching progress (from the read goroutine).
-	// The third argument is the actual remote UDP endpoint (IP:port) used for
-	// the connection, or an empty string when not available.
 	OnState func(peerID protocol.PeerID, state string, endpoint string)
-	// wgHook routes datagrams that are not punch frames to a WireGuard tunnel
-	// sharing this socket -- and therefore this NAT mapping. Swapped atomically
-	// because the tunnel may attach while the read loop is already running.
+	// OnRefreshNeeded is invoked periodically while a peer remains unconnected
+	// (e.g. rotating CGNAT) so the caller can re-probe STUN and push a fresh anchor.
+	OnRefreshNeeded func(peerID protocol.PeerID)
+	// OnDirectConfirmed is invoked when a direct path is locked via PktAck on sockIdx.
+	OnDirectConfirmed func(peerID protocol.PeerID, sockIdx int)
+
 	wgHook atomic.Pointer[WireGuardSink]
 
 	mu     sync.Mutex
@@ -78,16 +80,52 @@ type sendItem struct {
 	buf      []byte
 }
 
+type probeStamp struct {
+	seq  uint16
+	sent time.Time
+	ok   bool
+}
+
 type peer struct {
 	info      NATInfo
 	mu        sync.Mutex
 	endpoint  *net.UDPAddr
-	sockIdx   int // which Conns entry carries this peer's data path
+	sockIdx   int // which Conns entry carries this peer's data path (-1 = IPv6Conn)
 	transport string
+	tier      routeTier
+	rtt       time.Duration
 	connected bool
+	confirmed bool // true once a PktAck or bidirectional handshake locked endpoint+sockIdx
 	seq       uint16
 	stop      chan struct{}
 	lastSeen  time.Time
+	probeSent [512]probeStamp
+}
+
+func (ps *peer) nextProbeSeqLocked() uint16 {
+	ps.seq++
+	if ps.seq == 0 {
+		ps.seq = 1
+	}
+	ps.probeSent[ps.seq&511] = probeStamp{seq: ps.seq, sent: time.Now(), ok: true}
+	return ps.seq
+}
+
+func (ps *peer) measureRTTLocked(seq uint16) time.Duration {
+	if seq == 0 {
+		return 0
+	}
+	st := ps.probeSent[seq&511]
+	if !st.ok || st.seq != seq || st.sent.IsZero() {
+		return 0
+	}
+	d := time.Since(st.sent)
+	if d < time.Microsecond {
+		// Windows and fast loopback can complete a probe round-trip within a
+		// single clock tick (0ns); clamp to 1µs so confirmed RTT stays > 0.
+		return time.Microsecond
+	}
+	return d
 }
 
 // New creates an idle Punch over conn. The single socket is installed as the
@@ -100,22 +138,31 @@ func New(conn net.PacketConn, myID protocol.PeerID, my NATInfo, cfg Config) *Pun
 		MyID:   myID,
 		My:     my,
 		Config: cfg,
-		sendCh: make(chan sendItem, 4096),
+		sendCh: make(chan sendItem, 8192),
 		peers:  make(map[protocol.PeerID]*peer),
 		done:   make(chan struct{}),
 	}
 }
 
-// logf emits a verbose punch-flow message when OnLog is configured.
 func (p *Punch) logf(format string, args ...interface{}) {
 	if p.Config.OnLog != nil {
 		p.Config.OnLog(format, args...)
 	}
 }
 
+func (p *Punch) connFor(sockIdx int) net.PacketConn {
+	if sockIdx == -1 && p.IPv6Conn != nil {
+		return p.IPv6Conn
+	}
+	if sockIdx >= 0 && sockIdx < len(p.Conns) && p.Conns[sockIdx] != nil {
+		return p.Conns[sockIdx]
+	}
+	return p.Conn
+}
+
 // AddPeer registers a remote peer and starts probing it. If the peer already
-// exists its info is refreshed and the old probe loop is stopped before a new
-// one starts with the updated targets.
+// exists, the probe loop restarts against the refreshed candidate and clears any
+// stale link state from the previous session.
 func (p *Punch) AddPeer(id protocol.PeerID, info NATInfo) {
 	p.mu.Lock()
 	ps, ok := p.peers[id]
@@ -138,15 +185,14 @@ func (p *Punch) AddPeer(id protocol.PeerID, info NATInfo) {
 	ps.lastSeen = time.Now()
 	// Reaching an existing peer here means the far side restarted: a candidate is
 	// only ever (re)sent when a node newly discovers us, and the server forwards
-	// it verbatim without replaying it to anyone already connected. The endpoint
-	// and socket on record belong to the dead session. Leaving the peer marked
-	// connected would send this fresh probe loop straight into keepalive mode on a
-	// path the peer no longer uses -- and because a rejoined peer cannot reach us
-	// until WE open its side of the mapping, its own probes would meet a closed
-	// door for the whole idle timeout. That is the "disconnect, reconnect, never
-	// reconnects again" deadlock.
+	// it verbatim without replaying it to anyone already connected. Clearing the
+	// old endpoint, tier, and connected flag prevents the "disconnect, reconnect,
+	// never reconnects again" deadlock.
 	ps.connected = false
+	ps.confirmed = false
 	ps.transport = ""
+	ps.tier = tierNone
+	ps.rtt = 0
 	ps.endpoint = nil
 	ps.sockIdx = 0
 	ps.mu.Unlock()
@@ -177,8 +223,15 @@ func (p *Punch) Start() {
 		p.Conns = []net.PacketConn{p.Conn}
 	}
 	for i, conn := range p.Conns {
+		if conn == nil {
+			continue
+		}
 		p.wg.Add(1)
 		go p.readLoop(conn, i)
+	}
+	if p.IPv6Conn != nil {
+		p.wg.Add(1)
+		go p.readLoop(p.IPv6Conn, -1)
 	}
 	p.wg.Add(1)
 	go p.sendLoop()
@@ -186,28 +239,23 @@ func (p *Punch) Start() {
 
 func (p *Punch) intervalMs() int {
 	if p.Config.ProbeIntervalMs <= 0 {
-		return 200
+		return 80
 	}
 	return p.Config.ProbeIntervalMs
 }
 
-func (p *Punch) punchTimeout() time.Duration {
-	if p.Config.PunchTimeoutMs <= 0 {
-		return 4 * time.Second
+func (p *Punch) punchPPS() int {
+	if p.Config.PunchPPS <= 0 {
+		return defaultPunchPPS
 	}
-	return time.Duration(p.Config.PunchTimeoutMs) * time.Millisecond
+	return p.Config.PunchPPS
 }
 
-// escalateMs is how long a soft (cone-classified) plan may run without
-// connecting before we re-plan the peer as hard. A few seconds is enough for a
-// true cone peer to have connected via its public address, so waiting this long
-// before spraying only delays recovery from a misclassification and never
-// slows a correctly-classified link.
-func (p *Punch) escalateMs() int {
+func (p *Punch) escalateAfter() time.Duration {
 	if p.Config.EscalateAfterMs > 0 {
-		return p.Config.EscalateAfterMs
+		return time.Duration(p.Config.EscalateAfterMs) * time.Millisecond
 	}
-	return 3000
+	return 2000 * time.Millisecond
 }
 
 // Send delivers a data payload to a connected peer.
@@ -228,7 +276,7 @@ func (p *Punch) Send(id protocol.PeerID, data []byte) error {
 	case p.sendCh <- sendItem{sockIdx: ps.sockIdx, endpoint: ps.endpoint, buf: buf}:
 		return nil
 	default:
-		_, err := p.Conns[ps.sockIdx].WriteTo(buf, ps.endpoint)
+		_, err := p.connFor(ps.sockIdx).WriteTo(buf, ps.endpoint)
 		putEncode(buf)
 		return err
 	}
@@ -239,9 +287,6 @@ const (
 	sendBatchInterval = time.Millisecond
 )
 
-// sendLoop batches outbound UDP datagrams and flushes them with sendmmsg
-// (WriteBatch) where supported. This reduces syscall overhead dramatically on
-// high-packet-rate paths such as Android TUN bridging.
 func (p *Punch) sendLoop() {
 	defer p.wg.Done()
 	var batchWriter *ipv4.PacketConn
@@ -258,7 +303,7 @@ func (p *Punch) sendLoop() {
 			return
 		case item := <-p.sendCh:
 			if item.sockIdx != 0 {
-				_, _ = p.Conns[item.sockIdx].WriteTo(item.buf, item.endpoint)
+				_, _ = p.connFor(item.sockIdx).WriteTo(item.buf, item.endpoint)
 				putEncode(item.buf)
 				continue
 			}
@@ -268,7 +313,7 @@ func (p *Punch) sendLoop() {
 				select {
 				case more := <-p.sendCh:
 					if more.sockIdx != 0 {
-						_, _ = p.Conns[more.sockIdx].WriteTo(more.buf, more.endpoint)
+						_, _ = p.connFor(more.sockIdx).WriteTo(more.buf, more.endpoint)
 						putEncode(more.buf)
 						continue
 					}
@@ -301,8 +346,6 @@ func (p *Punch) flushBatch(msgs []ipv4.Message, batchWriter *ipv4.PacketConn) {
 			}
 			return
 		}
-		// WriteBatch is not supported on this platform/conn; fall back to
-		// individual writes so packets are not silently dropped.
 	}
 	for _, m := range msgs {
 		if m.Addr != nil && len(m.Buffers) > 0 {
@@ -327,11 +370,33 @@ func (p *Punch) Connected(id protocol.PeerID) (bool, string) {
 	return ps.connected, ps.transport
 }
 
+// PeerRoute returns the currently selected route tier ("lan","ipv6","upnp",
+// "public","none"), active remote endpoint, and last measured RTT.
+func (p *Punch) PeerRoute(id protocol.PeerID) (tier string, endpoint string, rtt time.Duration) {
+	ps := p.peer(id)
+	if ps == nil {
+		return tierNone.String(), "", 0
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.endpoint != nil {
+		endpoint = ps.endpoint.String()
+	}
+	return ps.tier.String(), endpoint, ps.rtt
+}
+
+func (p *Punch) routeState(id protocol.PeerID) (connected, confirmed bool, transport string, tier routeTier) {
+	ps := p.peer(id)
+	if ps == nil {
+		return false, false, "", tierNone
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	return ps.connected, ps.confirmed, ps.transport, ps.tier
+}
+
 // SendWireGuard writes an outbound WireGuard datagram to dst through the socket
-// that actually punched the peer owning that endpoint, so the frame shares the
-// peer's live NAT mapping instead of a different pool socket's unmapped source.
-// It falls back to the primary socket when the endpoint matches no punched peer
-// (a relay link, or a peer mid-roaming before its endpoint is confirmed).
+// that actually punched the peer owning that endpoint.
 func (p *Punch) SendWireGuard(buf []byte, dst *net.UDPAddr) error {
 	if dst == nil {
 		return errors.New("punch: nil wireguard destination")
@@ -342,16 +407,13 @@ func (p *Punch) SendWireGuard(buf []byte, dst *net.UDPAddr) error {
 	for _, ps := range p.peers {
 		ps.mu.Lock()
 		if ps.connected && ps.transport == StatePunched && ps.endpoint != nil &&
-			ps.endpoint.String() == target && ps.sockIdx < len(p.Conns) {
+			ps.endpoint.String() == target {
 			idx = ps.sockIdx
 		}
 		ps.mu.Unlock()
 	}
 	p.mu.Unlock()
-	if idx >= len(p.Conns) {
-		idx = 0
-	}
-	_, err := p.Conns[idx].WriteTo(buf, dst)
+	_, err := p.connFor(idx).WriteTo(buf, dst)
 	return err
 }
 
@@ -361,8 +423,10 @@ func (p *Punch) peer(id protocol.PeerID) *peer {
 	return p.peers[id]
 }
 
-// probeLoop probes all targets for one peer until connected or the peer's
-// generation is replaced/removed.
+// probeLoop probes all targets for one peer until a direct link is established.
+// In pure-P2P mode, it never gives up: after an intense initial window it
+// settles into a steady low-overhead direct probe cadence and triggers
+// periodic NAT anchor refreshes.
 func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 	defer p.wg.Done()
 	ps := p.peer(id)
@@ -374,12 +438,17 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 	ps.mu.Unlock()
 
 	cfg := p.Config
+	var deck *portDeck
+	if info.isHardNAT() && cfg.SymmetricSpray >= 0 {
+		deck = newPortDeck(nil)
+	}
 
-	// Pure P2P: there is no relay fallback, so every peer gets the full direct
-	// attempt. canSpray (an active socket pool) enables the step-aligned and
-	// n4 block legs; the multi-IP spray leg runs regardless of pool size, so a
-	// destination-rotating CGNAT is still attacked even with a single socket.
-	targets := planTargets(p.My, info, cfg)
+	var batchWriter0 *ipv4.PacketConn
+	if uc, ok := p.Conn.(*net.UDPConn); ok {
+		batchWriter0 = ipv4.NewPacketConn(uc)
+	}
+
+	targets := planTargetsWithDeck(p.My, info, cfg, deck, 0)
 	var punchEps []Endpoint
 	spraying := false
 	for i := range targets {
@@ -389,61 +458,29 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 		punchEps = append(punchEps, targets[i])
 	}
 
-	interval := time.Duration(p.intervalMs()) * time.Millisecond
-
-	// Verbose flow log: the punching plan for this peer. The spray window is
-	// thousands of endpoints; collapse it to one line so the plan is readable.
 	p.logf("peer %s (nat=%s): my private=%s peer private=%s", id.String()[:8], info.Type, p.My.PrivateAddr, info.PrivateAddr)
-	p.logf("peer %s (nat=%s): punching plan", id.String()[:8], info.Type)
-	sprayPorts := 0
-	var sprayIP net.IP
+	p.logf("peer %s (nat=%s): punching plan (%d targets, pps=%d)", id.String()[:8], info.Type, len(punchEps), p.punchPPS())
+	counts := map[string]int{}
 	for _, ep := range punchEps {
-		if ep.Kind == "spray" {
-			sprayPorts++
-			if sprayIP == nil {
-				sprayIP = ep.Addr.IP
-			}
-			continue
-		}
-		p.logf("  target kind=%s %s", ep.Kind, ep.Addr)
+		counts[ep.Kind]++
 	}
-	if sprayPorts > 0 {
-		p.logf("  target kind=spray %d random ports at %s (re-rolled each round)", sprayPorts, sprayIP)
+	for kind, cnt := range counts {
+		p.logf("  leg=%s targets=%d", kind, cnt)
 	}
-	start := time.Now()
-	lastAnnounce := time.Time{}
-	round := 0
-	// Fail-safe escalation. A cellular symmetric NAT is flakily classified as
-	// cone on real networks (the second-destination probe sometimes repeats the
-	// mapping), and a "cone" verdict gives the peer only a single public probe
-	// that never re-rolls -- so a misclassification permanently strands the
-	// link. If a soft (non-spraying) plan has not connected within
-	// escalateAfter, re-plan the peer as hard (plant+spray). This is additive:
-	// a genuinely-cone peer would already be connected by now, so escalating it
-	// costs only a little extra traffic and recovers the misdetected case.
+
+	interval := time.Duration(p.intervalMs()) * time.Millisecond
+	pps := p.punchPPS()
+	escalateAfter := p.escalateAfter()
 	escalated := false
-	escalateAfter := time.Duration(p.escalateMs()) * time.Millisecond
-	// planInfo is the peer info the plan is built from; escalation switches it
-	// from the (possibly misclassified) reported type to hard so every later
-	// re-roll keeps the aggressive plan instead of reverting to the soft one.
-	planInfo := info
-	// planMy mirrors planInfo for our OWN side. A symmetric host can also be
-	// flakily misdetected as cone, and then it never PLANTS (fans its socket
-	// pool), leaving the peer a single external port to hit. Escalation forces
-	// our own type hard too, so the full plant+spray birthday attack runs and
-	// self-misdetection is recovered.
 	planMy := p.My
-	// Probe rate ceiling. A wide CGNAT spray is tens of thousands of targets a
-	// round; blasting them as fast as the loop allows saturates the host NIC and
-	// overflows the router's NAT conntrack table, which takes the entire network
-	// offline. Pace the sweep instead -- EasyTier-class punching lands within
-	// seconds at a couple thousand packets/s, so a cap costs nothing real.
-	pps := cfg.PunchPPS
-	if pps <= 0 {
-		pps = defaultPunchPPS
-	}
-	pace := time.Second / time.Duration(pps)
-	nextSend := time.Now()
+	planInfo := info
+	maxTier := maxPlannedTier(punchEps)
+	start := time.Now()
+	var directConfirmedAt time.Time
+	lastAnnounce := time.Time{}
+	lastRefresh := start
+	round := 0
+
 	for {
 		if p.stopped() {
 			return
@@ -453,16 +490,29 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 			return
 		default:
 		}
-		connected, transport := p.Connected(id)
-		if connected && transport == StatePunched {
-			p.keepaliveLoop(id, stop)
-			return
+		connected, confirmed, _, curTier := p.routeState(id)
+		var upgradeEps []Endpoint
+		if connected && confirmed {
+			if directConfirmedAt.IsZero() {
+				directConfirmedAt = time.Now()
+			}
+			if curTier < maxTier && time.Since(directConfirmedAt) < upgradeProbeWindow {
+				upgradeEps = filterHigherTierEndpoints(punchEps, curTier)
+			}
+			if len(upgradeEps) == 0 {
+				p.keepaliveLoop(id, stop)
+				return
+			}
 		}
-		if !spraying && !escalated && time.Since(start) > escalateAfter {
+
+		if !connected && !spraying && !escalated && time.Since(start) >= escalateAfter {
 			escalated = true
-			planInfo.Type = stun.NatSymmetric
 			planMy.Type = stun.NatSymmetric
-			nt := planTargets(planMy, planInfo, cfg)
+			planInfo.Type = stun.NatSymmetric
+			if deck == nil && cfg.SymmetricSpray >= 0 {
+				deck = newPortDeck(nil)
+			}
+			nt := planTargetsWithDeck(planMy, planInfo, cfg, deck, round)
 			replanned := punchEps[:0]
 			for i := range nt {
 				if nt[i].Kind == "spray" {
@@ -471,59 +521,45 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 				replanned = append(replanned, nt[i])
 			}
 			punchEps = replanned
-			p.logf("peer %s: cone-classified peer not connected after %s, escalating to hard plant+spray", id.String()[:8], escalateAfter)
+			maxTier = maxPlannedTier(punchEps)
+			p.logf("peer %s: not connected after %s, escalating both ends to hard plant+spray", id.String()[:8], escalateAfter)
 		}
+
 		wait := interval
-		if spraying && round > 0 {
-			// Re-roll the spray window each round. A fixed random subset can
-			// miss the peer's planted mapping ports forever; new ports every
-			// round grow coverage until a collision lands.
-			nt := planTargets(planMy, planInfo, cfg)
-			replanned := punchEps[:0]
-			replanned = append(replanned, nt...)
-			punchEps = replanned
+		if round > 0 && time.Since(start) > 25*time.Second && wait < 250*time.Millisecond {
+			wait = 250 * time.Millisecond
 		}
+
+		if !confirmed && round > 0 && (deck != nil || planInfo.PoolCIDR != nil || planMy.isHardNAT()) {
+			nt := planTargetsWithDeck(planMy, planInfo, cfg, deck, round)
+			punchEps = append(punchEps[:0], nt...)
+			maxTier = maxPlannedTier(punchEps)
+		}
+
 		eps := punchEps
-		nextSend = time.Now()
-		for _, ep := range eps {
-			if p.stopped() {
-				return
-			}
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			// Staggered plant/block refresh. A 128-socket plant pool re-sent in
-			// full every round floods the cellular CGNAT's port quota / anti-flood
-			// (measured: pps 3000 with full re-send dropped to 1/4). UDP mappings
-			// live 15-60s, so after the first two rounds that spread every socket,
-			// only a rotating 1/plantStaggerDiv slice needs refreshing each round to
-			// keep them warm -- freeing the rate budget for the spray that actually
-			// collides. Spray/predicted/public always send every round.
-			if round >= 2 && (ep.Kind == "plant" || ep.Kind == "block") &&
-				(ep.Socket+round)%plantStaggerDiv != 0 {
-				continue
-			}
-			p.sendProbe(ps, ep)
-			// Rate-limit the sweep: block until this probe's scheduled slot.
-			nextSend = nextSend.Add(pace)
-			if d := time.Until(nextSend); d > 0 {
-				select {
-				case <-p.done:
-					return
-				case <-stop:
-					return
-				case <-time.After(d):
-				}
+		if len(upgradeEps) > 0 {
+			// Active lower-tier direct link already works; keep it warm while
+			// probing strictly higher-tier candidates (LAN / IPv6 / UPnP) only.
+			p.keepAliveOnce(id)
+			eps = upgradeEps
+			if wait < upgradeProbeInterval {
+				wait = upgradeProbeInterval
 			}
 		}
+
+		p.sendBurst(ps, eps, batchWriter0, pps, stop)
 		round++
-		// periodic activity heartbeat
+
+		if !connected && p.OnRefreshNeeded != nil && time.Since(lastRefresh) >= refreshAnchorEvery {
+			lastRefresh = time.Now()
+			go p.OnRefreshNeeded(id)
+		}
+
 		if time.Since(lastAnnounce) > 2*time.Second {
 			lastAnnounce = time.Now()
-			p.logf("peer %s: still probing %d target(s) (round %d)", id.String()[:8], len(eps), round)
+			p.logf("peer %s: probing %d targets (round %d)", id.String()[:8], len(eps), round)
 		}
+
 		select {
 		case <-p.done:
 			return
@@ -534,12 +570,113 @@ func (p *Punch) probeLoop(id protocol.PeerID, stop <-chan struct{}) {
 	}
 }
 
-// keepaliveLoop maintains an established peer's NAT mapping. It sends a
-// lightweight ack addressed to that peer on the confirmed endpoint until the
-// peer is removed or the engine stops. Using PktAck with a non-zero dst keeps
-// relay broadcasts from being accepted by other room members.
+// sendBurst dispatches eps with Socket 0 batched via WriteBatch and rate-paced
+// at pps packets/sec so NATs and kernel buffers do not drop bursts.
+func (p *Punch) sendBurst(ps *peer, eps []Endpoint, batchWriter0 *ipv4.PacketConn, pps int, stop <-chan struct{}) {
+	const chunkSize = 32
+	var chunk []ipv4.Message
+	var chunkBufs [][]byte
+	if batchWriter0 != nil {
+		chunk = make([]ipv4.Message, 0, chunkSize)
+		chunkBufs = make([][]byte, 0, chunkSize)
+	}
+
+	sentSincePace := 0
+	paceStart := time.Now()
+	paceStep := 32
+
+	pace := func() bool {
+		sentSincePace++
+		if pps <= 0 || sentSincePace < paceStep {
+			return true
+		}
+		targetDur := time.Duration(sentSincePace) * time.Second / time.Duration(pps)
+		if elapsed := time.Since(paceStart); targetDur > elapsed {
+			d := targetDur - elapsed
+			if d > 20*time.Millisecond {
+				d = 20 * time.Millisecond
+			}
+			select {
+			case <-p.done:
+				return false
+			case <-stop:
+				return false
+			case <-time.After(d):
+			}
+		}
+		if sentSincePace >= 256 {
+			sentSincePace = 0
+			paceStart = time.Now()
+		}
+		return true
+	}
+
+	flushChunk := func() {
+		if len(chunk) == 0 {
+			return
+		}
+		if _, err := batchWriter0.WriteBatch(chunk, 0); err != nil {
+			for _, m := range chunk {
+				if m.Addr != nil && len(m.Buffers) > 0 {
+					_, _ = p.Conn.WriteTo(m.Buffers[0], m.Addr)
+				}
+			}
+		}
+		for _, b := range chunkBufs {
+			putEncode(b)
+		}
+		chunk = chunk[:0]
+		chunkBufs = chunkBufs[:0]
+	}
+
+	for _, ep := range eps {
+		if p.stopped() {
+			flushChunk()
+			return
+		}
+		select {
+		case <-stop:
+			flushChunk()
+			return
+		default:
+		}
+		if !pace() {
+			flushChunk()
+			return
+		}
+
+		ps.mu.Lock()
+		seq := ps.nextProbeSeqLocked()
+		ps.mu.Unlock()
+
+		pkt := &Packet{Type: PktProbe, Seq: seq, Src: p.MyID, Dst: protocol.PeerID{}}
+		buf := encodePooled(pkt)
+		if ep.Socket == 0 && batchWriter0 != nil {
+			chunk = append(chunk, ipv4.Message{Addr: ep.Addr, Buffers: [][]byte{buf}})
+			chunkBufs = append(chunkBufs, buf)
+			if len(chunk) >= chunkSize {
+				flushChunk()
+			}
+			continue
+		}
+		_, _ = p.connFor(ep.Socket).WriteTo(buf, ep.Addr)
+		putEncode(buf)
+	}
+	flushChunk()
+}
+
 func (p *Punch) keepaliveLoop(id protocol.PeerID, stop <-chan struct{}) {
-	ticker := time.NewTicker(keepaliveInterval)
+	ps := p.peer(id)
+	iv := keepaliveInterval
+	if ps != nil {
+		ps.mu.Lock()
+		if p.My.isHardNAT() || ps.info.isHardNAT() {
+			iv = symKeepaliveInterval
+		}
+		ps.mu.Unlock()
+	}
+
+	ticker := time.NewTicker(iv)
 	defer ticker.Stop()
 	for {
 		select {
@@ -560,7 +697,10 @@ func (p *Punch) keepaliveLoop(id protocol.PeerID, stop <-chan struct{}) {
 		}
 		if time.Since(ps.lastSeen) > peerIdleTimeout {
 			ps.connected = false
+			ps.confirmed = false
 			ps.transport = ""
+			ps.tier = tierNone
+			ps.rtt = 0
 			ps.mu.Unlock()
 			p.logf("peer %s: idle for %s, restarting hole punch", id.String()[:8], peerIdleTimeout)
 			p.restartPeer(id)
@@ -573,10 +713,6 @@ func (p *Punch) keepaliveLoop(id protocol.PeerID, stop <-chan struct{}) {
 	}
 }
 
-// keepAliveOnce sends the one lightweight ack that maintains a connected
-// peer's NAT mapping on its confirmed endpoint. Using PktAck with a non-zero
-// dst keeps relay broadcasts from being accepted by other room members. It
-// returns false when the peer is gone or is no longer connected.
 func (p *Punch) keepAliveOnce(id protocol.PeerID) bool {
 	ps := p.peer(id)
 	if ps == nil {
@@ -589,19 +725,16 @@ func (p *Punch) keepAliveOnce(id protocol.PeerID) bool {
 	}
 	endpoint := ps.endpoint
 	sockIdx := ps.sockIdx
-	ps.seq++
-	seq := ps.seq
 	ps.mu.Unlock()
-	pkt := &Packet{Type: PktAck, Seq: seq, Src: p.MyID, Dst: id}
+	// Use Seq=0 for unsolicited keepalives so peer's probe-ack RTT tracker
+	// never confuses keepalives with echoed PktProbe sequence numbers.
+	pkt := &Packet{Type: PktAck, Seq: 0, Src: p.MyID, Dst: id}
 	buf := encodePooled(pkt)
-	p.Conns[sockIdx].WriteTo(buf, endpoint)
+	_, _ = p.connFor(sockIdx).WriteTo(buf, endpoint)
 	putEncode(buf)
 	return true
 }
 
-// restartPeer stops the current probe/keepalive generation for a peer and
-// starts a fresh probe loop with the latest NAT info. Used after a connected
-// peer goes idle for too long.
 func (p *Punch) restartPeer(id protocol.PeerID) {
 	p.mu.Lock()
 	ps := p.peers[id]
@@ -623,19 +756,11 @@ func (p *Punch) restartPeer(id protocol.PeerID) {
 
 func (p *Punch) sendProbe(ps *peer, ep Endpoint) {
 	ps.mu.Lock()
-	ps.seq++
-	seq := ps.seq
+	seq := ps.nextProbeSeqLocked()
 	ps.mu.Unlock()
 	pkt := &Packet{Type: PktProbe, Seq: seq, Src: p.MyID, Dst: protocol.PeerID{}, Payload: nil}
 	buf := encodePooled(pkt)
-	// A target planned against a wider pool than this engine has -- an AddPeer
-	// that raced a pool swap -- still has to reach the peer on some socket, and
-	// indexing past the end would take the whole process down.
-	idx := ep.Socket
-	if idx >= len(p.Conns) {
-		idx = 0
-	}
-	p.Conns[idx].WriteTo(buf, ep.Addr)
+	_, _ = p.connFor(ep.Socket).WriteTo(buf, ep.Addr)
 	putEncode(buf)
 }
 
@@ -646,7 +771,15 @@ func (p *Punch) readLoop(conn net.PacketConn, sockIdx int) {
 		bufs[i] = make([]byte, 65536)
 	}
 	for {
-		batches, err := readBatch(conn, bufs)
+		var (
+			batches []batchPacket
+			err     error
+		)
+		if sockIdx < 0 {
+			batches, err = readBatchSingle(conn, bufs[0])
+		} else {
+			batches, err = readBatch(conn, bufs)
+		}
 		if err != nil {
 			return
 		}
@@ -668,12 +801,6 @@ func (p *Punch) readLoop(conn net.PacketConn, sockIdx int) {
 				if pkt.Dst != p.MyID && pkt.Dst != (protocol.PeerID{}) {
 					continue
 				}
-			case PktRegister:
-				continue
-			case PktRegAck:
-				if pkt.Dst != p.MyID {
-					continue
-				}
 			}
 			p.handle(pkt, bp.src, sockIdx)
 		}
@@ -683,47 +810,74 @@ func (p *Punch) readLoop(conn net.PacketConn, sockIdx int) {
 func (p *Punch) handle(pkt *Packet, src net.Addr, sockIdx int) {
 	ua, _ := src.(*net.UDPAddr)
 
-	switch pkt.Type {
-	case PktRegAck:
-		return
-	case PktRegister:
-		return
-	}
-
 	ps := p.peer(pkt.Src)
 	if ps == nil {
 		return
 	}
 	ps.mu.Lock()
-	ps.lastSeen = time.Now()
 	switch pkt.Type {
 	case PktProbe, PktProbe2:
-		first, upgraded := ps.note(p, ua, sockIdx)
+		prevTier := ps.tier
+		wasConfirmed := ps.confirmed
+		sameAddr := ps.endpoint != nil && ua != nil && ps.endpoint.IP.Equal(ua.IP) && ps.endpoint.Port == ua.Port && ps.sockIdx == sockIdx
+		probeTier := classifyPacketTier(p.My, ps.info, p.Config, ua, sockIdx)
+		first, upgraded, _ := ps.note(p, ua, sockIdx, false, 0)
+		// Only refresh liveness from one-way probes if we are not yet confirmed
+		// or the probe came from the active path / caused a transition; otherwise
+		// a stray or roaming probe would keep lastSeen alive while being ignored
+		// and defeat peerIdleTimeout recovery.
+		if !wasConfirmed || sameAddr || first || upgraded {
+			ps.lastSeen = time.Now()
+		}
 		transport := ps.transport
+		confirmed := ps.confirmed
+		newTier := ps.tier
 		ps.mu.Unlock()
 		if first || upgraded {
-			p.logf("peer %s: <- probe from %s -> connected via %s (socket %d)", pkt.Src.String()[:8], ua, transport, sockIdx)
+			p.logf("peer %s: <- probe from %s -> connected via %s[%s] (socket %d)", pkt.Src.String()[:8], ua, transport, newTier, sockIdx)
 		}
 		ack := &Packet{Type: PktAck, Seq: pkt.Seq, Src: p.MyID, Dst: pkt.Src}
 		buf := encodePooled(ack)
-		p.Conns[sockIdx].WriteTo(buf, ua)
+		_, _ = p.connFor(sockIdx).WriteTo(buf, ua)
 		putEncode(buf)
-		p.report(ps, pkt.Src)
-		return
-	case PktAck:
-		first, upgraded := ps.note(p, ua, sockIdx)
-		transport := ps.transport
-		ps.mu.Unlock()
-		if first || upgraded {
-			p.logf("peer %s: <- ack from %s -> connected via %s (socket %d)", pkt.Src.String()[:8], ua, transport, sockIdx)
+		// If we are already confirmed on a lower tier and receive a higher-tier
+		// probe (e.g. LAN/IPv6 arriving after Public), fire one opportunistic
+		// reverse probe immediately so both sides confirm the upgrade in 1 RTT.
+		if confirmed && probeTier > prevTier && ua != nil {
+			p.sendProbe(ps, Endpoint{Addr: ua, Socket: sockIdx})
 		}
 		p.report(ps, pkt.Src)
 		return
+	case PktAck:
+		ps.lastSeen = time.Now()
+		sampleRTT := ps.measureRTTLocked(pkt.Seq)
+		prevTier := ps.tier
+		first, upgraded, notifyConfirmed := ps.note(p, ua, sockIdx, true, sampleRTT)
+		transport := ps.transport
+		confirmedSock := ps.sockIdx
+		newTier := ps.tier
+		rtt := ps.rtt
+		ps.mu.Unlock()
+		if first {
+			p.logf("peer %s: <- ack from %s -> connected via %s[%s] (socket %d, rtt=%s)", pkt.Src.String()[:8], ua, transport, newTier, confirmedSock, rtt)
+		} else if upgraded {
+			p.logf("peer %s: <- ack from %s -> upgraded %s -> %s[%s] (socket %d, rtt=%s)", pkt.Src.String()[:8], ua, prevTier, transport, newTier, confirmedSock, rtt)
+		}
+		p.report(ps, pkt.Src)
+		if notifyConfirmed && p.OnDirectConfirmed != nil {
+			p.OnDirectConfirmed(pkt.Src, confirmedSock)
+		}
+		return
 	case PktData:
-		first, upgraded := ps.note(p, ua, sockIdx)
+		ps.lastSeen = time.Now()
+		first, upgraded, notifyConfirmed := ps.note(p, ua, sockIdx, true, 0)
+		confirmedSock := ps.sockIdx
 		ps.mu.Unlock()
 		if first || upgraded {
 			p.report(ps, pkt.Src)
+		}
+		if notifyConfirmed && p.OnDirectConfirmed != nil {
+			p.OnDirectConfirmed(pkt.Src, confirmedSock)
 		}
 		if p.OnData != nil {
 			p.OnData(pkt.Src, pkt)
@@ -731,27 +885,71 @@ func (p *Punch) handle(pkt *Packet, src net.Addr, sockIdx int) {
 	}
 }
 
-// note records the endpoint and socket a peer's packet arrived from and labels
-// the link.
-//
-// A direct path, once confirmed, is never replaced by the relay: the relay
-// keeps forwarding this peer's keepalives to the same socket, and letting
-// those overwrite the endpoint would pull a punched link back onto the slow
-// path every few seconds. Caller must hold ps.mu.
-func (ps *peer) note(p *Punch, ua *net.UDPAddr, sockIdx int) (first, upgraded bool) {
+// note records the endpoint, socket, and routeTier for a peer's packet.
+// Routes obey strict ICE upgrade-only ordering (LAN > IPv6 > UPnP > Public):
+// higher tiers always upgrade lower tiers once confirmed via PktAck/PktData,
+// while lower-tier delayed packets or stray PktProbes never downgrade or hijack
+// an already-confirmed direct link. Caller must hold ps.mu.
+func (ps *peer) note(p *Punch, ua *net.UDPAddr, sockIdx int, isAckOrData bool, sampleRTT time.Duration) (first, upgraded, notifyConfirmed bool) {
 	first = !ps.connected
 	if ua == nil {
-		return first, false
+		return first, false, false
 	}
-	was := ps.transport
+	newTier := classifyPacketTier(p.My, ps.info, p.Config, ua, sockIdx)
+
+	// Strictly non-downgrading: once connected on a higher tier (e.g. LAN/IPv6
+	// vs Public), lower-tier packets never overwrite it.
+	if ps.connected && newTier < ps.tier {
+		return false, false, false
+	}
+
+	// Same address & socket refresh: confirm or update RTT without churning.
+	sameAddr := ps.endpoint != nil && ps.endpoint.IP.Equal(ua.IP) && ps.endpoint.Port == ua.Port && ps.sockIdx == sockIdx
+
+	if ps.confirmed && ps.transport == StatePunched {
+		// Never let one-way PktProbes overwrite an already-confirmed direct path,
+		// even on a higher tier; wait for bidirectional PktAck/PktData so a broken
+		// half-open route cannot disrupt live traffic.
+		if !isAckOrData && !sameAddr {
+			return false, false, false
+		}
+	}
+
+	prevTier := ps.tier
+	prevSock := ps.sockIdx
+	prevEp := ps.endpoint
+
+	if sameAddr {
+		if sampleRTT > 0 {
+			ps.rtt = sampleRTT
+		}
+		if isAckOrData && !ps.confirmed {
+			ps.confirmed = true
+			notifyConfirmed = true
+		}
+		return false, false, notifyConfirmed
+	}
+
 	ps.endpoint = ua
 	ps.sockIdx = sockIdx
+	ps.tier = newTier
+	if sampleRTT > 0 {
+		ps.rtt = sampleRTT
+	} else if prevTier != tierNone && newTier > prevTier {
+		ps.rtt = 0
+	}
 	ps.transport = StatePunched
+	if isAckOrData {
+		wasConfirmed := ps.confirmed
+		ps.confirmed = true
+		endpointSwitched := prevEp == nil || !prevEp.IP.Equal(ua.IP) || prevEp.Port != ua.Port || prevSock != sockIdx
+		if !wasConfirmed || (newTier > prevTier && endpointSwitched) {
+			notifyConfirmed = true
+		}
+	}
 	ps.connected = true
-	// Pure P2P: any inbound packet from the peer confirms the direct punched
-	// endpoint. "upgraded" marks the first transition into a punched link.
-	upgraded = was != StatePunched
-	return first, upgraded
+	upgraded = prevTier != tierNone && newTier > prevTier
+	return first, upgraded, notifyConfirmed
 }
 
 func (p *Punch) report(ps *peer, id protocol.PeerID) {

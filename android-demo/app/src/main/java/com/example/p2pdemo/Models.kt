@@ -13,6 +13,7 @@ data class ConnConfig(
     val token: String = "",
     val authUser: String = "",
     val authSecret: String = "",
+    val stunList: String = "",
     val debug: Boolean = true,
     val plaintext: Boolean = false,
     val legacyMesh: Boolean = false,
@@ -23,25 +24,24 @@ data class ConnConfig(
     fun toP2p(): Config {
         val cfg = Config()
         cfg.setServerAddr(serverAddr)
-        // 单端口服务器：信令 / STUN / 中继共用同一地址。
+        // 单信令服务器（可选同端口主 STUN），同时支持信令下发与本地扩展多 STUN。
         cfg.setSTUNAddr(serverAddr)
+        cfg.setSTUNSecondaries(stunList)
         cfg.setToken(token)
         cfg.setAuthUser(authUser)
         cfg.setAuthSecret(authSecret)
         cfg.setPortPrediction(true)
         cfg.setEnableLAN(true)
-        // Hard-symmetric birthday attack. The phone is the CGNAT (hard) side:
-        // a contiguous local block lets it PLANT one mapping per socket at the
-        // peer's advertised port, so the cone peer's wide random SPRAY has
-        // mappings to collide with. PeerPortOffset keeps n4's cheap block bet
-        // for port-preserving NATs. 128 sockets + PunchPPS cap match the
-        // live-verified tuning (rotating-pool NAT3<->NAT4 direct, tail 51s->9s);
-        // the engine staggers the plant refresh from round 2 so the larger pool
-        // does not flood the cellular port quota.
-        cfg.setPredictionSockets(128L)
+        cfg.setEnableIPv6(true)
+        cfg.setEnableUPnP(true)
+        // NAT3<->NAT4 并行探测 + 192 错峰保活锚点池 + 512 加权无放回随机喷射 + 1500 PPS 限速。
+        cfg.setPredictionSockets(192L)
         cfg.setPeerPortOffset(20L)
-        cfg.setSymmetricSpray(1024L)
+        cfg.setSymmetricSpray(512L)
+        cfg.setSprayIPMax(64L)
+        cfg.setProbeIntervalMs(60L)
         cfg.setPunchPPS(1500L)
+        cfg.setEscalateAfterMs(2000L)
         cfg.setDebug(debug)
         cfg.setPlaintext(plaintext)
         cfg.setLegacyMesh(legacyMesh)

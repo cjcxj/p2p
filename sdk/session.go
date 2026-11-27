@@ -24,8 +24,6 @@ import (
 
 var errBadIP = errors.New("p2p: invalid ip address")
 
-// udpSocketBufferSize is the target UDP socket buffer size used by Session.
-// 4 MiB is a reasonable high-BDP default; OS limits may cap the actual value.
 const udpSocketBufferSize = 4 << 20
 
 // Member describes a node in the virtual network.
@@ -34,7 +32,7 @@ type Member struct {
 	VirtualIP     string
 	NATType       string
 	Transport     string
-	Endpoint      string // actual remote UDP endpoint (IP:port) when connected
+	Endpoint      string
 	Connected     bool
 	BytesSent     uint64
 	BytesReceived uint64
@@ -46,8 +44,11 @@ type Session struct {
 	l   Listener
 
 	conn       net.PacketConn
-	extraConns []*net.UDPConn // spray pool; closed in Close
+	ip6Conn    net.PacketConn // optional dual-stack IPv6 socket
+	extraConns []*net.UDPConn // spray/plant pool; closed in Disconnect
+	poolPorts  []int          // local source ports of extraConns + conn
 	det        *stun.Detection
+	stunList   []string // merged STUN observation servers
 	id         protocol.PeerID
 	vip        net.IP
 	ipnet      *net.IPNet
@@ -55,7 +56,6 @@ type Session struct {
 	ph         *punch.Punch
 	mesh       *mesh.Node
 	room       string
-
 	x25519     *ecdh.PrivateKey
 	protector  SocketProtector
 	localStack *netstack.LocalStack
@@ -68,6 +68,7 @@ type Session struct {
 	tunWriteCh   chan []byte
 	tunWriteStop chan struct{}
 
+	tunMu  sync.Mutex // lock order: always acquire tunMu before mu
 	mu     sync.Mutex
 	peers  map[string]*remote
 	closed bool
@@ -76,46 +77,47 @@ type Session struct {
 }
 
 type remote struct {
-	id        protocol.PeerID
-	vip       net.IP
-	connected bool
-	transport string
-	endpoint  string // actual remote UDP endpoint (IP:port)
-	key       []byte // per-pair data-plane AEAD key; nil means plaintext fallback
-	wgPub     string // peer's X25519 key, hex, as advertised in signaling
+	id            protocol.PeerID
+	vip           net.IP
+	natType       string
+	connected     bool
+	transport     string
+	endpoint      string
+	key           []byte
+	wgPub         string
 	// wgApplied is the tunnel entry actually installed for this peer, or the
 	// zero value while none is. Comparing the whole entry -- not just the
-	// endpoint -- is what makes a rejoin under a fresh key take effect: the
-	// endpoint is often identical after a reconnect from the same network, and
-	// the stale key inside the tunnel would keep the link dark.
+	// endpoint -- is what makes a rejoin under a fresh key take effect.
 	wgApplied     tunnelPeer
+	natInfo       punch.NATInfo
 	bytesSent     uint64
 	bytesReceived uint64
 }
 
 // SocketProtector protects the session's UDP socket from being routed back
-// through a VPN tunnel (Android VpnService integration). Implementations
-// call VpnService.protect(fd) and return whether it succeeded.
+// through a VPN tunnel (Android VpnService integration).
 type SocketProtector interface {
 	Protect(fd int) bool
 }
 
-// SetSocketProtector installs a protector for the session's UDP socket and
-// applies it immediately. Call before Connect when a VPN may route the
-// socket's traffic.
+// SetSocketProtector installs a protector for the session's UDP sockets.
 func (s *Session) SetSocketProtector(p SocketProtector) {
 	s.mu.Lock()
 	s.protector = p
 	extras := s.extraConns
+	ip6 := s.ip6Conn
 	s.mu.Unlock()
 	protectConn(s.conn, p)
+	if ip6 != nil {
+		protectConn(ip6, p)
+	}
 	for _, c := range extras {
 		protectConn(c, p)
 	}
 }
 
 func protectConn(conn net.PacketConn, p SocketProtector) {
-	if p == nil {
+	if p == nil || conn == nil {
 		return
 	}
 	uc, ok := conn.(*net.UDPConn)
@@ -129,20 +131,14 @@ func protectConn(conn net.PacketConn, p SocketProtector) {
 	raw.Control(func(fd uintptr) { p.Protect(int(fd)) })
 }
 
-// AttachTUN attaches a raw TUN file descriptor (e.g. Android VpnService) and
-// runs the tunnel in Go. The session takes ownership of fd: once this call
-// returns -- success or failure -- the descriptor is closed and the caller must
-// not close it again. That is what lets a mobile app skip the per-packet
-// Java/JNI bridge, which was the slowest part of the old data plane.
-//
-// By default the descriptor is handed to a WireGuard interface that reads and
-// writes it directly. With Config.LegacyMesh it is bridged through the retired
-// mesh data plane instead, which is how IP traffic travelled before the
-// tunnel existed.
+// AttachTUN attaches a raw TUN file descriptor (e.g. Android VpnService).
 func (s *Session) AttachTUN(fd int, mtu int) error {
 	if fd < 0 {
 		return errors.New("p2p: invalid tun fd")
 	}
+	s.tunMu.Lock()
+	defer s.tunMu.Unlock()
+
 	s.mu.Lock()
 	legacy := s.cfg.LegacyMesh
 	attached := s.tunFile != nil || s.tunnel != nil
@@ -161,7 +157,7 @@ func (s *Session) AttachTUN(fd int, mtu int) error {
 		if err != nil {
 			return err
 		}
-		return s.startTunnel(dev.TUN(), dev.Name())
+		return s.startTunnelLocked(dev.TUN(), dev.Name())
 	}
 	f := os.NewFile(uintptr(fd), "p2p-tun")
 	if f == nil {
@@ -173,7 +169,7 @@ func (s *Session) AttachTUN(fd int, mtu int) error {
 		f.Close()
 		return net.ErrClosed
 	}
-	if s.tunFile != nil {
+	if s.tunFile != nil || s.tunnel != nil {
 		s.mu.Unlock()
 		f.Close()
 		return errors.New("p2p: tun already attached")
@@ -227,11 +223,7 @@ func (s *Session) tunReadLoop(f *os.File, mtu int) {
 	}
 }
 
-// EnableLocalStack creates a userspace IP endpoint for this node's virtual
-// address. Inbound IP packets addressed to the local virtual IP are then
-// handled in-process (e.g. ICMP echo replies) instead of being delivered as
-// EventData -- required on platforms where the kernel cannot route replies
-// back through a VPN tun (Android). Call after Connect once LocalIP is set.
+// EnableLocalStack creates a userspace IP endpoint for this node's virtual address.
 func (s *Session) EnableLocalStack() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -253,10 +245,7 @@ func (s *Session) EnableLocalStack() error {
 	return nil
 }
 
-// ExposeTCP makes this device's virtual address accept TCP connections on
-// port and forwards them to 127.0.0.1:port locally, so other nodes can reach
-// TCP services running on this device through the virtual IP. Requires
-// EnableLocalStack.
+// ExposeTCP forwards inbound TCP on port for this node's virtual IP to 127.0.0.1:port.
 func (s *Session) ExposeTCP(port int) error {
 	s.mu.Lock()
 	ls := s.localStack
@@ -267,7 +256,6 @@ func (s *Session) ExposeTCP(port int) error {
 	return ls.ExposeTCP(uint16(port))
 }
 
-// ipv4Dst returns the destination IPv4 of a raw IP packet, or nil.
 func ipv4Dst(pkt []byte) net.IP {
 	if len(pkt) < 20 || pkt[0]>>4 != 4 {
 		return nil
@@ -275,11 +263,6 @@ func ipv4Dst(pkt []byte) net.IP {
 	return net.IPv4(pkt[16], pkt[17], pkt[18], pkt[19])
 }
 
-// newPrimaryConn creates the session's main UDP socket. When the block spray
-// is active it binds the socket to the block base (StepProbePort) so the
-// public port advertised to peers is the base of the contiguous local block;
-// the peer's aim at advertised+offset then lands on pool socket `offset`.
-// Falls back to an ephemeral port if the base is unavailable.
 func newPrimaryConn(cfg *Config) (*net.UDPConn, error) {
 	if cfg.PredictionSockets > 1 {
 		if c, err := net.ListenUDP("udp4", &net.UDPAddr{Port: stun.StepProbePort}); err == nil {
@@ -302,8 +285,6 @@ func NewSession(cfg *Config, l Listener) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	// High-latency WAN paths need large UDP socket buffers; the OS defaults are
-	// often far too small for mesh throughput over mobile/home NAT links.
 	_ = conn.SetReadBuffer(udpSocketBufferSize)
 	_ = conn.SetWriteBuffer(udpSocketBufferSize)
 	key, err := newDataKey()
@@ -319,12 +300,10 @@ type nullListener struct{}
 
 func (nullListener) OnEvent(int, string, []byte) {}
 
-// LocalID returns this peer's identifier (valid after Connect).
 func (s *Session) LocalID() string {
 	return s.id.String()
 }
 
-// LocalIP returns this peer's virtual address (valid after Connect).
 func (s *Session) LocalIP() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -334,7 +313,6 @@ func (s *Session) LocalIP() string {
 	return s.vip.String()
 }
 
-// Subnet returns the room's virtual subnet (e.g. "10.9.0.0/24").
 func (s *Session) Subnet() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -344,7 +322,6 @@ func (s *Session) Subnet() string {
 	return s.ipnet.String()
 }
 
-// NATType returns the detected NAT type (valid after Connect).
 func (s *Session) NATType() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -354,21 +331,18 @@ func (s *Session) NATType() string {
 	return string(s.det.NATType)
 }
 
-// Members lists the known nodes of the virtual network.
 func (s *Session) Members() []*Member {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.memberList()
 }
 
-// MemberCount returns the number of known nodes (mobile-friendly accessor).
 func (s *Session) MemberCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.peers)
 }
 
-// MemberAt returns the i-th known node (mobile-friendly accessor).
 func (s *Session) MemberAt(i int) *Member {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -382,22 +356,27 @@ func (s *Session) MemberAt(i int) *Member {
 func (s *Session) memberList() []*Member {
 	out := make([]*Member, 0, len(s.peers))
 	for _, r := range s.peers {
-		m := &Member{PeerID: r.id.String(), Connected: r.connected, Transport: r.transport, Endpoint: r.endpoint, BytesSent: r.bytesSent, BytesReceived: r.bytesReceived}
+		m := &Member{
+			PeerID:        r.id.String(),
+			NATType:       r.natType,
+			Connected:     r.connected,
+			Transport:     r.transport,
+			Endpoint:      r.endpoint,
+			BytesSent:     r.bytesSent,
+			BytesReceived: r.bytesReceived,
+		}
 		if r.vip != nil {
 			m.VirtualIP = r.vip.String()
 		}
 		out = append(out, m)
 	}
 	// Deterministic order: MemberAt(i) re-snapshots the map on every call, and
-	// Go map iteration is randomized. Without sorting, the app's
-	// "for i in 0..MemberCount(): MemberAt(i)" loop can return the same peer at
-	// two indices (and skip another) whenever there are 2+ nodes -- producing
-	// duplicate LazyColumn keys and a crash. Sorting makes indices stable.
+	// Go map iteration is randomized. Sorting by PeerID prevents duplicate or
+	// skipped peers when callers iterate 0..MemberCount()-1 with 2+ peers.
 	sort.Slice(out, func(i, j int) bool { return out[i].PeerID < out[j].PeerID })
 	return out
 }
 
-// Connect joins a room and begins the connection pipeline asynchronously.
 func (s *Session) Connect(room string) error {
 	s.mu.Lock()
 	if s.closed {
@@ -416,8 +395,6 @@ func (s *Session) Connect(room string) error {
 	return nil
 }
 
-// SendToIP routes a payload to a virtual address, possibly via intermediate
-// nodes.
 func (s *Session) SendToIP(dstIP string, data []byte) error {
 	ip := net.ParseIP(dstIP)
 	if ip == nil {
@@ -426,7 +403,6 @@ func (s *Session) SendToIP(dstIP string, data []byte) error {
 	return s.sendToMesh(ip, data)
 }
 
-// Broadcast sends a payload to every node in the room.
 func (s *Session) Broadcast(data []byte) error {
 	s.mu.Lock()
 	m := s.mesh
@@ -437,8 +413,6 @@ func (s *Session) Broadcast(data []byte) error {
 	return m.Broadcast(data)
 }
 
-// Send delivers a payload to a peer (by peer id or virtual address), routed
-// through the mesh.
 func (s *Session) Send(peerID string, data []byte) error {
 	s.mu.Lock()
 	r := s.peers[peerID]
@@ -463,9 +437,6 @@ func (s *Session) Send(peerID string, data []byte) error {
 	return s.sendToMesh(vip, data)
 }
 
-// sendSecure sends a mesh payload to a peer, encrypting it with the per-pair
-// data-plane key when one has been negotiated. Without a key it falls back to
-// the historical plaintext path for compatibility with older peers.
 func (s *Session) sendSecure(id protocol.PeerID, payload []byte) error {
 	s.mu.Lock()
 	r := s.peers[id.String()]
@@ -491,9 +462,6 @@ func (s *Session) sendSecure(id protocol.PeerID, payload []byte) error {
 	return ph.Send(id, payload)
 }
 
-// sendToMesh sends an application payload to a virtual IP. When a per-pair
-// key with the final destination is available, the payload is encrypted
-// end-to-end before entering the mesh, so intermediate nodes cannot read it.
 func (s *Session) sendToMesh(dst net.IP, data []byte) error {
 	s.mu.Lock()
 	m := s.mesh
@@ -518,8 +486,6 @@ func (s *Session) sendToMesh(dst net.IP, data []byte) error {
 	return m.SendTo(dst, data)
 }
 
-// openInbound decrypts an end-to-end encrypted payload received from src.
-// Broadcast and legacy plaintext payloads are returned unchanged.
 func (s *Session) openInbound(src net.IP, payload []byte) []byte {
 	if s.cfg.Plaintext {
 		return payload
@@ -549,10 +515,9 @@ func (s *Session) openInbound(src net.IP, payload []byte) []byte {
 	return payload
 }
 
-// Disconnect tears the session down. It is safe to call before Connect; in
-// that case the session is simply marked closed and the socket released.
 func (s *Session) Disconnect() {
 	s.once.Do(func() {
+		s.tunMu.Lock()
 		s.mu.Lock()
 		s.closed = true
 		done := s.done
@@ -566,25 +531,30 @@ func (s *Session) Disconnect() {
 		ch := s.tunWriteCh
 		stop := s.tunWriteStop
 		extraConns := s.extraConns
+		ip6Conn := s.ip6Conn
 		s.tunnel = nil
 		s.tunnelName = ""
 		s.tunFile = nil
 		s.tunWriteCh = nil
 		s.tunWriteStop = nil
 		s.extraConns = nil
+		s.ip6Conn = nil
 		s.mu.Unlock()
-		if sig != nil {
-			sig.Close()
-		}
-		// Stop the tunnel before the socket: its device would otherwise try to
-		// write WireGuard frames onto a closed conn.
 		if tun != nil {
 			tun.Stop()
 		}
-		// close the socket first so the punch read loop unblocks
+		s.tunMu.Unlock()
+		if sig != nil {
+			sig.Close()
+		}
 		s.conn.Close()
+		if ip6Conn != nil {
+			_ = ip6Conn.Close()
+		}
 		for _, ec := range extraConns {
-			ec.Close()
+			if ec != nil {
+				_ = ec.Close()
+			}
 		}
 		if ph != nil {
 			ph.Stop()
@@ -600,35 +570,18 @@ func (s *Session) Disconnect() {
 	})
 }
 
-// run is the connection pipeline.
+// run executes the pure-P2P pipeline:
+//  1. Dial single signaling server first so server-configured STUN servers are known.
+//  2. Run concurrent multi-STUN NAT detection (+ parallel UPnP/NAT-PMP/PCP & IPv6).
+//  3. Start Punch engine with contiguous nil-free pool sockets & start signaling loop.
 func (s *Session) run(room string) {
-	// 1. NAT detection over our UDP socket.
-	det, err := s.detect()
-	if err != nil {
-		det = &stun.Detection{NATType: stun.NatUnknown, LocalAddr: localUDP(s.conn)}
-	}
-	s.mu.Lock()
-	s.det = det
-	s.mu.Unlock()
-	// The classification decides the whole punching plan, and a wrong one is
-	// invisible unless the evidence is printed: "port_restricted_cone" learned
-	// from a reachable alternate destination and the same guess learned from
-	// nothing look identical otherwise.
-	if m := det.Method(); m != "" {
-		s.debugf("p2p: NAT " + string(det.NATType) + ": " + m)
-	}
-	// Detection sets a read deadline on the socket; clear it so the punch
-	// engine can block freely.
-	if dc, ok := s.conn.(interface{ SetReadDeadline(time.Time) error }); ok {
-		dc.SetReadDeadline(time.Time{})
-	}
-
-	// 2. Signaling handshake (assigns our peer id and virtual address).
+	// 1. Signaling handshake first so server-pushed STUNServers arrive before Detect().
 	var sigAuth *signaling.Auth
 	if s.cfg.AuthSecret != "" {
 		sigAuth = &signaling.Auth{User: s.cfg.AuthUser, Secret: s.cfg.AuthSecret}
 	}
 	var sig *signaling.Client
+	var err error
 	if s.cfg.TLS {
 		tlsCfg := &tls.Config{
 			ServerName:         s.cfg.TLSServerName,
@@ -643,8 +596,11 @@ func (s *Session) run(room string) {
 		s.emit(EventStateChanged, "", []byte(StateFailed))
 		return
 	}
+
+	mergedSTUN := mergeSTUNServers(splitCSV(s.cfg.STUNSecondaries), sig.STUNServers())
 	s.mu.Lock()
 	s.id = sig.PeerID()
+	s.stunList = mergedSTUN
 	if v := sig.VirtualIP(); v != "" {
 		s.vip = net.ParseIP(v)
 	}
@@ -652,8 +608,75 @@ func (s *Session) run(room string) {
 		_, s.ipnet, _ = net.ParseCIDR(n)
 	}
 	s.sig = sig
+	prot := s.protector
 	s.mu.Unlock()
 	s.emit(EventStateChanged, "", []byte(StateConnecting))
+
+	// 2. Concurrent multi-STUN NAT detection + parallel IPv6 / UPnP discovery.
+	var ip6Conn *net.UDPConn
+	var ip6Addr *net.UDPAddr
+	var ip6Wg sync.WaitGroup
+	if s.cfg.EnableIPv6 {
+		ip6Wg.Add(1)
+		go func() {
+			defer ip6Wg.Done()
+			c6, err := net.ListenUDP("udp6", &net.UDPAddr{Port: 0})
+			if err != nil {
+				return
+			}
+			protectConn(c6, prot)
+			var addrs []*net.UDPAddr
+			candidates := append([]string(nil), mergedSTUN...)
+			candidates = append(candidates, stun.DefaultIPv6Secondaries...)
+			for _, st := range candidates {
+				if a, err := net.ResolveUDPAddr("udp6", st); err == nil && a.IP != nil && a.IP.To4() == nil {
+					addrs = append(addrs, a)
+				}
+			}
+			if len(addrs) == 0 {
+				c6.Close()
+				return
+			}
+			sc := &stun.Client{Conn: c6}
+			res := sc.ConcurrentBindAll(addrs, 500*time.Millisecond)
+			for _, r := range res {
+				if r.Mapped != nil && r.Mapped.IP != nil && r.Mapped.IP.IsGlobalUnicast() {
+					ip6Conn = c6
+					ip6Addr = r.Mapped
+					return
+				}
+			}
+			c6.Close()
+		}()
+	}
+
+	det, err := s.detect(mergedSTUN)
+	if err != nil {
+		det = &stun.Detection{NATType: stun.NatUnknown, LocalAddr: localUDP(s.conn)}
+	}
+	if dc, ok := s.conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+		dc.SetReadDeadline(time.Time{})
+	}
+
+	if s.cfg.EnableUPnP && det.LocalAddr != nil && det.LocalAddr.Port > 0 && det.NATType != stun.NatOpen {
+		if uAddr := stun.MapExternalUDP(det.LocalAddr.IP, det.LocalAddr.Port, 350*time.Millisecond); uAddr != nil {
+			det.UPnPAddr = uAddr
+		}
+	}
+	ip6Wg.Wait()
+	if ip6Addr != nil {
+		det.IPv6Addr = ip6Addr
+	}
+
+	s.mu.Lock()
+	s.det = det
+	if ip6Conn != nil {
+		s.ip6Conn = ip6Conn
+	}
+	s.mu.Unlock()
+	if m := det.Method(); m != "" {
+		s.debugf("p2p: NAT " + string(det.NATType) + ": " + m)
+	}
 
 	// 3. Mesh node (virtual addressing + routing).
 	meshNode := mesh.NewNode(s.id, s.vip, s.ipnet)
@@ -666,8 +689,6 @@ func (s *Session) run(room string) {
 		ls := s.localStack
 		s.mu.Unlock()
 		if ls != nil && ls.Wants(payload) {
-			// IP packet the userspace stack should answer (ICMP echo / TCP to
-			// our virtual address): handled in-process, no EventData.
 			ls.HandleInbound(payload)
 			return nil
 		}
@@ -677,8 +698,6 @@ func (s *Session) run(room string) {
 		s.mu.Unlock()
 		if tf != nil {
 			if ch != nil {
-				// Never block the punch read loop on a slow TUN write; drop
-				// only when the write queue is full.
 				select {
 				case ch <- payload:
 				default:
@@ -697,35 +716,89 @@ func (s *Session) run(room string) {
 	s.mesh = meshNode
 	s.mu.Unlock()
 
-	// 4. Punch engine over the same UDP socket.
-	// det.LocalAddr already resolves the wildcard socket address to a concrete
-	// LAN IP when possible; fall back to the raw socket address only if needed.
+	// 4. Build contiguous nil-free socket pool and start pure-P2P punch engine.
 	privateAddr := det.LocalAddr
 	if privateAddr == nil {
 		privateAddr = localUDP(s.conn)
 	}
 	my := punch.NATInfo{
-		Type:        det.NATType,
-		PrivateAddr: privateAddr,
+		Type:               det.NATType,
+		PublicAddr:         det.MappedAddr,
+		PrivateAddr:        privateAddr,
+		ExtraPrivateAddrs:  det.LocalAddrs,
+		PortDelta:          det.PortDelta,
+		PortStep:           det.PortStep,
+		PortPreserve:       det.PortPreserve,
+		PortPreserveOffset: det.PortPreserveOffset,
+		PortBlockMin:       det.PortBlockMin,
+		PortBlockMax:       det.PortBlockMax,
+		ObservedMappings:   det.ObservedMappings,
+		PublicIPs:          det.ObservedIPs,
+		IPv6Addr:           det.IPv6Addr,
+		UPnPAddr:           det.UPnPAddr,
 	}
-	if det.MappedAddr != nil {
-		my.PublicAddr = det.MappedAddr
+	for _, cstr := range det.LocalCIDRs {
+		if _, n, err := net.ParseCIDR(cstr); err == nil {
+			my.PrivateCIDRs = append(my.PrivateCIDRs, n)
+		}
 	}
-	my.PortDelta = det.PortDelta
-	my.PortStep = det.PortStep
+
+	pool := []net.PacketConn{s.conn}
+	var poolPorts []int
+	if ua := localUDP(s.conn); ua != nil {
+		poolPorts = append(poolPorts, ua.Port)
+	}
+	if s.cfg.PredictionSockets > 1 {
+		extra := make([]*net.UDPConn, 0, s.cfg.PredictionSockets-1)
+		for i := 1; i < s.cfg.PredictionSockets; i++ {
+			c, err := net.ListenUDP("udp4", &net.UDPAddr{Port: stun.StepProbePort + i})
+			if err != nil {
+				c, err = net.ListenUDP("udp4", nil)
+				if err != nil {
+					break
+				}
+			}
+			_ = c.SetReadBuffer(udpSocketBufferSize)
+			_ = c.SetWriteBuffer(udpSocketBufferSize)
+			s.mu.Lock()
+			p := s.protector
+			s.mu.Unlock()
+			protectConn(c, p)
+			pool = append(pool, c)
+			extra = append(extra, c)
+			if ua, ok := c.LocalAddr().(*net.UDPAddr); ok {
+				poolPorts = append(poolPorts, ua.Port)
+			}
+		}
+		s.mu.Lock()
+		s.extraConns = extra
+		s.poolPorts = poolPorts
+		s.mu.Unlock()
+	} else {
+		s.mu.Lock()
+		s.poolPorts = poolPorts
+		s.mu.Unlock()
+	}
+
+	my.PoolSize = len(pool)
+	my.PoolPorts = poolPorts
 
 	ph := punch.New(s.conn, s.id, my, punch.Config{
 		PortPrediction:    s.cfg.PortPrediction,
 		EnableLAN:         s.cfg.EnableLAN,
 		ProbeIntervalMs:   s.cfg.ProbeIntervalMs,
 		PunchTimeoutMs:    s.cfg.PunchTimeoutMs,
-		PredictionSockets: s.cfg.PredictionSockets,
+		PredictionSockets: len(pool),
 		PeerPortOffset:    s.cfg.PeerPortOffset,
 		SymmetricSpray:    s.cfg.SymmetricSpray,
 		SprayIPMax:        s.cfg.SprayIPMax,
 		PunchPPS:          s.cfg.PunchPPS,
 		EscalateAfterMs:   s.cfg.EscalateAfterMs,
 	})
+	ph.Conns = pool
+	if ip6Conn != nil {
+		ph.IPv6Conn = ip6Conn
+	}
 	if s.cfg.Debug {
 		ph.Config.OnLog = func(format string, args ...interface{}) {
 			s.emit(EventDebug, "", []byte(fmt.Sprintf(format, args...)))
@@ -743,8 +816,6 @@ func (s *Session) run(room string) {
 		if len(key) > 0 && !s.cfg.Plaintext {
 			dec, err := openData(key, payload)
 			if err != nil {
-				// Drop undecryptable/tampered packets. They cannot be
-				// routed safely.
 				if s.cfg.Debug {
 					s.emit(EventDebug, "", []byte("p2p: dropped undecryptable data packet from "+src.String()[:8]))
 				}
@@ -762,42 +833,21 @@ func (s *Session) run(room string) {
 	ph.OnState = func(id protocol.PeerID, t string, endpoint string) {
 		s.onPeerConnected(id, t, endpoint)
 	}
-	// Build the spray socket pool before starting the punch engine.
-	if s.cfg.PredictionSockets > 1 {
-		pool := make([]net.PacketConn, s.cfg.PredictionSockets)
-		pool[0] = s.conn
-		extra := make([]*net.UDPConn, 0, s.cfg.PredictionSockets-1)
-		for i := 1; i < s.cfg.PredictionSockets; i++ {
-			c, err := net.ListenUDP("udp4", &net.UDPAddr{Port: stun.StepProbePort + i})
-			if err != nil {
-				c, err = net.ListenUDP("udp4", nil)
-				if err != nil {
-					break
-				}
-			}
-			_ = c.SetReadBuffer(udpSocketBufferSize)
-			_ = c.SetWriteBuffer(udpSocketBufferSize)
-			protectConn(c, s.protector)
-			pool[i] = c
-			extra = append(extra, c)
-		}
-		s.mu.Lock()
-		s.extraConns = extra
-		s.mu.Unlock()
-		ph.Conns = pool
+	ph.OnRefreshNeeded = func(peerID protocol.PeerID) {
+		s.refreshAnchorAndSync(peerID)
 	}
 	ph.Start()
+
+	s.tunMu.Lock()
 	s.mu.Lock()
 	s.ph = ph
 	tun := s.tunnel
 	s.mu.Unlock()
-	// A tunnel attached before the punch engine existed -- possible with
-	// AttachTUN, which takes a descriptor the app already owns -- has had
-	// nowhere to receive its frames. Hook this socket up now.
 	if tun != nil {
 		wireTunnel(tun, ph)
-		s.applyTunnelPeers(s.pendingTunnelPeers())
+		s.applyTunnelPeersLocked(s.pendingTunnelPeers())
 	}
+	s.tunMu.Unlock()
 
 	sig.OnMessage = func(m protocol.Message) error {
 		return s.onSignaling(m)
@@ -813,12 +863,8 @@ func (s *Session) run(room string) {
 	}
 	go sig.Run()
 
-	// Session is now fully connected to the room: signaling is running,
-	// the mesh node exists and the punch engine is listening.
 	s.emit(EventStateChanged, "", []byte(StateConnected))
 
-	// Timeout watchdog: after TimeoutSec, wait a grace period for late
-	// joiners before reporting an empty/unreachable room.
 	go func() {
 		sec := s.cfg.TimeoutSec
 		select {
@@ -842,7 +888,7 @@ func (s *Session) run(room string) {
 				if peerCount == 0 {
 					s.emit(EventError, "", []byte("房间内暂无其他节点：请在其他设备用相同房间名启动客户端"))
 				} else {
-					s.emit(EventError, "", []byte("connect timeout: peers in room not reachable"))
+					s.emit(EventError, "", []byte("connect timeout: peers in room not reachable directly"))
 				}
 			}
 		case <-s.done:
@@ -850,28 +896,83 @@ func (s *Session) run(room string) {
 	}()
 }
 
-func (s *Session) detect() (*stun.Detection, error) {
-	server, err := net.ResolveUDPAddr("udp", s.cfg.STUNAddr)
+// refreshAnchorAndSync performs a non-disruptive STUN observation via an
+// ephemeral socket and pushes a MsgPunchSync anchor update to targetPeer so
+// rotating CGNAT egress IPs stay up-to-date during prolonged punching.
+func (s *Session) refreshAnchorAndSync(targetPeer protocol.PeerID) {
+	s.mu.Lock()
+	sig := s.sig
+	closed := s.closed
+	det := s.det
+	stuns := append([]string(nil), s.stunList...)
+	s.mu.Unlock()
+	if closed || sig == nil || det == nil {
+		return
+	}
+	var addrs []*net.UDPAddr
+	if a, err := stun.ResolveUDPAddr(s.cfg.STUNAddr); err == nil {
+		addrs = append(addrs, a)
+	}
+	for _, st := range stuns {
+		if a, err := stun.ResolveUDPAddr(st); err == nil {
+			addrs = append(addrs, a)
+		}
+	}
+	if len(addrs) == 0 {
+		return
+	}
+	sc := &stun.Client{}
+	mappings := sc.ObserveEgress(addrs, 500*time.Millisecond, 700*time.Millisecond)
+	if len(mappings) == 0 {
+		return
+	}
+	anchor := mappings[0].String()
+	_ = sig.Send(protocol.Message{
+		Type:       protocol.MsgPunchSync,
+		TargetID:   targetPeer.String(),
+		AnchorAddr: anchor,
+	})
+}
+
+func (s *Session) detect(secondaries []string) (*stun.Detection, error) {
+	stunAddr := s.cfg.STUNAddr
+	if stunAddr == "" {
+		stunAddr = s.cfg.ServerAddr
+	}
+	server, err := net.ResolveUDPAddr("udp4", stunAddr)
 	if err != nil {
 		return nil, err
 	}
-	// Timeout/SecondaryTimeout must be generous: a cellular CGNAT's path to a
-	// public STUN observation point routinely exceeds 400ms on the first packet,
-	// and if the alternate probes time out we sample only the primary egress IP,
-	// announce no egress pool, and the cone peer cannot reach the rotating
-	// address it uses toward us. The concurrent observeEgressIPs sweep needs this
-	// window to collect the multi-IP candidate set that the pool is derived from.
-	c := &stun.Client{Conn: s.conn, Server: server, Retries: 1, Timeout: 1200 * time.Millisecond, SecondaryTimeout: 1200 * time.Millisecond, StepSamples: stun.DefaultStepSamples}
-	// Operator-supplied observation points override the built-in (China-carrier
-	// reachable) defaults, so the CGNAT candidate discovery generalizes to the
-	// deployment's own network instead of a fixed public STUN list.
-	if list := splitCSV(s.cfg.STUNSecondaries); len(list) > 0 {
-		c.Secondaries = list
+	// Cellular CGNAT first STUN responses routinely take >400ms; use generous
+	// defaults so mobile peers do not falsely time out or fall back to unknown.
+	c := &stun.Client{
+		Conn:             s.conn,
+		Server:           server,
+		Retries:          1,
+		Timeout:          2 * time.Second,
+		SecondaryTimeout: 800 * time.Millisecond,
+		StepSamples:      stun.DefaultStepSamples,
+		Secondaries:      secondaries,
 	}
 	return c.Detect()
 }
 
-// splitCSV trims a comma-separated list into non-empty tokens.
+func mergeSTUNServers(local, server []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, list := range [][]string{local, server} {
+		for _, item := range list {
+			item = strings.TrimSpace(item)
+			if item == "" || seen[item] {
+				continue
+			}
+			seen[item] = true
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
 func splitCSV(s string) []string {
 	if s == "" {
 		return nil
@@ -892,7 +993,6 @@ func localUDP(conn net.PacketConn) *net.UDPAddr {
 	return nil
 }
 
-// onSignaling handles inbound signaling frames.
 func (s *Session) onSignaling(m protocol.Message) error {
 	switch m.Type {
 	case protocol.MsgMembers:
@@ -902,18 +1002,64 @@ func (s *Session) onSignaling(m protocol.Message) error {
 			return nil
 		}
 		s.onPeerCandidate(m)
+	case protocol.MsgPunchSync:
+		if m.PeerID == "" || m.AnchorAddr == "" {
+			return nil
+		}
+		s.onPunchSync(m)
 	case protocol.MsgError:
 		s.emit(EventError, "", []byte(m.Error))
 	}
 	return nil
 }
 
-// syncMembers reconciles the room membership from the full member list.
+func (s *Session) onPunchSync(m protocol.Message) {
+	if m.PeerID == s.id.String() {
+		return
+	}
+	anchor, err := net.ResolveUDPAddr("udp4", m.AnchorAddr)
+	if err != nil {
+		return
+	}
+	senderID, err := protocol.ParsePeerID(m.PeerID)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	ph := s.ph
+	r := s.peers[m.PeerID]
+	if r == nil || ph == nil {
+		s.mu.Unlock()
+		return
+	}
+	info := r.natInfo
+	dup := false
+	if info.PublicAddr != nil && info.PublicAddr.String() == anchor.String() {
+		dup = true
+	}
+	for _, om := range info.ObservedMappings {
+		if om != nil && om.String() == anchor.String() {
+			dup = true
+			break
+		}
+	}
+	if !dup {
+		info.ObservedMappings = append(info.ObservedMappings, anchor)
+		r.natInfo = info
+	}
+	s.mu.Unlock()
+	if ok, _ := ph.Connected(senderID); ok || dup {
+		return
+	}
+	s.debugf(fmt.Sprintf("p2p: peer %s refreshed egress anchor %s", m.PeerID[:8], anchor))
+	ph.AddPeer(senderID, info)
+}
+
 func (s *Session) syncMembers(list []protocol.MemberInfo) {
 	seen := make(map[string]bool, len(list))
 	for _, mi := range list {
 		if mi.PeerID == s.id.String() {
-			continue // never treat ourselves as a peer
+			continue
 		}
 		seen[mi.PeerID] = true
 		ip := net.ParseIP(mi.VirtualIP)
@@ -938,7 +1084,6 @@ func (s *Session) syncMembers(list []protocol.MemberInfo) {
 			s.onNewPeer(mi.PeerID)
 		}
 	}
-	// leave detection
 	s.mu.Lock()
 	var gone []string
 	for id := range s.peers {
@@ -952,7 +1097,6 @@ func (s *Session) syncMembers(list []protocol.MemberInfo) {
 	}
 }
 
-// onNewPeer starts the candidate exchange with a newly discovered node.
 func (s *Session) onNewPeer(idStr string) {
 	s.mu.Lock()
 	r := s.peers[idStr]
@@ -960,22 +1104,23 @@ func (s *Session) onNewPeer(idStr string) {
 	if r != nil && r.vip != nil {
 		vip = r.vip.String()
 	}
+	sig := s.sig
 	s.mu.Unlock()
 
 	s.emit(EventPeerJoined, vip, []byte(idStr))
-	// send our candidate to them
+	if sig == nil {
+		return
+	}
 	cand := s.buildCandidate()
 	c := *cand
 	c.PeerID = idStr
-	s.sig.Send(protocol.Message{
+	_ = sig.Send(protocol.Message{
 		Type:      protocol.MsgCandidate,
 		PeerID:    s.id.String(),
 		Candidate: &c,
 	})
 }
 
-// onPeerCandidate feeds a received candidate into the punch engine and, when
-// both sides advertise X25519 keys, derives the per-pair data-plane AEAD key.
 func (s *Session) onPeerCandidate(m protocol.Message) {
 	sender := m.PeerID
 	if sender == "" || sender == s.id.String() {
@@ -991,14 +1136,16 @@ func (s *Session) onPeerCandidate(m protocol.Message) {
 		return
 	}
 	key := s.negotiateDataKey(senderID, c.X25519Pub)
+	s.tunMu.Lock()
 	s.mu.Lock()
-	// record the peer's virtual address and negotiated key
 	r := s.peers[sender]
 	if r == nil {
 		r = &remote{id: senderID}
 		s.peers[sender] = r
 	}
 	r.id = senderID
+	r.natType = c.NATType
+	r.natInfo = info
 	var vipIP net.IP
 	if ip := net.ParseIP(c.VirtualIP); ip != nil {
 		r.vip = ip
@@ -1011,12 +1158,8 @@ func (s *Session) onPeerCandidate(m protocol.Message) {
 		r.wgPub = c.X25519Pub
 	}
 	// A candidate for a peer we already consider connected means the far side
-	// restarted: a node only (re)announces when it newly discovers us, and the
-	// server forwards candidates verbatim without replaying them to anyone
-	// already connected. Everything the old session produced -- the punched path,
-	// the data key, the tunnel entry -- is then stale, even when the peer kept the
-	// same X25519 key: a tunnel device rebuilt on the far side holds no session for
-	// ours, so the entry has to be dropped and re-established rather than trusted.
+	// restarted. Everything the old session produced -- the punched path, the
+	// tunnel entry -- is then stale, even when the peer kept the same X25519 key.
 	restarted := r.connected
 	appliedPub := r.wgApplied.pub
 	if restarted {
@@ -1025,55 +1168,50 @@ func (s *Session) onPeerCandidate(m protocol.Message) {
 		r.endpoint = ""
 		r.wgApplied = tunnelPeer{}
 	}
-	// A candidate can also arrive after the link was already punched, with a
-	// better endpoint -- or a fresh key after a rejoin -- than the one the tunnel
-	// is using.
 	tp, stalePub, needTunnel := s.tunnelPeer(sender, r)
 	meshNode := s.mesh
 	ph := s.ph
 	s.mu.Unlock()
+	if restarted {
+		s.dropTunnelPeerLocked(appliedPub)
+	}
+	if needTunnel {
+		s.dropTunnelPeerLocked(stalePub)
+		s.applyTunnelPeersLocked([]tunnelPeer{tp})
+	}
+	s.tunMu.Unlock()
+
 	if meshNode != nil && vipIP != nil {
 		meshNode.AddKnownIP(vipIP)
-	}
-	if restarted {
-		s.dropTunnelPeer(appliedPub)
 	}
 	if ph == nil {
 		return
 	}
-	// Actionable diagnostic for the one case that can still defeat a symmetric
-	// peer: its candidate set enumerates only one public IP AND it announced no
-	// egress pool. If that IP is not the address it uses toward us (a
-	// destination-rotating CGNAT), the spray has nothing correct to aim at and
-	// the link will not connect (pure P2P: no relay to fall back to). Surface
-	// the fix: configure more STUN observation points.
-	if s.cfg.Debug && info.Type == stun.NatSymmetric && info.PoolCIDR == nil && len(info.CandidateIPs()) <= 1 {
-		s.debugf("p2p: peer " + sender + " is symmetric but exposes a single candidate IP; " +
-			"if punching fails, add more --stun-list observation points so its egress pool is enumerated")
+	if s.cfg.Debug && info.Type == stun.NatSymmetric && info.PoolCIDR == nil && len(info.CandidateIPs()) <= 1 && info.IPv6Addr == nil && info.UPnPAddr == nil {
+		s.debugf("p2p: peer " + sender + " is symmetric with only 1 candidate IP; " +
+			"if direct punch stalls on a rotating CGNAT, add more --stun-servers / --stun-list observation points")
 	}
 	ph.AddPeer(senderID, info)
-	if needTunnel {
-		s.dropTunnelPeer(stalePub)
-		s.applyTunnelPeers([]tunnelPeer{tp})
-	}
 }
 
 func (s *Session) onPeerConnected(id protocol.PeerID, transport, endpoint string) {
 	if id == s.id {
 		return
 	}
+	idStr := id.String()
+	s.tunMu.Lock()
 	s.mu.Lock()
-	r, ok := s.peers[id.String()]
+	r, ok := s.peers[idStr]
 	if !ok {
 		r = &remote{id: id}
-		s.peers[id.String()] = r
+		s.peers[idStr] = r
 	}
 	first := !r.connected
 	oldTransport := r.transport
+	oldEndpoint := r.endpoint
 	r.connected = true
 	r.transport = transport
 	r.endpoint = endpoint
-	idStr := id.String()
 	tp, stalePub, needTunnel := s.tunnelPeer(idStr, r)
 	vip := ""
 	var vipIP net.IP
@@ -1085,8 +1223,12 @@ func (s *Session) onPeerConnected(id protocol.PeerID, transport, endpoint string
 	ph := s.ph
 	peerID := id
 	s.mu.Unlock()
+	s.dropTunnelPeerLocked(stalePub)
+	if needTunnel {
+		s.applyTunnelPeersLocked([]tunnelPeer{tp})
+	}
+	s.tunMu.Unlock()
 
-	// register the direct link in the mesh so it can route through it
 	if meshNode != nil && ph != nil {
 		meshNode.AddLink(&mesh.Link{
 			PeerID:    peerID,
@@ -1099,16 +1241,13 @@ func (s *Session) onPeerConnected(id protocol.PeerID, transport, endpoint string
 	}
 	if first {
 		s.emit(EventPeerConnected, vip, []byte(transport))
-	} else if oldTransport != "" && oldTransport != transport {
+	} else if oldTransport != "" && (oldTransport != transport || (oldEndpoint != "" && oldEndpoint != endpoint)) {
 		s.emit(EventPathChanged, vip, []byte(transport))
-	}
-	s.dropTunnelPeer(stalePub)
-	if needTunnel {
-		s.applyTunnelPeers([]tunnelPeer{tp})
 	}
 }
 
 func (s *Session) onPeerLeave(idStr string) {
+	s.tunMu.Lock()
 	s.mu.Lock()
 	r := s.peers[idStr]
 	delete(s.peers, idStr)
@@ -1118,14 +1257,15 @@ func (s *Session) onPeerLeave(idStr string) {
 	var gonePub string
 	if r != nil {
 		// Remove the key that is actually in the tunnel, which is not always the
-		// one last advertised: a candidate can arrive for a peer whose link has
-		// not been punched yet, so nothing was ever installed for that key.
+		// one last advertised.
 		gonePub = r.wgApplied.pub
 		if r.vip != nil {
 			vipIP = r.vip
 		}
 	}
 	s.mu.Unlock()
+	s.dropTunnelPeerLocked(gonePub)
+	s.tunMu.Unlock()
 	vip := ""
 	if vipIP != nil {
 		vip = vipIP.String()
@@ -1142,31 +1282,33 @@ func (s *Session) onPeerLeave(idStr string) {
 		}
 	}
 	s.emit(EventPeerLeft, vip, []byte(idStr))
-	s.dropTunnelPeer(gonePub)
 }
 
-// buildCandidate assembles this peer's punching candidate.
 func (s *Session) buildCandidate() *protocol.Candidate {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	det := s.det
 	c := &protocol.Candidate{
-		NATType:     string(stun.NatUnknown),
-		PrivateAddr: "",
-		PortDelta:   0,
+		NATType: string(stun.NatUnknown),
 	}
 	if s.vip != nil {
 		c.VirtualIP = s.vip.String()
+	}
+	if len(s.poolPorts) > 0 {
+		c.PoolSize = len(s.poolPorts)
+		if len(s.poolPorts) <= 256 {
+			c.PoolPorts = append([]int(nil), s.poolPorts...)
+		}
 	}
 	if det != nil {
 		c.NATType = string(det.NATType)
 		c.PortDelta = det.PortDelta
 		c.PortStep = det.PortStep
+		c.PortPreserve = det.PortPreserve
+		c.PortPreserveOffset = det.PortPreserveOffset
+		c.PortBlockMin = det.PortBlockMin
+		c.PortBlockMax = det.PortBlockMax
 		if det.MappedAddr != nil {
-			// Smuggle the observation-point IPs (destination-rotating CGNAT)
-			// into the string field the server forwards verbatim, as
-			// "ip:port,ip2,ip3". A peer that understands them sprays each;
-			// anything else only ever sees the first token.
 			c.PublicAddr = det.MappedAddr.String()
 			for _, ip := range det.ObservedIPs {
 				if ip == nil || ip.Equal(det.MappedAddr.IP) {
@@ -1174,22 +1316,29 @@ func (s *Session) buildCandidate() *protocol.Candidate {
 				}
 				c.PublicAddr += "," + ip.String()
 			}
-			// Announce the egress POOL, not just the sampled addresses. A
-			// carrier CGNAT re-dials inside a contiguous block and only shows a
-			// few of its IPs to any STUN point, so the address it uses toward a
-			// given peer is often absent from the sample above. Carriers pick
-			// that address by destination and no fixed observation list can
-			// guarantee seeing it, but the block can be inferred from the
-			// sampled addresses: advertise their smallest covering prefix as a
-			// CIDR token and let the easy side spray the whole block. Tokens
-			// containing "/" are ignored by older peers, so this stays on the
-			// verbatim-forwarded string field and needs no server redeploy.
-			if pool := coveringPrefix(det); pool != nil {
+			if pool := det.CoveringPool(); pool != nil {
 				c.PublicAddr += "," + pool.String()
+			}
+		}
+		for _, m := range det.ObservedMappings {
+			if m != nil {
+				c.ObservedMappings = append(c.ObservedMappings, m.String())
 			}
 		}
 		if det.LocalAddr != nil {
 			c.PrivateAddr = det.LocalAddr.String()
+		}
+		for _, la := range det.LocalAddrs {
+			if la != nil && (det.LocalAddr == nil || !la.IP.Equal(det.LocalAddr.IP)) {
+				c.ExtraPrivateAddrs = append(c.ExtraPrivateAddrs, la.String())
+			}
+		}
+		c.PrivateCIDRs = append([]string(nil), det.LocalCIDRs...)
+		if det.IPv6Addr != nil {
+			c.IPv6Addr = det.IPv6Addr.String()
+		}
+		if det.UPnPAddr != nil {
+			c.UPnPAddr = det.UPnPAddr.String()
 		}
 	}
 	c.X25519Pub = dataPublicHex(s.x25519)
@@ -1198,24 +1347,24 @@ func (s *Session) buildCandidate() *protocol.Candidate {
 
 func candidateToNAT(c *protocol.Candidate) (punch.NATInfo, error) {
 	info := punch.NATInfo{
-		Type:      stun.NATType(c.NATType),
-		PortDelta: c.PortDelta,
-		PortStep:  c.PortStep,
+		Type:               stun.NATType(c.NATType),
+		PortDelta:          c.PortDelta,
+		PortStep:           c.PortStep,
+		PortPreserve:       c.PortPreserve,
+		PortPreserveOffset: c.PortPreserveOffset,
+		PortBlockMin:       c.PortBlockMin,
+		PortBlockMax:       c.PortBlockMax,
+		PoolSize:           c.PoolSize,
+		PoolPorts:          append([]int(nil), c.PoolPorts...),
 	}
 	var err error
 	if c.PublicAddr != "" {
-		// The sender may smuggle extra observation-point IPs after the primary
-		// address as a comma list, carried in this string field so an older
-		// signaling server that forwards Candidate verbatim still delivers
-		// them. First token is the primary ip:port; the rest are bare IPs.
 		primary, extras := splitCandidateAddr(c.PublicAddr)
 		if info.PublicAddr, err = net.ResolveUDPAddr("udp", primary); err != nil {
 			return info, err
 		}
 		for _, e := range extras {
 			if strings.IndexByte(e, '/') >= 0 {
-				// An announced egress pool (CIDR). Older senders never emit
-				// it; peers that do not expand it simply ignore it.
 				if _, ipnet, err := net.ParseCIDR(e); err == nil {
 					info.PoolCIDR = ipnet
 				}
@@ -1226,17 +1375,39 @@ func candidateToNAT(c *protocol.Candidate) (punch.NATInfo, error) {
 			}
 		}
 	}
+	for _, om := range c.ObservedMappings {
+		if a, err := net.ResolveUDPAddr("udp4", om); err == nil {
+			info.ObservedMappings = append(info.ObservedMappings, a)
+		}
+	}
 	if c.PrivateAddr != "" {
 		if info.PrivateAddr, err = net.ResolveUDPAddr("udp", c.PrivateAddr); err != nil {
 			return info, err
 		}
 	}
+	for _, ea := range c.ExtraPrivateAddrs {
+		if a, err := net.ResolveUDPAddr("udp4", ea); err == nil {
+			info.ExtraPrivateAddrs = append(info.ExtraPrivateAddrs, a)
+		}
+	}
+	for _, cs := range c.PrivateCIDRs {
+		if _, n, err := net.ParseCIDR(cs); err == nil {
+			info.PrivateCIDRs = append(info.PrivateCIDRs, n)
+		}
+	}
+	if c.IPv6Addr != "" {
+		if a, err := net.ResolveUDPAddr("udp6", c.IPv6Addr); err == nil {
+			info.IPv6Addr = a
+		}
+	}
+	if c.UPnPAddr != "" {
+		if a, err := net.ResolveUDPAddr("udp4", c.UPnPAddr); err == nil {
+			info.UPnPAddr = a
+		}
+	}
 	return info, nil
 }
 
-// splitCandidateAddr separates a candidate public address ("ip:port" optionally
-// followed by ",ip2,ip3" observation-point extras) into its primary token and
-// the extra bare-IP tokens.
 func splitCandidateAddr(s string) (string, []string) {
 	idx := strings.IndexByte(s, ',')
 	if idx < 0 {
@@ -1252,23 +1423,10 @@ func splitCandidateAddr(s string) (string, []string) {
 	return head, extras
 }
 
-// coveringPrefix returns the peer's announced egress pool: the smallest prefix
-// covering its mapped address and every STUN-observed address. The CGNAT block
-// is inferable from clustered samples even though the specific egress IP used
-// toward a given peer was never observed, so the easy peer can spray the whole
-// block. nil means there is nothing to expand. The logic lives in one place
-// (stun.Detection.CoveringPool) so nat-check reports exactly what a session
-// would advertise.
-func coveringPrefix(det *stun.Detection) *net.IPNet {
-	return det.CoveringPool()
-}
-
-// emit dispatches an event to the listener.
 func (s *Session) emit(event int, peerID string, data []byte) {
 	s.l.OnEvent(event, peerID, data)
 }
 
-// debugf reports an internal failure only when verbose flow logging is on.
 func (s *Session) debugf(msg string) {
 	if s.cfg.Debug {
 		s.emit(EventDebug, "", []byte(msg))

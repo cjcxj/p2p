@@ -29,7 +29,7 @@ if [ -z "$SSH" ] || [ -z "$SSPORT" ]; then
   echo "usage: P2P_SSH=user@host P2P_SSH_PORT=port $0 [ssh] [port]"; exit 2
 fi
 HOST="${SSH#*@}"                 # strip user@ -> cloud public IP
-SERVER="${SERVER:-$HOST:8080}"   # signaling+STUN+relay on the single port
+SERVER="${SERVER:-$HOST:8080}"   # signaling+STUN on the single port (pure P2P)
 ROOM="${ROOM:-symtest}"
 NS=p4test; VETH=h-p4; VPEER=n-p4; SUBNET=172.31.250; CPORT=5211
 BIN=/tmp/p2p-symtest   # uploaded linux p2p client
