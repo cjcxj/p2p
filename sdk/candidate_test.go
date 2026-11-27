@@ -226,6 +226,7 @@ func TestCandidateCarriesGatewayMapping(t *testing.T) {
 		PortPreserveOffset: 15000,
 		PortBlockMin:       44900,
 		PortBlockMax:       45200,
+		IPv6Addr:           &net.UDPAddr{IP: net.ParseIP("2001:db8::45"), Port: 30000},
 		LocalAddrs: []*net.UDPAddr{
 			{IP: net.ParseIP("192.168.1.45"), Port: 30000},
 			{IP: net.ParseIP("10.7.3.23"), Port: 30000},
@@ -272,6 +273,9 @@ func TestCandidateCarriesGatewayMapping(t *testing.T) {
 	// searching instead of aiming.
 	if !info.PortPreserve || info.PortPreserveOffset != 15000 {
 		t.Fatalf("port-preserve lost: %v/%d", info.PortPreserve, info.PortPreserveOffset)
+	}
+	if info.IPv6Addr == nil || info.IPv6Addr.String() != "[2001:db8::45]:30000" {
+		t.Fatalf("ipv6 address lost on the wire: %v", info.IPv6Addr)
 	}
 	if info.PortBlockMin != 44900 || info.PortBlockMax != 45200 {
 		t.Fatalf("allocation block lost: %d-%d", info.PortBlockMin, info.PortBlockMax)

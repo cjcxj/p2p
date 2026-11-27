@@ -42,7 +42,7 @@ const plantStaggerDiv = 8
 // Endpoint is one address the punch engine will probe.
 type Endpoint struct {
 	Addr   *net.UDPAddr
-	Kind   string // "lan","public","upnp","predicted","block","plant","preserve","pba","spray"
+	Kind   string // "lan","public","upnp","ipv6","predicted","block","plant","preserve","pba","spray"
 	Order  int
 	Socket int // index into Punch.Conns; 0 = primary
 }
@@ -71,6 +71,9 @@ type NATInfo struct {
 	// turns a blind 1..65535 search into a dense sweep of a few hundred ports.
 	PortBlockMin int
 	PortBlockMax int
+	// IPv6Addr is a globally reachable IPv6 address the peer announced. When we are
+	// dual-stack too, this is the best path available: no IPv4 NAT is involved.
+	IPv6Addr *net.UDPAddr
 	// PublicIPs are additional distinct public addresses this peer was seen at
 	// across multiple STUN observation points (a destination-rotating CGNAT).
 	// Empty for ordinary NATs; the spray leg aims at all of them plus
@@ -302,6 +305,14 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config, round int) []Endpoint {
 				}
 			}
 		}
+	}
+
+	// Direct IPv6: both sides globally reachable on v6 means the IPv4 CGNAT is
+	// irrelevant. Sent on the dual-stack socket (-1), since the IPv4 pool cannot
+	// carry it.
+	if peer.IPv6Addr != nil && my.IPv6Addr != nil {
+		eps = append(eps, Endpoint{Addr: peer.IPv6Addr, Kind: "ipv6", Order: order, Socket: -1})
+		order++
 	}
 
 	// Public address: always probed. Works for every cone combination and

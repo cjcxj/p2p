@@ -29,6 +29,11 @@ type Config struct {
 	// reach us before we have sent anything. Costs one budget-bounded probe
 	// during detection and nothing on networks with no IGD.
 	EnableUPnP bool
+	// EnableIPv6 probes for a globally reachable IPv6 address on a dedicated
+	// dual-stack socket and advertises it. On carriers with real IPv6 this bypasses
+	// the IPv4 CGNAT completely; where v6 is absent or NATed the probe fails
+	// quickly and nothing else changes.
+	EnableIPv6 bool
 	// Debug enables verbose hole-punching flow logs (delivered as
 	// EventDebug).
 	Debug bool
@@ -105,6 +110,7 @@ func Defaults() *Config {
 		PortPrediction:  true,
 		EnableLAN:       true,
 		EnableUPnP:      true,
+		EnableIPv6:      true,
 		TimeoutSec:      15,
 		ProbeIntervalMs: 200,
 		PunchTimeoutMs:  4000,

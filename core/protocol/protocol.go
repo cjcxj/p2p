@@ -105,6 +105,9 @@ type Candidate struct {
 	// hand ports from, letting a peer sweep that block instead of 1..65535.
 	PortBlockMin int `json:"port_block_min,omitempty"`
 	PortBlockMax int `json:"port_block_max,omitempty"`
+	// IPv6Addr is a globally reachable IPv6 address for the sender. A peer that is
+	// dual-stack too can use it directly, which skips IPv4 NAT traversal entirely.
+	IPv6Addr string `json:"ipv6_addr,omitempty"`
 }
 
 // Message is the JSON-over-TCP wire frame exchanged over signaling.

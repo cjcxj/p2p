@@ -56,8 +56,11 @@ type Session struct {
 	mesh       *mesh.Node
 	room       string
 
-	x25519     *ecdh.PrivateKey
-	protector  SocketProtector
+	x25519    *ecdh.PrivateKey
+	protector SocketProtector
+	// ip6Conn is the dual-stack socket kept from detection when this host has a
+	// globally reachable IPv6 address; the punch engine drives it as pool index -1.
+	ip6Conn    net.PacketConn
 	localStack *netstack.LocalStack
 
 	tunnel     *wgengine.Tunnel
@@ -575,6 +578,8 @@ func (s *Session) Disconnect() {
 		ch := s.tunWriteCh
 		stop := s.tunWriteStop
 		extraConns := s.extraConns
+		ip6 := s.ip6Conn
+		s.ip6Conn = nil
 		s.tunnel = nil
 		s.tunnelName = ""
 		s.tunFile = nil
@@ -592,6 +597,9 @@ func (s *Session) Disconnect() {
 		}
 		// close the socket first so the punch read loop unblocks
 		s.conn.Close()
+		if ip6 != nil {
+			ip6.Close()
+		}
 		for _, ec := range extraConns {
 			ec.Close()
 		}
@@ -723,6 +731,7 @@ func (s *Session) run(room string) {
 	my.PortDelta = det.PortDelta
 	my.PortStep = det.PortStep
 	my.UPnPAddr = det.UPnPAddr
+	my.IPv6Addr = det.IPv6Addr
 	my.PrivateCIDRs = parseCIDRs(det.LocalCIDRs)
 	for _, a := range det.LocalAddrs {
 		if a != nil && (det.LocalAddr == nil || !a.IP.Equal(det.LocalAddr.IP)) {
@@ -775,6 +784,11 @@ func (s *Session) run(room string) {
 		s.mu.Unlock()
 		return meshNode.Handle(src, payload)
 	}
+	// The dual-stack socket found during detection, if any: the engine gives it
+	// pool index -1 so an IPv6-reachable peer is probed over IPv6.
+	s.mu.Lock()
+	ph.IPv6Conn = s.ip6Conn
+	s.mu.Unlock()
 	ph.OnState = func(id protocol.PeerID, t string, endpoint string) {
 		s.onPeerConnected(id, t, endpoint)
 	}
@@ -894,13 +908,70 @@ func (s *Session) detect() (*stun.Detection, error) {
 	// us on it before we have sent a packet -- but only where there is a gateway
 	// to ask. A host STUN already sees as open needs none, and the attempt is
 	// budget-bounded so a network without an IGD costs at most that window.
+	// Gateway mapping and the IPv6 probe are independent and both bounded, so they
+	// run at once instead of stacking their worst cases onto connect latency.
+	var wg sync.WaitGroup
 	if s.cfg.EnableUPnP && det.NATType != stun.NatOpen &&
 		det.LocalAddr != nil && det.LocalAddr.Port > 0 {
-		if ua := stun.MapExternalUDP(det.LocalAddr.IP, det.LocalAddr.Port, 400*time.Millisecond); ua != nil {
-			det.UPnPAddr = ua
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if ua := stun.MapExternalUDP(det.LocalAddr.IP, det.LocalAddr.Port, 400*time.Millisecond); ua != nil {
+				det.UPnPAddr = ua
+			}
+		}()
+	}
+	if s.cfg.EnableIPv6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, mapped := s.probeIPv6()
+			if conn != nil {
+				s.mu.Lock()
+				s.ip6Conn = conn
+				s.mu.Unlock()
+			}
+			det.IPv6Addr = mapped
+		}()
+	}
+	wg.Wait()
+	return det, nil
+}
+
+// probeIPv6 opens a udp6 socket and asks every resolvable STUN point what it sees.
+// The socket is kept only when a globally reachable IPv6 mapping comes back: a
+// host with no v6 route, a NATed v6, or a silent responder all leave the session
+// exactly as it was, with one closed socket and no extra state.
+func (s *Session) probeIPv6() (net.PacketConn, *net.UDPAddr) {
+	c6, err := net.ListenUDP("udp6", &net.UDPAddr{Port: 0})
+	if err != nil {
+		return nil, nil
+	}
+	protectConn(c6, s.protector)
+	var addrs []*net.UDPAddr
+	seen := map[string]bool{}
+	list := append([]string(nil), splitCSV(s.cfg.STUNSecondaries)...)
+	list = append(list, stun.DefaultIPv6Secondaries...)
+	for _, st := range list {
+		a, rerr := net.ResolveUDPAddr("udp6", st)
+		if rerr != nil || a == nil || a.IP == nil || a.IP.To4() != nil || seen[a.String()] {
+			continue
+		}
+		seen[a.String()] = true
+		addrs = append(addrs, a)
+	}
+	if len(addrs) == 0 {
+		c6.Close()
+		return nil, nil
+	}
+	sc := &stun.Client{Conn: c6}
+	for _, r := range sc.ConcurrentBindAll(addrs, 500*time.Millisecond) {
+		if r.Mapped != nil && r.Mapped.IP != nil && r.Mapped.IP.IsGlobalUnicast() {
+			return c6, r.Mapped
 		}
 	}
-	return det, nil
+	c6.Close()
+	return nil, nil
 }
 
 // splitCSV trims a comma-separated list into non-empty tokens.
@@ -1236,6 +1307,9 @@ func (s *Session) buildCandidate() *protocol.Candidate {
 		if det.UPnPAddr != nil {
 			c.UPnPAddr = det.UPnPAddr.String()
 		}
+		if det.IPv6Addr != nil {
+			c.IPv6Addr = det.IPv6Addr.String()
+		}
 		if len(det.LocalCIDRs) > 0 {
 			c.PrivateCIDRs = det.LocalCIDRs
 		}
@@ -1298,6 +1372,11 @@ func candidateToNAT(c *protocol.Candidate) (punch.NATInfo, error) {
 	if c.UPnPAddr != "" {
 		if ua, upErr := net.ResolveUDPAddr("udp", c.UPnPAddr); upErr == nil {
 			info.UPnPAddr = ua
+		}
+	}
+	if c.IPv6Addr != "" {
+		if ua, eErr := net.ResolveUDPAddr("udp6", c.IPv6Addr); eErr == nil && ua.IP != nil {
+			info.IPv6Addr = ua
 		}
 	}
 	// Subnets the peer shares with us, so the LAN shortcut is decided by the real

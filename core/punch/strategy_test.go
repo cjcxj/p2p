@@ -639,3 +639,37 @@ func TestPlanTargetsUsesMeasuredAllocatorBehaviour(t *testing.T) {
 		}
 	}
 }
+
+// A global IPv6 address on both sides is the best route there is -- it never
+// touches the IPv4 NAT -- but it is only useful when we can send over IPv6 too, so
+// a peer advertising v6 to a v4-only host must not create a target.
+func TestPlanTargetsIPv6NeedsBothSides(t *testing.T) {
+	v6 := &net.UDPAddr{IP: net.ParseIP("2001:db8::5"), Port: 30000}
+	peer := NATInfo{Type: stun.NatPortRestrictedCone, PublicAddr: addr("1.2.3.4", 40000), IPv6Addr: v6}
+	cfg := Config{EnableLAN: true, PredictionSockets: 1}
+
+	both := NATInfo{Type: stun.NatPortRestrictedCone, IPv6Addr: &net.UDPAddr{IP: net.ParseIP("2001:db8::9"), Port: 30000}}
+	eps := planTargets(both, peer, cfg, 0)
+	n := 0
+	for _, e := range eps {
+		if e.Kind == "ipv6" {
+			n++
+			if e.Socket != -1 {
+				t.Fatalf("ipv6 target uses socket %d, want -1 (the dual-stack socket)", e.Socket)
+			}
+			if e.Addr.String() != v6.String() {
+				t.Fatalf("ipv6 target aimed at %s, want %s", e.Addr, v6)
+			}
+		}
+	}
+	if n != 1 {
+		t.Fatalf("ipv6 targets = %d, want exactly 1", n)
+	}
+
+	v4only := NATInfo{Type: stun.NatPortRestrictedCone}
+	for _, e := range planTargets(v4only, peer, cfg, 0) {
+		if e.Kind == "ipv6" {
+			t.Fatal("an IPv6-only path was planned for a host with no IPv6 address")
+		}
+	}
+}

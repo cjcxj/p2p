@@ -53,11 +53,15 @@ const ackCorrelationWindow = 10 * time.Second
 // Punch drives hole punching for a set of remote peers over one or more shared
 // UDP sockets.
 type Punch struct {
-	Conn   net.PacketConn
-	Conns  []net.PacketConn // socket pool; Conns[0] == Conn after Start
-	MyID   protocol.PeerID
-	My     NATInfo
-	Config Config
+	Conn  net.PacketConn
+	Conns []net.PacketConn // socket pool; Conns[0] == Conn after Start
+	// IPv6Conn is an optional dual-stack socket. It gets pool index -1 because
+	// it is not part of the IPv4 pool: a peer with a global v6 address is
+	// reachable without traversing the IPv4 NAT at all.
+	IPv6Conn net.PacketConn
+	MyID     protocol.PeerID
+	My       NATInfo
+	Config   Config
 
 	// OnData is called for inbound data packets (from the read goroutine).
 	OnData func(src protocol.PeerID, pkt *Packet) error
@@ -207,6 +211,10 @@ func (p *Punch) Start() {
 		p.wg.Add(1)
 		go p.readLoop(conn, i)
 	}
+	if p.IPv6Conn != nil {
+		p.wg.Add(1)
+		go p.readLoop(p.IPv6Conn, -1)
+	}
 	p.wg.Add(1)
 	go p.sendLoop()
 }
@@ -255,7 +263,7 @@ func (p *Punch) Send(id protocol.PeerID, data []byte) error {
 	case p.sendCh <- sendItem{sockIdx: ps.sockIdx, endpoint: ps.endpoint, buf: buf}:
 		return nil
 	default:
-		_, err := p.Conns[ps.sockIdx].WriteTo(buf, ps.endpoint)
+		_, err := p.connFor(ps.sockIdx).WriteTo(buf, ps.endpoint)
 		putEncode(buf)
 		return err
 	}
@@ -285,7 +293,7 @@ func (p *Punch) sendLoop() {
 			return
 		case item := <-p.sendCh:
 			if item.sockIdx != 0 {
-				_, _ = p.Conns[item.sockIdx].WriteTo(item.buf, item.endpoint)
+				_, _ = p.connFor(item.sockIdx).WriteTo(item.buf, item.endpoint)
 				putEncode(item.buf)
 				continue
 			}
@@ -295,7 +303,7 @@ func (p *Punch) sendLoop() {
 				select {
 				case more := <-p.sendCh:
 					if more.sockIdx != 0 {
-						_, _ = p.Conns[more.sockIdx].WriteTo(more.buf, more.endpoint)
+						_, _ = p.connFor(more.sockIdx).WriteTo(more.buf, more.endpoint)
 						putEncode(more.buf)
 						continue
 					}
@@ -378,7 +386,7 @@ func (p *Punch) SendWireGuard(buf []byte, dst *net.UDPAddr) error {
 	if idx >= len(p.Conns) {
 		idx = 0
 	}
-	_, err := p.Conns[idx].WriteTo(buf, dst)
+	_, err := p.connFor(idx).WriteTo(buf, dst)
 	return err
 }
 
@@ -412,6 +420,23 @@ func (p *Punch) PeerRoute(id protocol.PeerID) (tier string, endpoint string, rtt
 		ep = ps.endpoint.String()
 	}
 	return ps.tier.String(), ep, ps.rtt
+}
+
+// connFor resolves a pool index to a socket. -1 is the IPv6 socket when the
+// caller attached one; anything out of range falls back to the primary socket
+// rather than panicking, because a plan built against a wider pool than this
+// engine has must still send something.
+func (p *Punch) connFor(idx int) net.PacketConn {
+	if idx == -1 {
+		if p.IPv6Conn != nil {
+			return p.IPv6Conn
+		}
+		return p.Conn
+	}
+	if idx < 0 || idx >= len(p.Conns) {
+		return p.Conn
+	}
+	return p.Conns[idx]
 }
 
 func (p *Punch) peer(id protocol.PeerID) *peer {
@@ -653,7 +678,7 @@ func (p *Punch) keepAliveOnce(id protocol.PeerID) bool {
 	ps.mu.Unlock()
 	pkt := &Packet{Type: PktAck, Seq: seq, Src: p.MyID, Dst: id}
 	buf := encodePooled(pkt)
-	p.Conns[sockIdx].WriteTo(buf, endpoint)
+	p.connFor(sockIdx).WriteTo(buf, endpoint)
 	putEncode(buf)
 	return true
 }
@@ -696,7 +721,7 @@ func (p *Punch) sendProbe(ps *peer, ep Endpoint) {
 	if idx >= len(p.Conns) {
 		idx = 0
 	}
-	p.Conns[idx].WriteTo(buf, ep.Addr)
+	p.connFor(idx).WriteTo(buf, ep.Addr)
 	putEncode(buf)
 }
 
@@ -759,7 +784,7 @@ func (p *Punch) handle(pkt *Packet, src net.Addr, sockIdx int) {
 		}
 		ack := &Packet{Type: PktAck, Seq: pkt.Seq, Src: p.MyID, Dst: pkt.Src}
 		buf := encodePooled(ack)
-		p.Conns[sockIdx].WriteTo(buf, ua)
+		p.connFor(sockIdx).WriteTo(buf, ua)
 		putEncode(buf)
 		p.report(ps, pkt.Src)
 		return

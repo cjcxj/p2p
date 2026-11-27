@@ -48,6 +48,131 @@ var DefaultSecondaries = []string{
 	"74.125.250.129:19302",
 }
 
+// DefaultIPv6Secondaries are dual-stack / IPv6 public STUN servers used when
+// probing IPv6 public reachability.
+var DefaultIPv6Secondaries = []string{
+	"stun1.l.google.com:19302",
+	"stun.l.google.com:19302",
+}
+
+// STUNResult captures one valid STUN BindingResponse from a destination.
+type STUNResult struct {
+	Server  *net.UDPAddr
+	Mapped  *net.UDPAddr
+	From    *net.UDPAddr
+	Latency time.Duration
+}
+
+// ConcurrentBindAll sends STUN BindingRequests concurrently to all destinations
+// in addrs over c.Conn, demultiplexing responses by Transaction ID. It returns
+// early as soon as every destination has answered, or when timeout elapses.
+func (c *Client) ConcurrentBindAll(addrs []*net.UDPAddr, timeout time.Duration) []STUNResult {
+	if c.Conn == nil || len(addrs) == 0 {
+		return nil
+	}
+	if timeout <= 0 {
+		timeout = 800 * time.Millisecond
+	}
+
+	type pendingReq struct {
+		dst    *net.UDPAddr
+		packet []byte
+		sentAt time.Time
+		done   bool
+	}
+
+	pending := make(map[[12]byte]*pendingReq, len(addrs))
+	order := make([][12]byte, 0, len(addrs))
+	for _, dst := range addrs {
+		if dst == nil {
+			continue
+		}
+		req := NewBindingRequest()
+		req.AddSoftware("p2p")
+		raw := req.Encode()
+		pending[req.TID] = &pendingReq{
+			dst:    dst,
+			packet: raw,
+			sentAt: time.Now(),
+		}
+		order = append(order, req.TID)
+		_, _ = c.Conn.WriteTo(raw, dst)
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	if dc, ok := c.Conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+		defer dc.SetReadDeadline(time.Time{})
+	}
+
+	results := make([]STUNResult, 0, len(pending))
+	answered := 0
+	start := time.Now()
+	overallDeadline := start.Add(timeout)
+	retryAt := start.Add(timeout / 2)
+	retried := false
+
+	buf := make([]byte, 2048)
+	for answered < len(pending) {
+		now := time.Now()
+		if !now.Before(overallDeadline) {
+			break
+		}
+		nextDeadline := overallDeadline
+		if !retried && retryAt.Before(nextDeadline) {
+			nextDeadline = retryAt
+		}
+		if dc, ok := c.Conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = dc.SetReadDeadline(nextDeadline)
+		}
+
+		n, src, err := c.Conn.ReadFrom(buf)
+		if err != nil {
+			if isTimeout(err) {
+				if !retried && !time.Now().Before(retryAt) {
+					retried = true
+					for _, tid := range order {
+						pr := pending[tid]
+						if !pr.done {
+							pr.sentAt = time.Now()
+							_, _ = c.Conn.WriteTo(pr.packet, pr.dst)
+						}
+					}
+					continue
+				}
+				break
+			}
+			break
+		}
+		if n < HeaderLength {
+			continue
+		}
+		msg, err := Decode(buf[:n])
+		if err != nil {
+			continue
+		}
+		pr, ok := pending[msg.TID]
+		if !ok || pr.done {
+			continue
+		}
+		mapped, err := msg.MappedAddress()
+		if err != nil {
+			continue
+		}
+		pr.done = true
+		answered++
+		ua, _ := src.(*net.UDPAddr)
+		results = append(results, STUNResult{
+			Server:  pr.dst,
+			Mapped:  mapped,
+			From:    ua,
+			Latency: time.Since(pr.sentAt),
+		})
+	}
+	return results
+}
+
 // BindRequest sends a binding request (optionally with a CHANGE-REQUEST) and
 // waits for the matching response. It returns the response and the source
 // address it arrived from.

@@ -36,6 +36,9 @@ data class ConnConfig(
         // before we have sent a packet -- and the probe is budget-bounded, so a
         // network without an IGD costs 400ms of detection at most.
         cfg.setEnableUPnP(true)
+        // Same reason: a zero-valued Config means IPv6 is off unless asked for.
+        // On carriers with real IPv6 this is the path that skips the CGNAT entirely.
+        cfg.setEnableIPv6(true)
         // Hard-symmetric birthday attack. The phone is the CGNAT (hard) side:
         // a contiguous local block lets it PLANT one mapping per socket at the
         // peer's advertised port, so the cone peer's wide random SPRAY has

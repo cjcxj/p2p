@@ -87,6 +87,9 @@ type Detection struct {
 	// NAT-PMP or UPnP IGD, if it managed to. It is a reachable address that
 	// does not depend on outbound traffic first, so peers can hit it cold.
 	UPnPAddr *net.UDPAddr
+	// IPv6Addr is a globally reachable IPv6 address observed for this host. A
+	// dual-stack peer can talk to it directly, bypassing the IPv4 CGNAT entirely.
+	IPv6Addr *net.UDPAddr
 	// Note carries the caveat for what could not be tested, so a reader of the
 	// log knows how far to trust NATType.
 	Note string
