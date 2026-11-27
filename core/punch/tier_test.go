@@ -45,11 +45,11 @@ func lanFixture() (*Punch, *peer, protocol.PeerID, *net.UDPAddr, *net.UDPAddr) {
 func TestRouteTierNeverDowngrades(t *testing.T) {
 	p, ps, _, peerPriv, peerPub := lanFixture()
 
-	ps.note(p, peerPub, 0)
+	ps.note(p, peerPub, 0, 0)
 	if ps.tier != tierPublic {
 		t.Fatalf("first path tier = %s, want public", ps.tier)
 	}
-	if _, upgraded := ps.note(p, peerPriv, 0); !upgraded {
+	if _, upgraded := ps.note(p, peerPriv, 0, 0); !upgraded {
 		t.Fatal("moving from public to LAN was not reported as an upgrade")
 	}
 	if ps.tier != tierLAN || ps.endpoint.String() != peerPriv.String() {
@@ -57,7 +57,7 @@ func TestRouteTierNeverDowngrades(t *testing.T) {
 	}
 
 	// Now the late public packet arrives.
-	ps.note(p, peerPub, 0)
+	ps.note(p, peerPub, 0, 0)
 	if ps.endpoint.String() != peerPriv.String() || ps.tier != tierLAN {
 		t.Fatalf("a public straggler downgraded the route to %s (%s)", ps.endpoint, ps.tier)
 	}
@@ -68,7 +68,7 @@ func TestRouteTierNeverDowngrades(t *testing.T) {
 // clock. Our keepalives are PktAck, so a healthy peer still renews it.
 func TestOneWayProbesDoNotKeepAStaleRouteAlive(t *testing.T) {
 	p, ps, id, _, peerPub := lanFixture()
-	ps.note(p, peerPub, 0)
+	ps.note(p, peerPub, 0, 0)
 
 	stale := time.Now().Add(-2 * peerIdleTimeout)
 
@@ -100,7 +100,7 @@ func TestOneWayProbesDoNotKeepAStaleRouteAlive(t *testing.T) {
 // packet and leave the peer unreachable behind a stale verdict.
 func TestAddPeerForgetsTheOldTier(t *testing.T) {
 	p, ps, id, peerPriv, _ := lanFixture()
-	ps.note(p, peerPriv, 0)
+	ps.note(p, peerPriv, 0, 0)
 	if ps.tier != tierLAN {
 		t.Fatalf("fixture did not reach the LAN tier (got %s)", ps.tier)
 	}
@@ -120,5 +120,63 @@ func TestAddPeerForgetsTheOldTier(t *testing.T) {
 	}
 	if tier != tierNone {
 		t.Fatalf("AddPeer kept tier %s from the dead session, want none", tier)
+	}
+}
+
+// A round trip is only real if the ack answers the probe we actually sent, from
+// the address it answers at. Anything else must report nothing rather than a
+// number the path never had.
+func TestPeerRouteReportsMeasuredRoundTrip(t *testing.T) {
+	p, ps, id, _, peerPub := lanFixture()
+
+	p.sendProbe(ps, Endpoint{Addr: peerPub, Kind: "public", Socket: 0})
+	ps.mu.Lock()
+	seq := ps.seq
+	ps.mu.Unlock()
+	time.Sleep(15 * time.Millisecond)
+	p.handle(&Packet{Type: PktAck, Seq: seq, Src: id, Dst: p.MyID}, peerPub, 0)
+
+	tier, ep, rtt := p.PeerRoute(id)
+	if tier != "public" || ep != peerPub.String() {
+		t.Fatalf("route = %s %s, want public %s", tier, ep, peerPub)
+	}
+	if rtt <= 0 {
+		t.Fatal("a correlated ack produced no round trip")
+	}
+
+	// Same sequence, different source: the ack cannot be credited to our probe.
+	p.sendProbe(ps, Endpoint{Addr: peerPub, Kind: "public", Socket: 0})
+	ps.mu.Lock()
+	seq2 := ps.seq
+	ps.mu.Unlock()
+	other := &net.UDPAddr{IP: net.ParseIP("198.51.100.9").To4(), Port: 5555}
+	p.handle(&Packet{Type: PktAck, Seq: seq2, Src: id, Dst: p.MyID}, other, 0)
+	if _, _, rtt2 := p.PeerRoute(id); rtt2 != 0 {
+		t.Fatalf("an ack from an address we never probed was timed as %v", rtt2)
+	}
+}
+
+// Moving to a better path must not inherit the old path's timing: the new route is
+// unmeasured until an answer arrives on it.
+func TestUpgradeClearsRoundTripUntilMeasured(t *testing.T) {
+	p, ps, id, peerPriv, peerPub := lanFixture()
+
+	p.sendProbe(ps, Endpoint{Addr: peerPub, Kind: "public", Socket: 0})
+	ps.mu.Lock()
+	seq := ps.seq
+	ps.mu.Unlock()
+	time.Sleep(15 * time.Millisecond)
+	p.handle(&Packet{Type: PktAck, Seq: seq, Src: id, Dst: p.MyID}, peerPub, 0)
+	if _, _, rtt := p.PeerRoute(id); rtt <= 0 {
+		t.Fatal("setup: the public path should already have a measurement")
+	}
+
+	p.handle(&Packet{Type: PktProbe, Seq: 4242, Src: id, Dst: p.MyID}, peerPriv, 0)
+	tier, ep, rtt := p.PeerRoute(id)
+	if tier != "lan" || ep != peerPriv.String() {
+		t.Fatalf("after the LAN packet route = %s %s, want lan %s", tier, ep, peerPriv)
+	}
+	if rtt != 0 {
+		t.Fatalf("the old path's round trip was carried onto the new one: %v", rtt)
 	}
 }

@@ -44,6 +44,12 @@ const keepaliveInterval = 15 * time.Second
 // link is considered stale and hole punching is restarted.
 const peerIdleTimeout = 45 * time.Second
 
+// ackCorrelationWindow bounds how late a PktAck may arrive and still be credited
+// as the answer to the probe its sequence names. Beyond it the ack most likely
+// answers a probe that was lost and re-sent, so timing it would report a round
+// trip the path never had.
+const ackCorrelationWindow = 10 * time.Second
+
 // Punch drives hole punching for a set of remote peers over one or more shared
 // UDP sockets.
 type Punch struct {
@@ -88,10 +94,24 @@ type peer struct {
 	// so a packet arriving later on the public mapping cannot replace a LAN or
 	// gateway-mapped path already in use.
 	tier      routeTier
+	rtt       time.Duration // round trip measured from a probe to its matching ack
 	connected bool
 	seq       uint16
 	stop      chan struct{}
 	lastSeen  time.Time
+	// probeSent records probes by sequence so an arriving ack can be matched to
+	// the packet it answers. 512 slots is more than one round of probes and the
+	// sequence wraps, so an old stamp can only ever be replaced, never trusted.
+	probeSent [512]probeStamp
+}
+
+// probeStamp is one outbound probe awaiting its answer. ep is kept so an ack can
+// only be credited to the address we actually probed.
+type probeStamp struct {
+	seq  uint16
+	sent time.Time
+	ep   *net.UDPAddr
+	ok   bool
 }
 
 // New creates an idle Punch over conn. The single socket is installed as the
@@ -154,6 +174,8 @@ func (p *Punch) AddPeer(id protocol.PeerID, info NATInfo) {
 	ps.endpoint = nil
 	ps.sockIdx = 0
 	ps.tier = tierNone
+	ps.rtt = 0
+	ps.probeSent = [512]probeStamp{}
 	ps.mu.Unlock()
 	p.mu.Unlock()
 	p.wg.Add(1)
@@ -358,6 +380,38 @@ func (p *Punch) SendWireGuard(buf []byte, dst *net.UDPAddr) error {
 	}
 	_, err := p.Conns[idx].WriteTo(buf, dst)
 	return err
+}
+
+// ackRTT returns the round trip for an ack, but only if it answers a probe we
+// sent to the very address the ack came from. An uncorrelated or absurdly old
+// ack reports nothing rather than a fabricated number.
+func (ps *peer) ackRTT(seq uint16, ua *net.UDPAddr) time.Duration {
+	st := ps.probeSent[seq&511]
+	if !st.ok || st.seq != seq || st.ep == nil || ua == nil || st.ep.String() != ua.String() {
+		return 0
+	}
+	d := time.Since(st.sent)
+	if d <= 0 || d > ackCorrelationWindow {
+		return 0
+	}
+	return d
+}
+
+// PeerRoute reports the class of path in use for a peer, the address it is
+// carried on, and the last measured round trip. The application shows these so a
+// user can tell a LAN session from one that fell back to the public mapping.
+func (p *Punch) PeerRoute(id protocol.PeerID) (tier string, endpoint string, rtt time.Duration) {
+	ps := p.peer(id)
+	if ps == nil {
+		return "none", "", 0
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	ep := ""
+	if ps.endpoint != nil {
+		ep = ps.endpoint.String()
+	}
+	return ps.tier.String(), ep, ps.rtt
 }
 
 func (p *Punch) peer(id protocol.PeerID) *peer {
@@ -630,6 +684,8 @@ func (p *Punch) sendProbe(ps *peer, ep Endpoint) {
 	ps.mu.Lock()
 	ps.seq++
 	seq := ps.seq
+	// Remember when and where this sequence left, so the answer can be timed.
+	ps.probeSent[seq&511] = probeStamp{seq: seq, sent: time.Now(), ep: ep.Addr, ok: true}
 	ps.mu.Unlock()
 	pkt := &Packet{Type: PktProbe, Seq: seq, Src: p.MyID, Dst: protocol.PeerID{}, Payload: nil}
 	buf := encodePooled(pkt)
@@ -708,11 +764,11 @@ func (p *Punch) handle(pkt *Packet, src net.Addr, sockIdx int) {
 	ps.mu.Lock()
 	switch pkt.Type {
 	case PktProbe, PktProbe2:
-		first, upgraded := ps.note(p, ua, sockIdx)
-		transport := ps.transport
+		first, upgraded := ps.note(p, ua, sockIdx, 0)
+		transport, tier := ps.transport, ps.tier
 		ps.mu.Unlock()
 		if first || upgraded {
-			p.logf("peer %s: <- probe from %s -> connected via %s (socket %d)", pkt.Src.String()[:8], ua, transport, sockIdx)
+			p.logf("peer %s: <- probe from %s -> connected via %s[%s] (socket %d)", pkt.Src.String()[:8], ua, transport, tier, sockIdx)
 		}
 		ack := &Packet{Type: PktAck, Seq: pkt.Seq, Src: p.MyID, Dst: pkt.Src}
 		buf := encodePooled(ack)
@@ -722,17 +778,17 @@ func (p *Punch) handle(pkt *Packet, src net.Addr, sockIdx int) {
 		return
 	case PktAck:
 		ps.lastSeen = time.Now()
-		first, upgraded := ps.note(p, ua, sockIdx)
-		transport := ps.transport
+		first, upgraded := ps.note(p, ua, sockIdx, ps.ackRTT(pkt.Seq, ua))
+		transport, tier, rtt := ps.transport, ps.tier, ps.rtt
 		ps.mu.Unlock()
 		if first || upgraded {
-			p.logf("peer %s: <- ack from %s -> connected via %s (socket %d)", pkt.Src.String()[:8], ua, transport, sockIdx)
+			p.logf("peer %s: <- ack from %s -> %s[%s] (socket %d, rtt=%s)", pkt.Src.String()[:8], ua, transport, tier, sockIdx, rtt.Round(time.Millisecond))
 		}
 		p.report(ps, pkt.Src)
 		return
 	case PktData:
 		ps.lastSeen = time.Now()
-		first, upgraded := ps.note(p, ua, sockIdx)
+		first, upgraded := ps.note(p, ua, sockIdx, 0)
 		ps.mu.Unlock()
 		if first || upgraded {
 			p.report(ps, pkt.Src)
@@ -750,7 +806,7 @@ func (p *Punch) handle(pkt *Packet, src net.Addr, sockIdx int) {
 // keeps forwarding this peer's keepalives to the same socket, and letting
 // those overwrite the endpoint would pull a punched link back onto the slow
 // path every few seconds. Caller must hold ps.mu.
-func (ps *peer) note(p *Punch, ua *net.UDPAddr, sockIdx int) (first, upgraded bool) {
+func (ps *peer) note(p *Punch, ua *net.UDPAddr, sockIdx int, sampleRTT time.Duration) (first, upgraded bool) {
 	first = !ps.connected
 	if ua == nil {
 		return first, false
@@ -761,6 +817,11 @@ func (ps *peer) note(p *Punch, ua *net.UDPAddr, sockIdx int) (first, upgraded bo
 	if ps.connected && newTier < ps.tier {
 		return false, false
 	}
+	// Whether this packet came in on the path we already use decides if a previous
+	// measurement may be kept, but it must not skip the state below: keepalive
+	// clears connected without clearing the endpoint, and an answer that then
+	// arrives on that same endpoint has to bring the link back up.
+	sameAddr := ps.endpoint != nil && ps.sockIdx == sockIdx && ps.endpoint.String() == ua.String()
 	was := ps.transport
 	prevTier := ps.tier
 	ps.endpoint = ua
@@ -768,6 +829,14 @@ func (ps *peer) note(p *Punch, ua *net.UDPAddr, sockIdx int) (first, upgraded bo
 	ps.tier = newTier
 	ps.transport = StatePunched
 	ps.connected = true
+	if sampleRTT > 0 {
+		ps.rtt = sampleRTT
+	} else if !sameAddr {
+		// The address changed and nothing on this packet measured the new one, so
+		// the old timing belongs to the address before it. A plain probe on the
+		// same path carries no sample either, and must not erase what we know.
+		ps.rtt = 0
+	}
 	// Pure P2P: any inbound packet from the peer confirms the direct punched
 	// endpoint. "upgraded" marks the first punched link and each move to a better
 	// class of path, both of which the caller reports as a path change.
