@@ -197,14 +197,14 @@ func addrFamily(ip net.IP) byte {
 	return 0x01
 }
 
-// xorMask returns the XOR-MAPPED-ADDRESS mask: the 32-bit magic cookie for IPv4
-// (RFC 5389), and cookie || six zero bytes || transaction-id for IPv6
-// (RFC 6338). The two differ, and third-party STUN servers use the RFC form, so
-// a mask our own decoder happens to share is not enough.
+// xorMask returns the XOR-MAPPED-ADDRESS mask. IPv4 uses the 32-bit magic cookie.
+// For IPv6, RFC 8489 §14.2 defines the 128-bit key as the magic cookie followed by
+// the 96-bit transaction id -- there is no reserved zero field between them, so
+// the id starts at byte 4, not byte 8.
 func xorMask(tid []byte) []byte {
 	key := make([]byte, 16)
 	binary.BigEndian.PutUint32(key[0:4], MagicCookie)
-	copy(key[8:], tid)
+	copy(key[4:], tid)
 	return key
 }
 

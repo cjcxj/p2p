@@ -9,9 +9,10 @@ import (
 // An IPv6 reflex address used to encode as a family-0x01 attribute with an empty
 // body: SetXORMappedAddress assigned ip = ip.To4() and then "fell back" to
 // ip.To16() on the nil result, which is still nil, so the address vanished from
-// our own server's Binding Success. The mask also has to be RFC 6338's
-// cookie || six zero bytes || transaction-id, not the IPv4 cookie repeated, or a
-// standards-compliant client reads garbage.
+// our own server's Binding Success. The mask also has to be RFC 8489 §14.2's
+// magic cookie followed directly by the 96-bit transaction id -- an earlier
+// version of this file, and the copy still on the candidate branch, kept four zero
+// bytes in between, which no conformant peer reads.
 func TestXORMappedAddressIPv6(t *testing.T) {
 	ip := net.ParseIP("2001:db8::1")
 	if ip == nil {
@@ -34,7 +35,7 @@ func TestXORMappedAddressIPv6(t *testing.T) {
 
 	key := make([]byte, 16)
 	binary.BigEndian.PutUint32(key[0:4], MagicCookie)
-	copy(key[8:], m.TID[:])
+	copy(key[4:], m.TID[:])
 	want := ip.To16()
 	for i := range want {
 		if v[4+i] != want[i]^key[i] {
