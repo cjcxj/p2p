@@ -201,6 +201,51 @@ func TestPlanTargetsBlockPortOutOfRange(t *testing.T) {
 	}
 }
 
+// A peer that pinned a mapping on its own gateway hands us an address that needs
+// no port guess. It must be in the plan, exactly as given, ahead of the guessed
+// ports, and it must not be emitted for a peer that has no mapping.
+func TestPlanTargetsCarvesOutGatewayMapping(t *testing.T) {
+	cfg := Config{PredictionSockets: 4, SymmetricSpray: 8}
+	peer := NATInfo{
+		Type:       stun.NatSymmetric,
+		PublicAddr: addr("1.2.3.4", 40000),
+		UPnPAddr:   addr("203.0.113.5", 35000),
+	}
+	eps := planTargets(NATInfo{Type: stun.NatPortRestrictedCone}, peer, cfg)
+
+	upnpAt, guessAt := -1, -1
+	for i, e := range eps {
+		switch e.Kind {
+		case "upnp":
+			upnpAt = i
+		case "predicted", "block", "spray":
+			if guessAt < 0 {
+				guessAt = i
+			}
+		}
+	}
+	if upnpAt < 0 {
+		t.Fatal("plan has no upnp target although the peer announced a mapping")
+	}
+	if got := eps[upnpAt].Addr.String(); got != "203.0.113.5:35000" {
+		t.Fatalf("upnp target aimed at %s, want 203.0.113.5:35000", got)
+	}
+	if eps[upnpAt].Socket != 0 {
+		t.Fatalf("upnp target uses socket %d, want 0", eps[upnpAt].Socket)
+	}
+	if guessAt >= 0 && upnpAt > guessAt {
+		t.Fatalf("the deterministic target is ordered after the guesses (%d > %d)", upnpAt, guessAt)
+	}
+
+	none := peer
+	none.UPnPAddr = nil
+	for _, e := range planTargets(NATInfo{Type: stun.NatPortRestrictedCone}, none, cfg) {
+		if e.Kind == "upnp" {
+			t.Fatalf("plan emitted an upnp target for a peer that has none: %s", e.Addr)
+		}
+	}
+}
+
 func countKind(eps []Endpoint, kind string) []Endpoint {
 	var out []Endpoint
 	for _, e := range eps {

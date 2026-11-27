@@ -145,6 +145,7 @@ func runConnect(args []string) int {
 	secret := fs.String("secret", "", "shared secret / password for server authentication")
 	noPredict := fs.Bool("no-predict", false, "disable symmetric-NAT port prediction")
 	noLAN := fs.Bool("no-lan", false, "disable same-LAN shortcut")
+	noUPnP := fs.Bool("no-upnp", false, "do not ask the gateway for a NAT-PMP/UPnP port mapping")
 	punchSockets := fs.Int("punch-sockets", 128, "socket pool size for symmetric plant/block legs (0=off)")
 	peerPortOffset := fs.Int("peer-port-offset", 20, "block spray aims at peer public port + this offset (must be < --punch-sockets)")
 	symSpray := fs.Int("sym-spray", 1024, "random ports the cone side sprays per round at each symmetric-peer public IP (birthday attack; 0=default)")
@@ -185,6 +186,9 @@ func runConnect(args []string) int {
 	}
 	if *noLAN {
 		cfg.EnableLAN = false
+	}
+	if *noUPnP {
+		cfg.EnableUPnP = false
 	}
 	cfg.PredictionSockets = *punchSockets
 	cfg.PeerPortOffset = *peerPortOffset
@@ -243,6 +247,7 @@ func runMesh(args []string) int {
 	secret := fs.String("secret", "", "shared secret / password for server authentication")
 	noPredict := fs.Bool("no-predict", false, "disable symmetric-NAT port prediction")
 	noLAN := fs.Bool("no-lan", false, "disable same-LAN shortcut")
+	noUPnP := fs.Bool("no-upnp", false, "do not ask the gateway for a NAT-PMP/UPnP port mapping")
 	punchSockets := fs.Int("punch-sockets", 128, "socket pool size for symmetric plant/block legs (0=off)")
 	peerPortOffset := fs.Int("peer-port-offset", 20, "block spray aims at peer public port + this offset (must be < --punch-sockets)")
 	symSpray := fs.Int("sym-spray", 1024, "random ports the cone side sprays per round at each symmetric-peer public IP (birthday attack; 0=default)")
@@ -286,6 +291,9 @@ func runMesh(args []string) int {
 	}
 	if *noLAN {
 		cfg.EnableLAN = false
+	}
+	if *noUPnP {
+		cfg.EnableUPnP = false
 	}
 	cfg.PredictionSockets = *punchSockets
 	cfg.PeerPortOffset = *peerPortOffset

@@ -23,6 +23,12 @@ type Config struct {
 	PortPrediction bool
 	// EnableLAN allows same-LAN direct connections.
 	EnableLAN bool
+	// EnableUPnP asks the local gateway (NAT-PMP / UPnP IGD) to pin a UDP
+	// mapping for our socket and advertises the resulting address to peers.
+	// A mapping the gateway already forwards beats a port guess: the peer can
+	// reach us before we have sent anything. Costs one budget-bounded probe
+	// during detection and nothing on networks with no IGD.
+	EnableUPnP bool
 	// Debug enables verbose hole-punching flow logs (delivered as
 	// EventDebug).
 	Debug bool
@@ -96,11 +102,12 @@ type Config struct {
 // Defaults returns a Config with the recommended values filled in.
 func Defaults() *Config {
 	return &Config{
-		PortPrediction:    true,
-		EnableLAN:         true,
-		TimeoutSec:        15,
-		ProbeIntervalMs:   200,
-		PunchTimeoutMs:    4000,
+		PortPrediction:  true,
+		EnableLAN:       true,
+		EnableUPnP:      true,
+		TimeoutSec:      15,
+		ProbeIntervalMs: 200,
+		PunchTimeoutMs:  4000,
 		// 128 plant sockets: at 25 the cone peer only had ~25 mappings to collide
 		// with against a 256-port blind window (~9.4%/round), which left a ~17s
 		// tail on real cellular CGNATs. 128 raises per-round hit rate to ~40-53%,

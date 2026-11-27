@@ -60,6 +60,10 @@ type Detection struct {
 	// FilterMeasured reports whether the cone subtype (full / address / port
 	// restricted) was actually observed rather than assumed.
 	FilterMeasured bool
+	// UPnPAddr is a UDP mapping this host pinned on its own gateway through
+	// NAT-PMP or UPnP IGD, if it managed to. It is a reachable address that
+	// does not depend on outbound traffic first, so peers can hit it cold.
+	UPnPAddr *net.UDPAddr
 	// Note carries the caveat for what could not be tested, so a reader of the
 	// log knows how far to trust NATType.
 	Note string

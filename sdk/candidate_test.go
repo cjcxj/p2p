@@ -211,3 +211,50 @@ func TestProductionPublishWireDecodeSpray(t *testing.T) {
 		t.Fatalf("production spray set missed the un-sampled egress .102 (pool %s)", info.PoolCIDR)
 	}
 }
+
+// A gateway mapping the sender pinned for us has to survive the trip to the
+// peer's punching plan, including its port -- which is why it rides its own field
+// instead of the bare-IP list in PublicAddr.
+func TestCandidateCarriesGatewayMapping(t *testing.T) {
+	det := &stun.Detection{
+		NATType:    stun.NatPortRestrictedCone,
+		MappedAddr: &net.UDPAddr{IP: net.ParseIP("203.0.113.44"), Port: 59804},
+		LocalAddr:  &net.UDPAddr{IP: net.ParseIP("192.168.1.45"), Port: 30000},
+		UPnPAddr:   &net.UDPAddr{IP: net.ParseIP("203.0.113.44"), Port: 41000},
+	}
+	s := &Session{det: det}
+
+	b, err := json.Marshal(protocol.Message{Type: protocol.MsgCandidate, Candidate: s.buildCandidate()})
+	if err != nil {
+		t.Fatalf("wire marshal: %v", err)
+	}
+	var m protocol.Message
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("wire unmarshal: %v", err)
+	}
+	if m.Candidate.UPnPAddr != "203.0.113.44:41000" {
+		t.Fatalf("wire carries upnp_addr %q, want 203.0.113.44:41000", m.Candidate.UPnPAddr)
+	}
+
+	info, err := candidateToNAT(m.Candidate)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if info.UPnPAddr == nil || info.UPnPAddr.Port != 41000 {
+		t.Fatalf("decoded NATInfo lost the mapping: %v", info.UPnPAddr)
+	}
+
+	// A peer that never got a mapping must not put an empty target in the plan.
+	plain := &Session{det: &stun.Detection{
+		NATType:    stun.NatPortRestrictedCone,
+		MappedAddr: det.MappedAddr,
+		LocalAddr:  det.LocalAddr,
+	}}
+	q, err := candidateToNAT(plain.buildCandidate())
+	if err != nil {
+		t.Fatalf("decode plain: %v", err)
+	}
+	if q.UPnPAddr != nil {
+		t.Fatalf("absent mapping decoded as %v", q.UPnPAddr)
+	}
+}

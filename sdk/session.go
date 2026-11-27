@@ -868,7 +868,21 @@ func (s *Session) detect() (*stun.Detection, error) {
 	if list := splitCSV(s.cfg.STUNSecondaries); len(list) > 0 {
 		c.Secondaries = list
 	}
-	return c.Detect()
+	det, err := c.Detect()
+	if err != nil {
+		return nil, err
+	}
+	// A gateway mapping is worth more than any port guess -- the peer can reach
+	// us on it before we have sent a packet -- but only where there is a gateway
+	// to ask. A host STUN already sees as open needs none, and the attempt is
+	// budget-bounded so a network without an IGD costs at most that window.
+	if s.cfg.EnableUPnP && det.NATType != stun.NatOpen &&
+		det.LocalAddr != nil && det.LocalAddr.Port > 0 {
+		if ua := stun.MapExternalUDP(det.LocalAddr.IP, det.LocalAddr.Port, 400*time.Millisecond); ua != nil {
+			det.UPnPAddr = ua
+		}
+	}
+	return det, nil
 }
 
 // splitCSV trims a comma-separated list into non-empty tokens.
@@ -1191,6 +1205,11 @@ func (s *Session) buildCandidate() *protocol.Candidate {
 		if det.LocalAddr != nil {
 			c.PrivateAddr = det.LocalAddr.String()
 		}
+		// Separate field, not another token in PublicAddr: a mapping has its own
+		// port, and peers that predate it must still read the address list.
+		if det.UPnPAddr != nil {
+			c.UPnPAddr = det.UPnPAddr.String()
+		}
 	}
 	c.X25519Pub = dataPublicHex(s.x25519)
 	return c
@@ -1229,6 +1248,14 @@ func candidateToNAT(c *protocol.Candidate) (punch.NATInfo, error) {
 	if c.PrivateAddr != "" {
 		if info.PrivateAddr, err = net.ResolveUDPAddr("udp", c.PrivateAddr); err != nil {
 			return info, err
+		}
+	}
+	// A gateway-mapped address the peer pinned on its router. A bad value is
+	// dropped rather than failing the candidate: it is an extra bet, and losing
+	// it must not cost the addresses we did parse.
+	if c.UPnPAddr != "" {
+		if ua, upErr := net.ResolveUDPAddr("udp", c.UPnPAddr); upErr == nil {
+			info.UPnPAddr = ua
 		}
 	}
 	return info, nil

@@ -42,7 +42,7 @@ const plantStaggerDiv = 8
 // Endpoint is one address the punch engine will probe.
 type Endpoint struct {
 	Addr   *net.UDPAddr
-	Kind   string // "lan","public","predicted","block","plant","spray"
+	Kind   string // "lan","public","upnp","predicted","block","plant","spray"
 	Order  int
 	Socket int // index into Punch.Conns; 0 = primary
 }
@@ -67,6 +67,11 @@ type NATInfo struct {
 	// leg covers the whole block (bounded by Config.SprayIPMax), which turns
 	// "we happened to sample the right IP" into a deterministic hit.
 	PoolCIDR *net.IPNet
+	// UPnPAddr is an address this peer pinned on its own gateway (NAT-PMP or
+	// UPnP IGD). It is a deterministic target that needs no port guess to
+	// collide with, so it is probed alongside the punched candidates whenever
+	// the peer managed to get one.
+	UPnPAddr *net.UDPAddr
 }
 
 // CandidateIPs returns every public IPv4 address the peer might be reached at:
@@ -224,6 +229,14 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 	// often for symmetric (once the mapping exists, filtering may allow it).
 	if peer.PublicAddr != nil {
 		eps = append(eps, Endpoint{Addr: peer.PublicAddr, Kind: "public", Order: order})
+		order++
+	}
+
+	// A gateway-mapped address is the one peer-side target that needs no guess:
+	// the peer's router forwards it to the peer before the peer has sent us
+	// anything, so it is aimed at directly, ahead of the port bets.
+	if peer.UPnPAddr != nil {
+		eps = append(eps, Endpoint{Addr: peer.UPnPAddr, Kind: "upnp", Order: order, Socket: 0})
 		order++
 	}
 
