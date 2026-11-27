@@ -72,6 +72,11 @@ type NATInfo struct {
 	// collide with, so it is probed alongside the punched candidates whenever
 	// the peer managed to get one.
 	UPnPAddr *net.UDPAddr
+	// PrivateCIDRs are the subnets this host's own interfaces sit on, as
+	// announced by the peer (or measured locally for our own side). They make
+	// the same-LAN shortcut exact on non-/24 links instead of guessing the mask
+	// from the third octet.
+	PrivateCIDRs []*net.IPNet
 }
 
 // CandidateIPs returns every public IPv4 address the peer might be reached at:
@@ -219,7 +224,7 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 		peer.PrivateAddr.IP != nil && my.PrivateAddr.IP != nil {
 		pe := peer.PrivateAddr.IP.To4()
 		me := my.PrivateAddr.IP.To4()
-		if pe != nil && me != nil && sameLAN(pe, me) {
+		if pe != nil && me != nil && sameLAN(pe, me, my.PrivateCIDRs, peer.PrivateCIDRs) {
 			eps = append(eps, Endpoint{Addr: peer.PrivateAddr, Kind: "lan", Order: order})
 			order++
 		}
@@ -402,8 +407,30 @@ func planTargets(my NATInfo, peer NATInfo, cfg Config) []Endpoint {
 	return eps
 }
 
-func sameLAN(a, b net.IP) bool {
-	return len(a) == 4 && len(b) == 4 && a[0] == b[0] && a[1] == b[1] && a[2] == b[2]
+// sameLAN reports whether two private addresses share a link. The announced
+// subnets decide when they exist -- that covers a /29 carrier link, a /21 office
+// VLAN, and a host with several interfaces, none of which the coarse fallback
+// reads correctly. Without announced subnets the old /24 comparison still
+// applies, so a peer that predates the field loses nothing. The subnets are
+// additive by design: an announcement that does not match must not take away a
+// same-LAN path the coarse rule already gave two hosts on one /24.
+func sameLAN(a, b net.IP, aCIDRs, bCIDRs []*net.IPNet) bool {
+	a4 := a.To4()
+	b4 := b.To4()
+	if a4 == nil || b4 == nil {
+		return false
+	}
+	for _, n := range aCIDRs {
+		if n != nil && n.Contains(a4) && n.Contains(b4) {
+			return true
+		}
+	}
+	for _, n := range bCIDRs {
+		if n != nil && n.Contains(a4) && n.Contains(b4) {
+			return true
+		}
+	}
+	return a4[0] == b4[0] && a4[1] == b4[1] && a4[2] == b4[2]
 }
 
 // isHardNAT reports whether a NAT type must use the plant+spray traversal.

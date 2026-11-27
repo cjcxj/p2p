@@ -713,6 +713,8 @@ func (s *Session) run(room string) {
 	}
 	my.PortDelta = det.PortDelta
 	my.PortStep = det.PortStep
+	my.UPnPAddr = det.UPnPAddr
+	my.PrivateCIDRs = parseCIDRs(det.LocalCIDRs)
 
 	ph := punch.New(s.conn, s.id, my, punch.Config{
 		PortPrediction:    s.cfg.PortPrediction,
@@ -1210,6 +1212,9 @@ func (s *Session) buildCandidate() *protocol.Candidate {
 		if det.UPnPAddr != nil {
 			c.UPnPAddr = det.UPnPAddr.String()
 		}
+		if len(det.LocalCIDRs) > 0 {
+			c.PrivateCIDRs = det.LocalCIDRs
+		}
 	}
 	c.X25519Pub = dataPublicHex(s.x25519)
 	return c
@@ -1258,7 +1263,24 @@ func candidateToNAT(c *protocol.Candidate) (punch.NATInfo, error) {
 			info.UPnPAddr = ua
 		}
 	}
+	// Subnets the peer shares with us, so the LAN shortcut is decided by the real
+	// mask rather than the third octet. Bad entries are dropped: the list is an
+	// optimisation, and a malformed one must not lose the candidate.
+	if len(c.PrivateCIDRs) > 0 {
+		info.PrivateCIDRs = parseCIDRs(c.PrivateCIDRs)
+	}
 	return info, nil
+}
+
+// parseCIDRs turns CIDR strings into networks, skipping anything unparseable.
+func parseCIDRs(list []string) []*net.IPNet {
+	var out []*net.IPNet
+	for _, s := range list {
+		if _, n, err := net.ParseCIDR(s); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // splitCandidateAddr separates a candidate public address ("ip:port" optionally

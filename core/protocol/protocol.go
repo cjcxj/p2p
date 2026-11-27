@@ -87,6 +87,11 @@ type Candidate struct {
 	// connect without waiting for a guess to collide. Empty for peers that have
 	// no gateway mapping; older peers neither send nor read this field.
 	UPnPAddr string `json:"upnp_addr,omitempty"`
+	// PrivateCIDRs are the sender's interface subnets in CIDR form. Same-LAN
+	// detection needs the real mask: a carrier link can be a /29 and a corporate
+	// VLAN a /21, and comparing the first three octets gets both wrong. Peers
+	// that predate this field simply fall back to the coarse comparison.
+	PrivateCIDRs []string `json:"private_cidrs,omitempty"`
 }
 
 // Message is the JSON-over-TCP wire frame exchanged over signaling.

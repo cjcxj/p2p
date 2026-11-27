@@ -39,6 +39,16 @@ type Detection struct {
 	MappedAddr *net.UDPAddr
 	// LocalAddr is the address of the client socket.
 	LocalAddr *net.UDPAddr
+	// LocalAddrs lists the same socket port on every active non-loopback IPv4
+	// interface, so a multi-homed host (VPN adapter, phone hotspot, VMware,
+	// wired plus Wi-Fi) can offer a same-LAN path on whichever network the peer
+	// actually shares with it.
+	LocalAddrs []*net.UDPAddr
+	// LocalCIDRs are the interface subnets those addresses live on (for example
+	// "192.168.10.5/24"), paired with LocalAddrs. A /29 carrier link and a /24
+	// office VLAN are both real local links, and guessing the mask from the
+	// first three octets gets both wrong.
+	LocalCIDRs []string
 	// PortDelta is the per-mapping port increment observed for a symmetric
 	// NAT (0 when not symmetric or not measurable).
 	PortDelta int
@@ -187,6 +197,55 @@ func localIPFor(server *net.UDPAddr) net.IP {
 // on the server having a second port: an alternate destination from
 // DefaultSecondaries is enough, and if none of them answers the result is
 // NatUnmeasurable rather than a guess.
+// enumerateLocalAddrs returns the given port on every active non-loopback IPv4
+// interface address, plus those interfaces' subnets. The primary address is
+// first so a caller that only uses the head of the list keeps behaving as
+// before. Link-local addresses are skipped: they cannot be reached by a peer
+// across the gateway, so offering them only adds a dead candidate.
+func enumerateLocalAddrs(port int, primary *net.UDPAddr) ([]*net.UDPAddr, []string) {
+	if port <= 0 {
+		return nil, nil
+	}
+	var addrs []*net.UDPAddr
+	var cidrs []string
+	seenIP := map[string]bool{}
+	if primary != nil && primary.IP != nil && !primary.IP.IsUnspecified() {
+		if ip4 := primary.IP.To4(); ip4 != nil {
+			seenIP[ip4.String()] = true
+			addrs = append(addrs, &net.UDPAddr{IP: ip4, Port: port})
+		}
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return addrs, cidrs
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		ifAddrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range ifAddrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok || ipNet.IP == nil {
+				continue
+			}
+			ip4 := ipNet.IP.To4()
+			if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+				continue
+			}
+			cidrs = append(cidrs, (&net.IPNet{IP: ip4, Mask: ipNet.Mask}).String())
+			if !seenIP[ip4.String()] {
+				seenIP[ip4.String()] = true
+				addrs = append(addrs, &net.UDPAddr{IP: ip4, Port: port})
+			}
+		}
+	}
+	return addrs, cidrs
+}
+
 func (c *Client) Detect() (*Detection, error) {
 	// Test I: plain binding to primary.
 	t1, _, err := c.BindRequest(false, false)
@@ -207,10 +266,17 @@ func (c *Client) Detect() (*Detection, error) {
 			localUDP = &net.UDPAddr{IP: ip, Port: localUDP.Port}
 		}
 	}
+	var localAddrs []*net.UDPAddr
+	var localCIDRs []string
+	if localUDP != nil && localUDP.Port > 0 {
+		localAddrs, localCIDRs = enumerateLocalAddrs(localUDP.Port, localUDP)
+	}
 	d := &Detection{
 		NATType:    NatUnknown,
 		MappedAddr: mapped1,
 		LocalAddr:  localUDP,
+		LocalAddrs: localAddrs,
+		LocalCIDRs: localCIDRs,
 	}
 
 	// Not behind a NAT: public mapping equals local socket address.

@@ -246,6 +246,64 @@ func TestPlanTargetsCarvesOutGatewayMapping(t *testing.T) {
 	}
 }
 
+// The third-octet heuristic says two hosts on 10.0.0.5/30 and 10.0.1.9/30 are on
+// different links and that 172.16.5.4 with 172.16.9.8 share one. Announced
+// subnets settle both, and a peer that announces nothing keeps the old behaviour.
+func TestSameLANSubnetAware(t *testing.T) {
+	// A /30 pair that straddles the third octet is still the same link.
+	n := &net.IPNet{IP: net.ParseIP("10.0.0.4").To4(), Mask: net.CIDRMask(30, 32)}
+	if !sameLAN(net.ParseIP("10.0.0.5"), net.ParseIP("10.0.0.6"), []*net.IPNet{n}, nil) {
+		t.Fatal("same /30 not recognised across the third octet")
+	}
+	// A /22 legitimately spans the third octet without being one link for our
+	// purposes unless the host announces it; with the announcement it is.
+	wide := &net.IPNet{IP: net.ParseIP("172.16.8.0").To4(), Mask: net.CIDRMask(22, 32)}
+	if !sameLAN(net.ParseIP("172.16.9.8"), net.ParseIP("172.16.10.4"), nil, []*net.IPNet{wide}) {
+		t.Fatal("announced /22 should join 172.16.9.8 and 172.16.10.4")
+	}
+	// An announced subnet only ever ADDS a same-LAN verdict: dropping the coarse
+	// fallback for a peer that did announce something would make an old-style
+	// /24 pair lose a path it has today. So a subnet that holds neither address
+	// must not fire on its own, and the fallback still decides.
+	small := &net.IPNet{IP: net.ParseIP("192.168.1.0").To4(), Mask: net.CIDRMask(31, 32)}
+	if sameLAN(net.ParseIP("192.168.1.4"), net.ParseIP("192.168.2.9"), []*net.IPNet{small}, nil) {
+		t.Fatal("a /31 that holds neither address must not report same-LAN")
+	}
+	if !sameLAN(net.ParseIP("192.168.1.4"), net.ParseIP("192.168.1.9"), []*net.IPNet{small}, nil) {
+		t.Fatal("the /24 fallback must survive an announcement that does not match")
+	}
+	// No announcement: unchanged coarse behaviour for older peers.
+	if !sameLAN(net.ParseIP("192.168.1.20"), net.ParseIP("192.168.1.31"), nil, nil) {
+		t.Fatal("fallback /24 comparison broke")
+	}
+	if sameLAN(net.ParseIP("192.168.1.20"), net.ParseIP("192.168.2.31"), nil, nil) {
+		t.Fatal("different third octets must not match without an announcement")
+	}
+}
+
+// A LAN target only appears when the two addresses really share a link.
+func TestPlanTargetsLansUseAnnouncedSubnets(t *testing.T) {
+	cfg := Config{EnableLAN: true, PredictionSockets: 1}
+	peer := NATInfo{
+		Type:        stun.NatPortRestrictedCone,
+		PublicAddr:  addr("1.2.3.4", 40000),
+		PrivateAddr: addr("10.0.0.6", 30000),
+		PrivateCIDRs: []*net.IPNet{{
+			IP: net.ParseIP("10.0.0.4").To4(), Mask: net.CIDRMask(30, 32),
+		}},
+	}
+	my := NATInfo{Type: stun.NatPortRestrictedCone, PrivateAddr: addr("10.0.0.5", 30000)}
+	var lan int
+	for _, e := range planTargets(my, peer, cfg) {
+		if e.Kind == "lan" {
+			lan++
+		}
+	}
+	if lan != 1 {
+		t.Fatalf("lan targets = %d, want 1 from the peer's announced /30", lan)
+	}
+}
+
 func countKind(eps []Endpoint, kind string) []Endpoint {
 	var out []Endpoint
 	for _, e := range eps {

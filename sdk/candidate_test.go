@@ -221,6 +221,7 @@ func TestCandidateCarriesGatewayMapping(t *testing.T) {
 		MappedAddr: &net.UDPAddr{IP: net.ParseIP("203.0.113.44"), Port: 59804},
 		LocalAddr:  &net.UDPAddr{IP: net.ParseIP("192.168.1.45"), Port: 30000},
 		UPnPAddr:   &net.UDPAddr{IP: net.ParseIP("203.0.113.44"), Port: 41000},
+		LocalCIDRs: []string{"192.168.1.45/24", "10.7.3.23/29"},
 	}
 	s := &Session{det: det}
 
@@ -242,6 +243,17 @@ func TestCandidateCarriesGatewayMapping(t *testing.T) {
 	}
 	if info.UPnPAddr == nil || info.UPnPAddr.Port != 41000 {
 		t.Fatalf("decoded NATInfo lost the mapping: %v", info.UPnPAddr)
+	}
+	// The announced subnets have to arrive as networks, not strings, or the
+	// receiver cannot test containment.
+	if len(info.PrivateCIDRs) != 2 {
+		t.Fatalf("decoded %v subnets, want 2", info.PrivateCIDRs)
+	}
+	if !info.PrivateCIDRs[1].Contains(net.ParseIP("10.7.3.20")) {
+		t.Fatalf("announced /29 does not hold the peer's address: %v", info.PrivateCIDRs[1])
+	}
+	if info.PrivateCIDRs[1].Contains(net.ParseIP("10.7.3.32")) {
+		t.Fatalf("announced /29 is wider than announced: %v", info.PrivateCIDRs[1])
 	}
 
 	// A peer that never got a mapping must not put an empty target in the plan.
